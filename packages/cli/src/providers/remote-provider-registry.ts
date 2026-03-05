@@ -101,6 +101,7 @@ const getRemoteProviders = (): RemoteProvider[] => [
     apiPath: "/anthropic/v1/messages",
     apiKeyEnvVar: "MINIMAX_API_KEY",
     prefixes: ["mmax/", "mm/"],
+    authScheme: "bearer",
     capabilities: {
       supportsTools: true,
       supportsVision: true,
@@ -115,6 +116,7 @@ const getRemoteProviders = (): RemoteProvider[] => [
     apiPath: "/anthropic/v1/messages",
     apiKeyEnvVar: "MINIMAX_CODING_API_KEY",
     prefixes: ["mmc/"],
+    authScheme: "bearer",
     capabilities: {
       supportsTools: true,
       supportsVision: true,

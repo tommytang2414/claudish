@@ -61,6 +61,8 @@ export interface RemoteProvider {
   capabilities: ProviderCapabilities;
   /** Optional custom headers */
   headers?: Record<string, string>;
+  /** Auth scheme for the API key header (defaults to "x-api-key") */
+  authScheme?: "x-api-key" | "bearer";
 }
 
 /**

@@ -31,9 +31,14 @@ export class AnthropicCompatProvider implements ProviderTransport {
 
   async getHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {
-      "x-api-key": this.apiKey,
       "anthropic-version": "2023-06-01",
     };
+
+    if (this.provider.authScheme === "bearer") {
+      headers["Authorization"] = `Bearer ${this.apiKey}`;
+    } else {
+      headers["x-api-key"] = this.apiKey;
+    }
 
     // Add provider-specific headers
     if (this.provider.headers) {
