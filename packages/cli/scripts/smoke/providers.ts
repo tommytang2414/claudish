@@ -29,7 +29,7 @@ const REPRESENTATIVE_MODELS: Record<string, string> = {
   zai: "glm-5",
   openai: "gpt-4o-mini",
   openrouter: "openai/gpt-4o-mini", // stable model always available on OpenRouter
-  litellm: "gpt-4o-mini",
+  litellm: "gemini-2.5-flash", // model deployed on the madappgang litellm instance
   "opencode-zen": "gpt-5-nano", // Free model (C1 fix: not kimi-k2.5)
   "opencode-zen-go": "glm-5", // Only confirmed working model (C2 fix)
   gemini: "gemini-2.0-flash",
