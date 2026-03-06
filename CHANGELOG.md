@@ -1,5 +1,28 @@
 # Changelog
 
+## [5.7.0] - 2026-03-06
+
+### Added
+- ✅ **OpenCode Zen Go plan support** (`zgo@`, `zengo@` shortcuts) — routes to `zen/go/v1/` subscription endpoint
+  - `zgo@glm-5` — GLM-5 via go subscription (free/included in plan)
+  - Dynamic model discovery: probes the go endpoint at model selector load time to surface available models
+- ✅ **OpenCode Zen free model live cross-reference** — `fetchZenFreeModels()` now validates against the live `/zen/v1/models` endpoint, eliminating stale models.dev entries (e.g. `kimi-k2.5-free` which no longer exists)
+
+### Fixed
+- 🐛 **OpenCode Zen auth** — `zen@` models were sending empty `Authorization` header, causing 401 errors. Now correctly sends `OPENCODE_API_KEY` (falls back to `Bearer public` for anonymous free model access without a key)
+- 🐛 **Misleading "Check API key" error** — `getRecoveryHint()` now detects when a 401 is caused by an unsupported model name (not a bad API key) and returns the correct hint
+- 🐛 **Zen Go model probe false positives** — Previous probe logic misidentified Kimi/MiniMax as go-plan models because their non-standard error format bypassed the `ModelError` check. Now only includes models that return actual completion choices
+
+### Usage
+```bash
+# Free anonymous models (no key required)
+claudish --model zen@gpt-5-nano "task"
+claudish --model zen@big-pickle "task"
+
+# OpenCode Go plan (requires OPENCODE_API_KEY)
+claudish --model zgo@glm-5 "task"
+```
+
 ## [2.3.1] - 2025-11-25
 
 ### Fixed
