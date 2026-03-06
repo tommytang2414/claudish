@@ -33,10 +33,31 @@ export class AnthropicPassthroughAdapter extends BaseModelAdapter {
   }
 
   /**
-   * Pass through Claude messages as-is — no OpenAI conversion.
+   * Pass through Claude messages, stripping Claude-internal content types
+   * that non-Anthropic providers don't support (e.g. tool_reference from
+   * the deferred tool loading / ToolSearch system).
    */
   override convertMessages(claudeRequest: any, _filterFn?: any): any[] {
-    return claudeRequest.messages || [];
+    const messages = claudeRequest.messages || [];
+    return messages.map((msg: any) => this.stripUnsupportedContentTypes(msg));
+  }
+
+  private stripUnsupportedContentTypes(message: any): any {
+    if (!message.content || !Array.isArray(message.content)) {
+      return message;
+    }
+    const filteredContent = message.content
+      .map((block: any) => {
+        // Strip tool_reference from tool_result content arrays
+        if (block.type === "tool_result" && Array.isArray(block.content)) {
+          const filtered = block.content.filter((c: any) => c.type !== "tool_reference");
+          // Keep at least a minimal text block so tool_result content is never empty
+          return { ...block, content: filtered.length > 0 ? filtered : [{ type: "text", text: "" }] };
+        }
+        return block;
+      })
+      .filter((block: any) => block.type !== "tool_reference");
+    return { ...message, content: filteredContent };
   }
 
   /**

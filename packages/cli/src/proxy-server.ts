@@ -69,9 +69,12 @@ export async function createProxyServer(
 
   // Helper to get or create OpenRouter handler for a target model
   const getOpenRouterHandler = (targetModel: string): ModelHandler => {
-    // Strip any provider prefix (e.g., openrouter@google/gemini -> google/gemini, glm@glm-5 -> glm-5)
+    // For explicit @ syntax: strip provider prefix (openrouter@google/gemini → google/gemini)
+    // For already-resolved vendor/model IDs (qwen/qwen3.5-plus-02-15): use as-is to preserve
+    // the vendor prefix that OpenRouter requires. parseModelSpec() would otherwise strip it
+    // (e.g. "qwen/" is a native pattern match → model becomes "qwen3.5-plus-02-15").
     const parsed = parseModelSpec(targetModel);
-    const modelId = parsed.provider !== "native-anthropic" ? parsed.model : targetModel;
+    const modelId = targetModel.includes("@") ? parsed.model : targetModel;
 
     if (!openRouterHandlers.has(modelId)) {
       const orProvider = new OpenRouterProvider(openrouterApiKey || "");
