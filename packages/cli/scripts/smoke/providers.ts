@@ -16,7 +16,6 @@ const SKIP_PROVIDERS = new Set([
   "gemini-codeassist", // OAuth-only, no API key auth
   "vertex", // Complex auth (VERTEX_PROJECT + OAuth)
   "glm-coding", // Coding PAAS endpoint — valid model IDs not yet confirmed
-  "minimax", // Redundant — minimax-coding tests same model/format with active billing
 ]);
 
 // Map provider name → representative model for smoke testing
