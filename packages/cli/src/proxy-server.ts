@@ -47,6 +47,7 @@ import {
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
 import { getFallbackChain } from "./providers/auto-route.js";
+import { loadRoutingRules, matchRoutingRule, buildRoutingChain } from "./providers/routing-rules.js";
 
 export interface ProxyServerOptions {
   summarizeTools?: boolean; // Summarize tool descriptions for local models
@@ -441,6 +442,9 @@ export async function createProxyServer(
       });
   }
 
+  // Load custom routing rules once at startup (local .claudish.json takes priority over global)
+  const customRoutingRules = loadRoutingRules();
+
   // Cache fallback handlers by target model string.
   // No TTL/invalidation: claudish is ephemeral per session, so env changes
   // (new API keys) take effect on next session start.
@@ -498,7 +502,12 @@ export async function createProxyServer(
           return fallbackHandlerCache.get(cacheKey)!;
         }
 
-        const chain = getFallbackChain(parsedForFallback.model, parsedForFallback.provider);
+        const matchedEntries = customRoutingRules
+          ? matchRoutingRule(parsedForFallback.model, customRoutingRules)
+          : null;
+        const chain = matchedEntries
+          ? buildRoutingChain(matchedEntries, parsedForFallback.model)
+          : getFallbackChain(parsedForFallback.model, parsedForFallback.provider);
         if (chain.length > 0) {
           const candidates: FallbackCandidate[] = [];
           for (const route of chain) {
@@ -522,8 +531,9 @@ export async function createProxyServer(
             fallbackHandlerCache.set(cacheKey, resultHandler);
 
             if (!options.quiet && candidates.length > 1) {
+              const source = matchedEntries ? "[Custom]" : "[Fallback]";
               logStderr(
-                `[Fallback] ${candidates.length} providers for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`
+                `${source} ${candidates.length} providers for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`
               );
             }
             return resultHandler;

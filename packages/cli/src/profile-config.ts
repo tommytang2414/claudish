@@ -52,6 +52,19 @@ export interface ProfileWithScope extends Profile {
 }
 
 /**
+ * A single routing destination: either "provider" (uses the original model name)
+ * or "provider@model" (uses a specific model on that provider).
+ */
+export type RoutingEntry = string;
+
+/**
+ * Custom routing rules: maps a model name pattern to an ordered list of routing
+ * destinations to try. Patterns can be exact names, globs ("kimi-*"), or "*"
+ * catch-all. Local .claudish.json rules replace global rules entirely.
+ */
+export type RoutingRules = Record<string, RoutingEntry[]>;
+
+/**
  * Telemetry consent state. Persisted to ~/.claudish/config.json under the
  * "telemetry" key. Absence of the "telemetry" key means the user has never
  * been prompted (equivalent to enabled: false, askedAt: undefined).
@@ -80,6 +93,11 @@ export interface ClaudishProfileConfig {
   profiles: Record<string, Profile>;
   /** Telemetry consent state. Absent = never prompted. */
   telemetry?: TelemetryConsent;
+  /**
+   * Custom routing rules. Local .claudish.json rules replace global rules entirely.
+   * Maps model name patterns (exact, glob, or "*") to ordered lists of routing entries.
+   */
+  routing?: RoutingRules;
 }
 
 /**
@@ -134,6 +152,10 @@ export function loadConfig(): ClaudishProfileConfig {
     // Preserve telemetry consent state if present
     if (config.telemetry !== undefined) {
       merged.telemetry = config.telemetry;
+    }
+    // Preserve custom routing rules if present
+    if (config.routing !== undefined) {
+      merged.routing = config.routing;
     }
     return merged;
   } catch (error) {
@@ -205,11 +227,16 @@ export function loadLocalConfig(): ClaudishProfileConfig | null {
     const content = readFileSync(localPath, "utf-8");
     const config = JSON.parse(content) as ClaudishProfileConfig;
 
-    return {
+    const local: ClaudishProfileConfig = {
       version: config.version || DEFAULT_CONFIG.version,
       defaultProfile: config.defaultProfile || "",
       profiles: config.profiles || {},
     };
+    // Preserve custom routing rules if present
+    if (config.routing !== undefined) {
+      local.routing = config.routing;
+    }
+    return local;
   } catch (error) {
     console.error(`Warning: Failed to load local config: ${error}`);
     return null;
