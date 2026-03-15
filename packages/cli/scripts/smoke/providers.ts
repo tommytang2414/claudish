@@ -34,6 +34,14 @@ const REPRESENTATIVE_MODELS: Record<string, string> = {
   gemini: "gemini-2.0-flash",
 };
 
+// Providers whose models can't process images natively.
+// In production, the fallback chain routes vision to another provider.
+// Smoke tests bypass the proxy, so we skip vision probes for these.
+const NO_NATIVE_VISION = new Set([
+  "minimax",
+  "minimax-coding",
+]);
+
 // Providers that use Anthropic-compat wire format
 const ANTHROPIC_COMPAT_PROVIDERS = new Set([
   "kimi",
@@ -124,7 +132,7 @@ export function discoverProviders(filterName?: string): SmokeProviderConfig[] {
         representativeModel: REPRESENTATIVE_MODELS[p.name],
         capabilities: {
           supportsTools: p.capabilities.supportsTools,
-          supportsVision: p.capabilities.supportsVision,
+          supportsVision: NO_NATIVE_VISION.has(p.name) ? false : p.capabilities.supportsVision,
           supportsReasoning: p.capabilities.supportsReasoning,
         },
       };
