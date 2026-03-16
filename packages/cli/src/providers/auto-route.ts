@@ -402,7 +402,7 @@ function hasProviderCredentials(provider: string): boolean {
 /**
  * Generate an ordered list of provider fallback candidates for a bare model name.
  *
- * Priority: LiteLLM → Subscription (Zen) → Provider Subscription Plan → Native API → OpenRouter
+ * Priority: LiteLLM → Subscription (Zen Go) → Provider Subscription Plan → Native API → OpenRouter
  *
  * Only includes providers that have credentials configured.
  * Used for auto-routed models (no explicit provider@ prefix).
@@ -421,12 +421,12 @@ export function getFallbackChain(modelName: string, nativeProvider: string): Fal
     });
   }
 
-  // 2. Subscription aggregator (OpenCode Zen — only for model families it actually serves)
+  // 2. Subscription aggregator (OpenCode Zen Go — only for model families it actually serves)
   if (process.env.OPENCODE_API_KEY && isZenCompatibleModel(modelName)) {
     routes.push({
-      provider: "opencode-zen",
-      modelSpec: `zen@${modelName}`,
-      displayName: "OpenCode Zen",
+      provider: "opencode-zen-go",
+      modelSpec: `zengo@${modelName}`,
+      displayName: "OpenCode Zen Go",
     });
   }
 

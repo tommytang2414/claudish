@@ -169,10 +169,10 @@ describe("Group 1: Fallback chain construction", () => {
 
     expect(chain.length).toBeGreaterThan(0);
 
-    // Verify ordering: LiteLLM < Zen < Subscription < Native < OpenRouter
+    // Verify ordering: LiteLLM < Zen Go < Subscription < Native < OpenRouter
     const providerOrder = chain.map((r: any) => r.provider);
     const litellmIdx = providerOrder.indexOf("litellm");
-    const zenIdx = providerOrder.indexOf("opencode-zen");
+    const zenIdx = providerOrder.indexOf("opencode-zen-go");
     const subIdx = providerOrder.indexOf("minimax-coding");
     const nativeIdx = providerOrder.indexOf("minimax");
     const orIdx = providerOrder.indexOf("openrouter");
@@ -203,7 +203,8 @@ describe("Group 1: Fallback chain construction", () => {
 
     expect(providers).not.toContain("unknown");
 
-    // Zen is filtered out — "some-unknown-model" won't be in the Zen catalog
+    // Zen Go is filtered out — "some-unknown-model" won't be in the Zen catalog
+    expect(providers).not.toContain("opencode-zen-go");
     expect(providers).not.toContain("opencode-zen");
 
     if (process.env.LITELLM_BASE_URL && process.env.LITELLM_API_KEY) {

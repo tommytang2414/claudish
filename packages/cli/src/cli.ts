@@ -35,7 +35,7 @@ export {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-let VERSION = "5.13.0"; // Fallback version for compiled binaries
+let VERSION = "5.13.1"; // Fallback version for compiled binaries
 try {
   const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf-8"));
   VERSION = packageJson.version;
@@ -1303,6 +1303,7 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
       zai: { envVar: "ZAI_API_KEY" },
       ollamacloud: { envVar: "OLLAMA_API_KEY" },
       "opencode-zen": { envVar: "OPENCODE_API_KEY" },
+      "opencode-zen-go": { envVar: "OPENCODE_API_KEY" },
       "gemini-codeassist": { envVar: "GEMINI_API_KEY" },
       vertex: { envVar: "VERTEX_API_KEY", aliases: ["VERTEX_PROJECT"] },
       poe: { envVar: "POE_API_KEY" },
@@ -1432,7 +1433,7 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
   console.log(`  ${RED}○${RESET} missing  API key not set, provider skipped`);
   console.log(`  ${BG_DIM}  highlighted  ${RESET} = first provider that will handle the request`);
   console.log("");
-  console.log(`  ${DIM}Chain order: LiteLLM → Zen → Subscription → Native API → OpenRouter${RESET}`);
+  console.log(`  ${DIM}Chain order: LiteLLM → Zen Go → Subscription → Native API → OpenRouter${RESET}`);
   console.log(`  ${DIM}Custom rules in .claudish.json or ~/.claudish/config.json override default chain${RESET}`);
   console.log("");
 }
