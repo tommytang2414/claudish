@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
 // Load .env file before anything else (quiet mode to suppress verbose output)
 import { config } from "dotenv";
@@ -168,14 +168,7 @@ if (isMcpMode) {
   });
 } else if (isConfigCommand) {
   // Interactive configuration TUI: claudish config (full-screen btop-inspired TUI)
-  // Dynamic path prevents bun build from inlining the TUI chunk (which uses bun:ffi)
-  const tuiPath = [".", "tui", "index.js"].join("/");
-  import(tuiPath)
-    .then((m) => m.startConfigTui().catch(handlePromptExit))
-    .catch(() => {
-      console.error("Config TUI requires Bun runtime. Install Bun: https://bun.sh");
-      process.exit(1);
-    });
+  import("./tui/index.js").then((m) => m.startConfigTui().catch(handlePromptExit));
 } else {
   // CLI mode
   runCli();
