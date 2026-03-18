@@ -15,6 +15,7 @@ import { BaseModelAdapter, type AdapterResult } from "./base-adapter.js";
 import { convertToolsToGemini } from "../handlers/shared/gemini-schema.js";
 import { filterIdentity } from "../handlers/shared/openai-compat.js";
 import { log } from "../logger.js";
+import type { StreamFormat } from "../providers/transport/types.js";
 
 /**
  * Patterns that indicate internal reasoning/monologue that should be filtered.
@@ -316,6 +317,10 @@ export class GeminiAdapter extends BaseModelAdapter {
   }
 
   // ─── Adapter metadata ─────────────────────────────────────────────
+
+  override getStreamFormat(): StreamFormat {
+    return "gemini-sse";
+  }
 
   /**
    * Reset reasoning filter state between requests.

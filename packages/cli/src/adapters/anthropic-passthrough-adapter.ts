@@ -7,6 +7,7 @@
  */
 
 import { BaseModelAdapter, type AdapterResult } from "./base-adapter.js";
+import type { StreamFormat } from "../providers/transport/types.js";
 
 export class AnthropicPassthroughAdapter extends BaseModelAdapter {
   private providerName: string;
@@ -108,10 +109,24 @@ export class AnthropicPassthroughAdapter extends BaseModelAdapter {
     return payload;
   }
 
+  override getStreamFormat(): StreamFormat {
+    return "anthropic-sse";
+  }
+
   override getContextWindow(): number {
-    if (this.providerName === "kimi" || this.providerName === "kimi-coding") {
-      return 128_000;
+    const model = this.modelId.toLowerCase();
+
+    // Kimi models — context window by model variant
+    if (model.includes("kimi-k2.5") || model.includes("kimi-k2-5")) return 262_144;
+    if (model.includes("kimi-k2")) return 262_144;
+    if (
+      this.providerName === "kimi" ||
+      this.providerName === "kimi-coding" ||
+      model.includes("kimi")
+    ) {
+      return 131_072;
     }
+
     if (this.providerName === "minimax" || this.providerName === "minimax-coding") {
       return 100_000;
     }

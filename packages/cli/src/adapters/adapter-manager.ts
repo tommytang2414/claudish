@@ -11,6 +11,7 @@
 import { BaseModelAdapter, DefaultAdapter } from "./base-adapter";
 import { GrokAdapter } from "./grok-adapter";
 import { GeminiAdapter } from "./gemini-adapter";
+import { CodexAdapter } from "./codex-adapter";
 import { OpenAIAdapter } from "./openai-adapter";
 import { QwenAdapter } from "./qwen-adapter";
 import { MiniMaxAdapter } from "./minimax-adapter";
@@ -26,6 +27,7 @@ export class AdapterManager {
     this.adapters = [
       new GrokAdapter(modelId),
       new GeminiAdapter(modelId),
+      new CodexAdapter(modelId), // Must be before OpenAIAdapter (codex matches first)
       new OpenAIAdapter(modelId),
       new QwenAdapter(modelId),
       new MiniMaxAdapter(modelId),

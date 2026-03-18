@@ -1,0 +1,12 @@
+data: {"id":"chatcmpl-seed2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-seed2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Let me read that file."},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-seed2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"Read","arguments":""}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-seed2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"file_path\":\"/tmp/test.txt\"}"}}]},"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-seed2","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}
+
+data: [DONE]
+

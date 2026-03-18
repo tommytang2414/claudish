@@ -9,6 +9,12 @@
 
 import { truncateToolName } from "./tool-name-utils.js";
 import type { ModelPricing } from "../handlers/shared/remote-provider-types.js";
+import { getModelPricing } from "../handlers/shared/remote-provider-types.js";
+import type { StreamFormat } from "../providers/transport/types.js";
+import type { FormatConverter } from "./format-converter.js";
+import type { ModelTranslator } from "./model-translator.js";
+import { convertMessagesToOpenAI } from "../handlers/shared/format/openai-messages.js";
+import { convertToolsToOpenAI } from "../handlers/shared/format/openai-tools.js";
 
 export interface ToolCall {
   id: string;
@@ -25,7 +31,7 @@ export interface AdapterResult {
   wasTransformed: boolean;
 }
 
-export abstract class BaseModelAdapter {
+export abstract class BaseModelAdapter implements FormatConverter, ModelTranslator {
   protected modelId: string;
 
   /**
@@ -103,12 +109,10 @@ export abstract class BaseModelAdapter {
 
   /**
    * Convert Claude-format messages to the target API format.
-   * Default: delegates to convertMessagesToOpenAI (imported dynamically to avoid circular deps).
+   * Default: delegates to convertMessagesToOpenAI.
    * Override for non-OpenAI formats (e.g., Gemini parts-based format).
    */
   convertMessages(claudeRequest: any, filterIdentityFn?: (s: string) => string): any[] {
-    // Lazy import to avoid circular dependency
-    const { convertMessagesToOpenAI } = require("../handlers/shared/openai-compat.js");
     return convertMessagesToOpenAI(claudeRequest, this.modelId, filterIdentityFn);
   }
 
@@ -117,7 +121,6 @@ export abstract class BaseModelAdapter {
    * Default: OpenAI function-calling format.
    */
   convertTools(claudeRequest: any, summarize = false): any[] {
-    const { convertToolsToOpenAI } = require("../handlers/shared/openai-compat.js");
     return convertToolsToOpenAI(claudeRequest, summarize);
   }
 
@@ -145,6 +148,15 @@ export abstract class BaseModelAdapter {
   }
 
   /**
+   * The stream format this adapter's target API returns.
+   * Default: "openai-sse" (most common format).
+   * Override for Anthropic passthrough ("anthropic-sse"), Gemini ("gemini-sse"), etc.
+   */
+  getStreamFormat(): StreamFormat {
+    return "openai-sse";
+  }
+
+  /**
    * Context window size for this model (tokens).
    * Used for token tracking and context-left-percent calculation.
    */
@@ -157,7 +169,6 @@ export abstract class BaseModelAdapter {
    * Default: delegates to the centralized getModelPricing.
    */
   getPricing(providerName: string): ModelPricing {
-    const { getModelPricing } = require("../handlers/shared/remote-provider-types.js");
     return getModelPricing(providerName, this.modelId);
   }
 

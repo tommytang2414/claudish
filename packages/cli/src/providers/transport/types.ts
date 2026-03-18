@@ -37,6 +37,14 @@ export interface ProviderTransport {
   getHeaders(): Promise<Record<string, string>>;
 
   /**
+   * Override the adapter's stream format selection.
+   * Only needed for aggregator providers (OpenRouter, LiteLLM) that normalize
+   * response formats server-side, regardless of the underlying model.
+   * If undefined, the adapter's getStreamFormat() is used.
+   */
+  overrideStreamFormat?(): StreamFormat;
+
+  /**
    * Extra fields to merge into the request payload.
    * Used for provider-specific keys like `extra_headers` (LiteLLM),
    * `provider` overrides (OpenRouter), etc.

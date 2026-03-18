@@ -10,18 +10,27 @@
 import { BaseModelAdapter, AdapterResult } from "./base-adapter";
 import { log } from "../logger";
 
-/** GLM model context windows */
-const GLM_CONTEXT_WINDOWS: Record<string, number> = {
-  "glm-5": 128_000,
-  "glm-4-plus": 128_000,
-  "glm-4-long": 1_000_000,
-  "glm-4-flash": 128_000,
-  "glm-4": 128_000,
-  "glm-3-turbo": 128_000,
-};
+/** GLM model context windows (pattern-match, checked in order) */
+const GLM_CONTEXT_WINDOWS: Array<[string, number]> = [
+  ["glm-5", 204_800],
+  ["glm-4.7-flash", 200_000],
+  ["glm-4.7", 204_800],
+  ["glm-4.6v", 128_000],
+  ["glm-4.6", 204_800],
+  ["glm-4.5v", 64_000],
+  ["glm-4.5-flash", 131_072],
+  ["glm-4.5-air", 131_072],
+  ["glm-4.5", 131_072],
+  ["glm-4-long", 1_000_000],
+  ["glm-4-plus", 128_000],
+  ["glm-4-flash", 128_000],
+  ["glm-4", 128_000],
+  ["glm-3-turbo", 128_000],
+  ["glm-", 131_072],
+];
 
-/** GLM models that support vision */
-const GLM_VISION_MODELS = ["glm-4v", "glm-4v-plus", "glm-5"];
+/** GLM models that support vision (explicit list for clarity) */
+const GLM_VISION_MODELS = ["glm-4v", "glm-4v-plus", "glm-4.5v", "glm-4.6v", "glm-5"];
 
 export class GLMAdapter extends BaseModelAdapter {
   processTextContent(textContent: string, accumulatedText: string): AdapterResult {
@@ -52,7 +61,7 @@ export class GLMAdapter extends BaseModelAdapter {
 
   getContextWindow(): number {
     const lower = this.modelId.toLowerCase();
-    for (const [pattern, size] of Object.entries(GLM_CONTEXT_WINDOWS)) {
+    for (const [pattern, size] of GLM_CONTEXT_WINDOWS) {
       if (lower.includes(pattern)) return size;
     }
     return 128_000;

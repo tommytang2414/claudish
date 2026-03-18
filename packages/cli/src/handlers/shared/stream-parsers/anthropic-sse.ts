@@ -36,6 +36,11 @@ export function createAnthropicPassthroughStream(
           let inputTokens = 0;
           let outputTokens = 0;
 
+          let totalLines = 0;
+          let textChunks = 0;
+          let toolUseBlocks = 0;
+          let stopReason: string | null = null;
+
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -44,13 +49,16 @@ export function createAnthropicPassthroughStream(
             buffer = lines.pop() || "";
 
             for (const line of lines) {
+              totalLines++;
               if (!isClosed) {
                 // Pass through SSE events as-is
                 controller.enqueue(encoder.encode(line + "\n"));
               }
 
-              // Extract usage from message_delta or message_start events
+              // Extract usage and debug info from SSE events
               if (line.startsWith("data: ")) {
+                log(`[SSE:anthropic] ${line.slice(6).substring(0, 300)}`);
+
                 try {
                   const data = JSON.parse(line.slice(6));
                   if (data.message?.usage) {
@@ -60,10 +68,27 @@ export function createAnthropicPassthroughStream(
                   if (data.usage) {
                     outputTokens = data.usage.output_tokens || outputTokens;
                   }
+                  // Log text content for debugging
+                  if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+                    const txt = data.delta.text || "";
+                    textChunks++;
+                    log(`[AnthropicSSE] Text chunk: "${txt.substring(0, 30).replace(/\n/g, "\\n")}" (${txt.length} chars)`);
+                  }
+                  // Track tool_use blocks
+                  if (data.type === "content_block_start" && data.content_block?.type === "tool_use") {
+                    toolUseBlocks++;
+                    log(`[AnthropicSSE] Tool use: ${data.content_block.name}`);
+                  }
+                  // Track stop reason
+                  if (data.type === "message_delta" && data.delta?.stop_reason) {
+                    stopReason = data.delta.stop_reason;
+                  }
                 } catch {}
               }
             }
           }
+
+          log(`[AnthropicSSE] Stream complete for ${opts.modelName}: ${totalLines} lines, ${textChunks} text chunks, ${toolUseBlocks} tool_use blocks, stop_reason=${stopReason}`);
 
           if (opts.onTokenUpdate) {
             opts.onTokenUpdate(inputTokens, outputTokens);

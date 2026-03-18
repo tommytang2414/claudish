@@ -623,9 +623,14 @@ export class ComposedHandler implements ModelHandler {
       }
     };
 
-    // Stream format: adapter knows the target API's response format.
-    // Transport can override for aggregators that normalize format.
-    const streamFormat = this.provider.overrideStreamFormat?.() ?? this.getAdapter().getStreamFormat();
+    // Stream format priority:
+    //   1. Transport override (aggregators like LiteLLM/OpenRouter normalize server-side)
+    //   2. Model adapter (CodexAdapter → openai-responses-sse; overrides provider adapter)
+    //   3. Provider adapter (explicit adapter passed to ComposedHandler)
+    const streamFormat =
+      this.provider.overrideStreamFormat?.() ??
+      this.modelAdapter?.getStreamFormat() ??
+      this.getAdapter().getStreamFormat();
     switch (streamFormat) {
       case "openai-sse":
         return createStreamingResponseHandler(

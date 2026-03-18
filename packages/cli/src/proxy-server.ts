@@ -52,6 +52,7 @@ import {
   matchRoutingRule,
   buildRoutingChain,
 } from "./providers/routing-rules.js";
+import { createHandlerForProvider } from "./providers/provider-profiles.js";
 
 export interface ProxyServerOptions {
   summarizeTools?: boolean; // Summarize tool descriptions for local models
@@ -242,202 +243,16 @@ export async function createProxyServer(
         ? process.env[resolved.provider.apiKeyEnvVar] || ""
         : "";
 
-      let handler: ModelHandler;
-      if (resolved.provider.name === "gemini") {
-        const gemProvider = new GeminiApiKeyProvider(resolved.provider, resolved.modelName, apiKey);
-        const gemAdapter = new GeminiAdapter(resolved.modelName);
-        handler = new ComposedHandler(gemProvider, targetModel, resolved.modelName, port, {
-          adapter: gemAdapter,
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created Gemini handler (composed): ${resolved.modelName}`);
-      } else if (resolved.provider.name === "gemini-codeassist") {
-        const gcaProvider = new GeminiCodeAssistProvider(resolved.modelName);
-        const gcaAdapter = new GeminiAdapter(resolved.modelName);
-        handler = new ComposedHandler(gcaProvider, targetModel, resolved.modelName, port, {
-          adapter: gcaAdapter,
-          unwrapGeminiResponse: true,
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created Gemini Code Assist handler (composed): ${resolved.modelName}`);
-      } else if (resolved.provider.name === "openai") {
-        // OpenAI uses ComposedHandler with OpenAIProvider + OpenAIAdapter
-        const oaiProvider = new OpenAIProvider(resolved.provider, resolved.modelName, apiKey);
-        const oaiAdapter = new OpenAIAdapter(resolved.modelName);
-        handler = new ComposedHandler(oaiProvider, targetModel, resolved.modelName, port, {
-          adapter: oaiAdapter,
-          tokenStrategy: "delta-aware",
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created OpenAI handler (composed): ${resolved.modelName}`);
-      } else if (
-        resolved.provider.name === "minimax" ||
-        resolved.provider.name === "minimax-coding" ||
-        resolved.provider.name === "kimi" ||
-        resolved.provider.name === "kimi-coding" ||
-        resolved.provider.name === "zai"
-      ) {
-        // MiniMax, Kimi, Kimi Coding, and Z.AI use Anthropic-compatible APIs — composed handler
-        const acProvider = new AnthropicCompatProvider(resolved.provider, apiKey);
-        const acAdapter = new AnthropicPassthroughAdapter(
-          resolved.modelName,
-          resolved.provider.name
-        );
-        handler = new ComposedHandler(acProvider, targetModel, resolved.modelName, port, {
-          adapter: acAdapter,
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created ${resolved.provider.name} handler (composed): ${resolved.modelName}`);
-      } else if (resolved.provider.name === "glm" || resolved.provider.name === "glm-coding") {
-        // GLM and GLM Coding Plan use OpenAI-compatible API — composed handler
-        const glmProvider = new OpenAIProvider(resolved.provider, resolved.modelName, apiKey);
-        const glmAdapter = new OpenAIAdapter(resolved.modelName);
-        handler = new ComposedHandler(glmProvider, targetModel, resolved.modelName, port, {
-          adapter: glmAdapter,
-          tokenStrategy: "delta-aware",
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created ${resolved.provider.name} handler (composed): ${resolved.modelName}`);
-      } else if (
-        resolved.provider.name === "opencode-zen" ||
-        resolved.provider.name === "opencode-zen-go"
-      ) {
-        // OpenCode Zen — two tiers:
-        //   zen/  (opencode-zen):    free anonymous models + full paid access (OPENCODE_API_KEY)
-        //   zgo/  (opencode-zen-go): go-plan models (glm-5, minimax-m2.5, kimi-k2.5) via zen/go/v1/
-        // Free anonymous models work without a key; use "public" as fallback for consistent rate-limit bucket
-        const zenApiKey = apiKey || "public";
-        const isGoProvider = resolved.provider.name === "opencode-zen-go";
-        if (resolved.modelName.toLowerCase().includes("minimax")) {
-          const zenAcProvider = new AnthropicCompatProvider(resolved.provider, zenApiKey);
-          const zenAcAdapter = new AnthropicPassthroughAdapter(
-            resolved.modelName,
-            resolved.provider.name
-          );
-          handler = new ComposedHandler(zenAcProvider, targetModel, resolved.modelName, port, {
-            adapter: zenAcAdapter,
-            isInteractive: options.isInteractive,
-            invocationMode,
-          });
-          log(
-            `[Proxy] Created OpenCode Zen${isGoProvider ? " Go" : ""} (Anthropic composed): ${resolved.modelName}`
-          );
-        } else {
-          const zenProvider = new OpenAIProvider(resolved.provider, resolved.modelName, zenApiKey);
-          const zenAdapter = new OpenAIAdapter(resolved.modelName);
-          handler = new ComposedHandler(zenProvider, targetModel, resolved.modelName, port, {
-            adapter: zenAdapter,
-            tokenStrategy: "delta-aware",
-            isInteractive: options.isInteractive,
-            invocationMode,
-          });
-          log(
-            `[Proxy] Created OpenCode Zen${isGoProvider ? " Go" : ""} (composed): ${resolved.modelName}`
-          );
-        }
-      } else if (resolved.provider.name === "ollamacloud") {
-        // OllamaCloud uses Ollama native API (NOT OpenAI-compatible) — composed handler
-        const ocProvider = new OllamaCloudProvider(resolved.provider, apiKey);
-        const ocAdapter = new OllamaCloudAdapter(resolved.modelName);
-        handler = new ComposedHandler(ocProvider, targetModel, resolved.modelName, port, {
-          adapter: ocAdapter,
-          tokenStrategy: "accumulate-both",
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(`[Proxy] Created OllamaCloud handler (composed): ${resolved.modelName}`);
-      } else if (resolved.provider.name === "litellm") {
-        // LiteLLM uses OpenAI-compatible API format — composed handler
-        if (!resolved.provider.baseUrl) {
-          logStderr("Error: LITELLM_BASE_URL or --litellm-url is required for LiteLLM provider.");
-          logStderr("Set it with: export LITELLM_BASE_URL='https://your-litellm-instance.com'");
-          logStderr(
-            "Or use: claudish --litellm-url https://your-instance.com --model litellm@model 'task'"
-          );
-          return null;
-        }
-        const provider = new LiteLLMProvider(resolved.provider.baseUrl, apiKey, resolved.modelName);
-        const adapter = new LiteLLMAdapter(resolved.modelName, resolved.provider.baseUrl);
-        handler = new ComposedHandler(provider, targetModel, resolved.modelName, port, {
-          adapter,
-          isInteractive: options.isInteractive,
-          invocationMode,
-        });
-        log(
-          `[Proxy] Created LiteLLM handler (composed): ${resolved.modelName} (${resolved.provider.baseUrl})`
-        );
-      } else if (resolved.provider.name === "vertex") {
-        // Vertex AI supports two modes:
-        // 1. Express Mode (API key) - for Gemini models
-        // 2. OAuth Mode (project/service account) - for all models including partners
-        const hasApiKey = !!process.env.VERTEX_API_KEY;
-        const vertexConfig = getVertexConfig();
-
-        if (hasApiKey) {
-          // Express Mode - Vertex Express uses the standard Gemini API endpoint
-          // but with VERTEX_API_KEY instead of GEMINI_API_KEY.
-          // We must use the Gemini provider config (which has the correct baseUrl/apiPath)
-          // because the vertex provider config has empty baseUrl/apiPath (designed for OAuth mode).
-          const geminiConfig = getRegisteredRemoteProviders().find((p) => p.name === "gemini");
-          const expressProvider = geminiConfig || resolved.provider;
-          const vxGemProvider = new GeminiApiKeyProvider(
-            expressProvider,
-            resolved.modelName,
-            process.env.VERTEX_API_KEY!
-          );
-          const vxGemAdapter = new GeminiAdapter(resolved.modelName);
-          handler = new ComposedHandler(vxGemProvider, targetModel, resolved.modelName, port, {
-            adapter: vxGemAdapter,
-            isInteractive: options.isInteractive,
-            invocationMode,
-          });
-          log(`[Proxy] Created Vertex AI Express handler (composed): ${resolved.modelName}`);
-        } else if (vertexConfig) {
-          // OAuth Mode - ComposedHandler with publisher-specific adapter
-          const oauthError = validateVertexOAuthConfig();
-          if (oauthError) {
-            log(`[Proxy] Vertex OAuth config error: ${oauthError}`);
-            return null;
-          }
-          const parsed = parseVertexModel(resolved.modelName);
-          const vxProvider = new VertexOAuthProvider(vertexConfig, parsed);
-
-          // Select adapter based on publisher
-          let vxAdapter;
-          const handlerOpts: any = {};
-          if (parsed.publisher === "google") {
-            vxAdapter = new GeminiAdapter(resolved.modelName);
-          } else if (parsed.publisher === "anthropic") {
-            vxAdapter = new AnthropicPassthroughAdapter(parsed.model, "vertex");
-          } else {
-            // Mistral/Meta use OpenAI format; Mistral rawPredict uses bare model name
-            const modelId =
-              parsed.publisher === "mistralai"
-                ? parsed.model
-                : `${parsed.publisher}/${parsed.model}`;
-            vxAdapter = new DefaultAdapter(modelId);
-          }
-
-          handler = new ComposedHandler(vxProvider, targetModel, resolved.modelName, port, {
-            adapter: vxAdapter,
-            ...handlerOpts,
-            isInteractive: options.isInteractive,
-            invocationMode,
-          });
-          log(
-            `[Proxy] Created Vertex AI OAuth handler (composed): ${resolved.modelName} [${parsed.publisher}] (project: ${vertexConfig.projectId})`
-          );
-        } else {
-          log(`[Proxy] Vertex AI requires either VERTEX_API_KEY or VERTEX_PROJECT`);
-          return null;
-        }
-      } else {
-        return null; // Unknown provider
+      const handler = createHandlerForProvider({
+        provider: resolved.provider,
+        modelName: resolved.modelName,
+        apiKey,
+        targetModel,
+        port,
+        sharedOpts: { isInteractive: options.isInteractive, invocationMode },
+      });
+      if (!handler) {
+        return null; // Profile returned null (missing config) or unknown provider
       }
 
       // Cache under both the original targetModel and the resolveTarget (if different)

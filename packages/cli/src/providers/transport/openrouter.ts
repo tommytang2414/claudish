@@ -26,6 +26,14 @@ export class OpenRouterProvider implements ProviderTransport {
     this.queue = OpenRouterRequestQueue.getInstance();
   }
 
+  /**
+   * OpenRouter normalizes all responses to OpenAI SSE format server-side,
+   * regardless of the underlying model (even if the adapter declares anthropic-sse).
+   */
+  overrideStreamFormat(): StreamFormat {
+    return "openai-sse";
+  }
+
   getEndpoint(): string {
     return OPENROUTER_API_URL;
   }

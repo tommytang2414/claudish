@@ -33,6 +33,14 @@ export class LiteLLMProvider implements ProviderTransport {
     this.modelName = modelName;
   }
 
+  /**
+   * LiteLLM normalizes all responses to OpenAI SSE format server-side,
+   * regardless of the underlying model (even if the adapter declares anthropic-sse).
+   */
+  overrideStreamFormat(): StreamFormat {
+    return "openai-sse";
+  }
+
   getEndpoint(): string {
     return `${this.baseUrl}/v1/chat/completions`;
   }

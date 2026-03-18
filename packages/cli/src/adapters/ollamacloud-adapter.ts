@@ -9,6 +9,7 @@
  */
 
 import { BaseModelAdapter, type AdapterResult } from "./base-adapter.js";
+import type { StreamFormat } from "../providers/transport/types.js";
 
 export class OllamaCloudAdapter extends BaseModelAdapter {
   constructor(modelId: string) {
@@ -75,6 +76,10 @@ export class OllamaCloudAdapter extends BaseModelAdapter {
       messages,
       stream: true,
     };
+  }
+
+  override getStreamFormat(): StreamFormat {
+    return "ollama-jsonl";
   }
 
   override getContextWindow(): number {

@@ -1245,6 +1245,15 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
       hasCredentials: boolean;
       credentialHint?: string;
     }>;
+    wiring?: {
+      formatAdapter: string;
+      declaredStreamFormat: string;
+      modelTranslator: string;
+      contextWindow: number;
+      supportsVision: boolean;
+      transportOverride: string | null;
+      effectiveStreamFormat: string;
+    };
   }
 
   const results: ProbeResult[] = [];
@@ -1337,6 +1346,79 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
       };
     });
 
+    // Compute adapter wiring for the first-ready provider
+    let wiring: ProbeResult["wiring"] = undefined;
+    const firstReadyRoute = chainDetails.find((c) => c.hasCredentials);
+    if (firstReadyRoute) {
+      const providerName = firstReadyRoute.provider;
+
+      // Resolve model name from the model spec (strip provider prefix if present)
+      const { resolveRemoteProvider } = await import("./providers/remote-provider-registry.js");
+      const resolvedSpec = resolveRemoteProvider(firstReadyRoute.modelSpec);
+      const modelName = resolvedSpec?.modelName || parsed.model;
+
+      // Determine format adapter from provider name (mirrors provider-profiles.ts)
+      let formatAdapterName = "OpenAIAdapter";
+      let declaredStreamFormat = "openai-sse";
+
+      const anthropicCompatProviders = ["minimax", "minimax-coding", "kimi", "kimi-coding", "zai"];
+      const isMinimaxModel = modelName.toLowerCase().includes("minimax");
+
+      if (anthropicCompatProviders.includes(providerName)) {
+        formatAdapterName = "AnthropicPassthroughAdapter";
+        declaredStreamFormat = "anthropic-sse";
+      } else if (
+        (providerName === "opencode-zen" || providerName === "opencode-zen-go") &&
+        isMinimaxModel
+      ) {
+        formatAdapterName = "AnthropicPassthroughAdapter";
+        declaredStreamFormat = "anthropic-sse";
+      } else if (providerName === "gemini" || providerName === "gemini-codeassist") {
+        formatAdapterName = "GeminiAdapter";
+        declaredStreamFormat = "gemini-sse";
+      } else if (providerName === "ollamacloud") {
+        formatAdapterName = "OllamaCloudAdapter";
+        declaredStreamFormat = "openai-sse";
+      } else if (providerName === "litellm") {
+        formatAdapterName = "LiteLLMAdapter";
+        declaredStreamFormat = "openai-sse";
+      } else {
+        // openai, glm, glm-coding, opencode-zen (non-minimax), opencode-zen-go (non-minimax)
+        formatAdapterName = "OpenAIAdapter";
+        declaredStreamFormat = "openai-sse";
+      }
+
+      // Get model translator via AdapterManager
+      const { AdapterManager } = await import("./adapters/adapter-manager.js");
+      const adapterManager = new AdapterManager(modelName);
+      const modelTranslator = adapterManager.getAdapter();
+      const modelTranslatorName = modelTranslator.getName();
+
+      // Transport overrides (aggregators that normalize responses to openai-sse)
+      const TRANSPORT_OVERRIDES: Record<string, string> = {
+        litellm: "openai-sse",
+        openrouter: "openai-sse",
+      };
+      const transportOverride = TRANSPORT_OVERRIDES[providerName] || null;
+
+      // Effective stream format: transport override wins, then model translator format (if not default),
+      // then the format adapter's declared format
+      const modelTranslatorFormat =
+        modelTranslatorName !== "DefaultAdapter" ? modelTranslator.getStreamFormat() : null;
+      const effectiveStreamFormat =
+        transportOverride || modelTranslatorFormat || declaredStreamFormat;
+
+      wiring = {
+        formatAdapter: formatAdapterName,
+        declaredStreamFormat,
+        modelTranslator: modelTranslatorName,
+        contextWindow: modelTranslator.getContextWindow(),
+        supportsVision: modelTranslator.supportsVision(),
+        transportOverride,
+        effectiveStreamFormat,
+      };
+    }
+
     results.push({
       model: modelInput,
       nativeProvider: parsed.provider,
@@ -1344,6 +1426,7 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
       routingSource: chain.source,
       matchedPattern: chain.matchedPattern,
       chain: chainDetails,
+      wiring,
     });
   }
 
@@ -1421,6 +1504,41 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
         console.log(
           `\n  ${DIM}  Will use: ${RESET}${GREEN}${firstReady.displayName}${RESET}${DIM} (${readyCount}/${result.chain.length} providers available)${RESET}`
         );
+
+        if (result.wiring) {
+          const w = result.wiring;
+          console.log("");
+          console.log(`  ${DIM}  Wiring:${RESET}`);
+          console.log(
+            `  ${DIM}    Format:     ${RESET}${w.formatAdapter}  ${DIM}→ ${w.declaredStreamFormat}${RESET}`
+          );
+
+          const ctxDisplay =
+            w.contextWindow >= 1_000_000
+              ? `${(w.contextWindow / 1_000_000).toFixed(1)}M`
+              : `${Math.round(w.contextWindow / 1000)}K`;
+          const visionDisplay = w.supportsVision ? `${GREEN}yes${RESET}` : `${RED}no${RESET}`;
+          console.log(
+            `  ${DIM}    Translator: ${RESET}${w.modelTranslator}  ${DIM}(${ctxDisplay} context, vision: ${visionDisplay}${DIM})${RESET}`
+          );
+
+          if (w.transportOverride) {
+            console.log(
+              `  ${DIM}    Override:   ${RESET}${YELLOW}transport overrides → ${w.transportOverride}${RESET}`
+            );
+          }
+
+          const parserColor =
+            w.effectiveStreamFormat === w.declaredStreamFormat ? GREEN : YELLOW;
+          const parserNote = w.transportOverride
+            ? `${DIM}← transport override wins${RESET}`
+            : w.effectiveStreamFormat !== w.declaredStreamFormat
+              ? `${DIM}← model translator wins${RESET}`
+              : "";
+          console.log(
+            `  ${DIM}    Parser:     ${RESET}${parserColor}${w.effectiveStreamFormat}${RESET}  ${parserNote}`
+          );
+        }
       }
     }
 
@@ -1435,6 +1553,11 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
   console.log("");
   console.log(`  ${DIM}Chain order: LiteLLM → Zen Go → Subscription → Native API → OpenRouter${RESET}`);
   console.log(`  ${DIM}Custom rules in .claudish.json or ~/.claudish/config.json override default chain${RESET}`);
+  console.log("");
+  console.log(`  ${DIM}Wiring shows the full adapter composition: format adapter → stream parser${RESET}`);
+  console.log(
+    `  ${DIM}Override occurs when aggregators (LiteLLM, OpenRouter) normalize response format${RESET}`
+  );
   console.log("");
 }
 
