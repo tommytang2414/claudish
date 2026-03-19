@@ -1,5 +1,6 @@
-import { writeFileSync, appendFile, existsSync, mkdirSync } from "fs";
+import { writeFileSync, appendFile, existsSync, mkdirSync, readdirSync, unlinkSync } from "fs";
 import { join } from "path";
+import { homedir } from "os";
 
 let logFilePath: string | null = null;
 let logLevel: "debug" | "info" | "minimal" = "info"; // Default to structured logging
@@ -8,6 +9,10 @@ let logBuffer: string[] = []; // Buffer for async writes
 let flushTimer: NodeJS.Timeout | null = null;
 const FLUSH_INTERVAL_MS = 100; // Flush every 100ms
 const MAX_BUFFER_SIZE = 50; // Flush if buffer exceeds 50 messages
+
+// Tier 1: Always-on structural logging state
+let alwaysOnLogPath: string | null = null;
+let alwaysOnBuffer: string[] = [];
 
 /**
  * Flush log buffer to file (async)
@@ -27,6 +32,16 @@ function flushLogBuffer(): void {
 }
 
 /**
+ * Flush always-on structural log buffer to file (async)
+ */
+function flushAlwaysOnBuffer(): void {
+  if (!alwaysOnLogPath || alwaysOnBuffer.length === 0) return;
+  const toWrite = alwaysOnBuffer.join("");
+  alwaysOnBuffer = [];
+  appendFile(alwaysOnLogPath, toWrite, () => {});
+}
+
+/**
  * Schedule periodic buffer flush
  */
 function scheduleFlush(): void {
@@ -34,6 +49,7 @@ function scheduleFlush(): void {
 
   flushTimer = setInterval(() => {
     flushLogBuffer();
+    flushAlwaysOnBuffer();
   }, FLUSH_INTERVAL_MS);
 
   // Cleanup on process exit
@@ -47,49 +63,170 @@ function scheduleFlush(): void {
       writeFileSync(logFilePath, logBuffer.join(""), { flag: "a" });
       logBuffer = [];
     }
+    if (alwaysOnLogPath && alwaysOnBuffer.length > 0) {
+      writeFileSync(alwaysOnLogPath, alwaysOnBuffer.join(""), { flag: "a" });
+      alwaysOnBuffer = [];
+    }
   });
+}
+
+/**
+ * Keep only the most recent N log files, delete older ones.
+ */
+function rotateOldLogs(dir: string, keep: number): void {
+  try {
+    const files = readdirSync(dir)
+      .filter((f) => f.startsWith("claudish_") && f.endsWith(".log"))
+      .sort()
+      .reverse();
+    for (const file of files.slice(keep)) {
+      try {
+        unlinkSync(join(dir, file));
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Strip content from a JSON SSE line, preserving structure.
+ * Replaces string values longer than 20 chars with "<N chars>".
+ * Preserves: keys, numbers, booleans, nulls, short strings (model names, event types, finish reasons).
+ */
+export function structuralRedact(jsonStr: string): string {
+  try {
+    const obj = JSON.parse(jsonStr);
+    return JSON.stringify(redactDeep(obj));
+  } catch {
+    // Not valid JSON — redact long strings inline
+    return jsonStr.replace(/"[^"]{20,}"/g, (m) => `"<${m.length - 2} chars>"`);
+  }
+}
+
+/** Keys that always carry model/user content — redact regardless of length */
+const CONTENT_KEYS = new Set([
+  "content", "reasoning_content", "text", "thinking",
+  "partial_json", "arguments", "input",
+]);
+
+function redactDeep(val: any, key?: string): any {
+  if (val === null || val === undefined) return val;
+  if (typeof val === "boolean" || typeof val === "number") return val;
+  if (typeof val === "string") {
+    // Content keys: always redact (these carry model/user text)
+    if (key && CONTENT_KEYS.has(key)) {
+      return `<${val.length} chars>`;
+    }
+    // Other strings: keep short ones (model names, event types, tool names, finish reasons)
+    return val.length <= 20 ? val : `<${val.length} chars>`;
+  }
+  if (Array.isArray(val)) return val.map((v) => redactDeep(v));
+  if (typeof val === "object") {
+    const result: any = {};
+    for (const [k, v] of Object.entries(val)) {
+      result[k] = redactDeep(v, k);
+    }
+    return result;
+  }
+  return val;
+}
+
+/**
+ * Determine if a log message should be written to the always-on structural log.
+ * Only structural/diagnostic messages, not verbose debug noise.
+ */
+function isStructuralLogWorthy(msg: string): boolean {
+  return (
+    msg.startsWith("[SSE:") ||
+    msg.startsWith("[Proxy]") ||
+    msg.startsWith("[Fallback]") ||
+    msg.startsWith("[Streaming] ===") || // HANDLER STARTED
+    msg.startsWith("[Streaming] Chunk:") ||
+    msg.startsWith("[Streaming] Received") ||
+    msg.startsWith("[Streaming] Text-based tool calls") ||
+    msg.startsWith("[Streaming] Final usage") ||
+    msg.startsWith("[Streaming] Sending") ||
+    msg.startsWith("[AnthropicSSE] Stream complete") ||
+    msg.startsWith("[AnthropicSSE] Tool use:") ||
+    msg.includes("Response status:") ||
+    msg.includes("Error") ||
+    msg.includes("error") ||
+    msg.includes("[Auto-route]")
+  );
+}
+
+/**
+ * Redact content from a log line for structural logging.
+ * SSE lines get JSON structural redaction. Other lines pass through.
+ */
+function redactLogLine(message: string, timestamp: string): string {
+  // SSE raw events: redact the JSON payload
+  if (message.startsWith("[SSE:")) {
+    const prefixEnd = message.indexOf("] ") + 2;
+    const prefix = message.substring(0, prefixEnd);
+    const payload = message.substring(prefixEnd);
+    return `[${timestamp}] ${prefix}${structuralRedact(payload)}\n`;
+  }
+  // Other lines: pass through (they don't contain user content)
+  return `[${timestamp}] ${message}\n`;
 }
 
 /**
  * Initialize file logging for this session
  */
-export function initLogger(debugMode: boolean, level: "debug" | "info" | "minimal" = "info"): void {
-  if (!debugMode) {
+export function initLogger(
+  debugMode: boolean,
+  level: "debug" | "info" | "minimal" = "info",
+  noLogs: boolean = false
+): void {
+  // Tier 1: Always-on structural logging (unless --no-logs)
+  if (!noLogs) {
+    const logsDir = join(homedir(), ".claudish", "logs");
+    if (!existsSync(logsDir)) {
+      mkdirSync(logsDir, { recursive: true });
+    }
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .split("T")
+      .join("_")
+      .slice(0, -5);
+    alwaysOnLogPath = join(logsDir, `claudish_${timestamp}.log`);
+    writeFileSync(
+      alwaysOnLogPath,
+      `Claudish Session Log - ${new Date().toISOString()}\nMode: structural (content redacted)\n${"=".repeat(60)}\n\n`
+    );
+    rotateOldLogs(logsDir, 20);
+    // Start flush timer if not already running
+    scheduleFlush();
+  }
+
+  // Tier 2: Debug verbose logging (existing behavior, only with --debug)
+  if (debugMode) {
+    logLevel = level;
+    const logsDir = join(process.cwd(), "logs");
+    if (!existsSync(logsDir)) {
+      mkdirSync(logsDir, { recursive: true });
+    }
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, "-")
+      .split("T")
+      .join("_")
+      .slice(0, -5);
+    logFilePath = join(logsDir, `claudish_${timestamp}.log`);
+    writeFileSync(
+      logFilePath,
+      `Claudish Debug Log - ${new Date().toISOString()}\nLog Level: ${level}\n${"=".repeat(80)}\n\n`
+    );
+    scheduleFlush();
+  } else {
     logFilePath = null;
-    // Clear any existing timer
-    if (flushTimer) {
+    // Clear any existing timer only if always-on is also disabled
+    if (noLogs && flushTimer) {
       clearInterval(flushTimer);
       flushTimer = null;
     }
-    return;
   }
-
-  // Set log level
-  logLevel = level;
-
-  // Create logs directory if it doesn't exist
-  const logsDir = join(process.cwd(), "logs");
-  if (!existsSync(logsDir)) {
-    mkdirSync(logsDir, { recursive: true });
-  }
-
-  // Create log file with timestamp
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, "-")
-    .split("T")
-    .join("_")
-    .slice(0, -5);
-  logFilePath = join(logsDir, `claudish_${timestamp}.log`);
-
-  // Write header (sync on init is fine)
-  writeFileSync(
-    logFilePath,
-    `Claudish Debug Log - ${new Date().toISOString()}\nLog Level: ${level}\n${"=".repeat(80)}\n\n`
-  );
-
-  // Start periodic flush timer
-  scheduleFlush();
 }
 
 /**
@@ -100,6 +237,7 @@ export function log(message: string, forceConsole = false): void {
   const timestamp = new Date().toISOString();
   const logLine = `[${timestamp}] ${message}\n`;
 
+  // Tier 2: Debug log (full content, existing behavior)
   if (logFilePath) {
     // Add to buffer (non-blocking)
     logBuffer.push(logLine);
@@ -107,6 +245,15 @@ export function log(message: string, forceConsole = false): void {
     // Flush immediately if buffer is getting large
     if (logBuffer.length >= MAX_BUFFER_SIZE) {
       flushLogBuffer();
+    }
+  }
+
+  // Tier 1: Always-on structural log (redacted content)
+  if (alwaysOnLogPath && isStructuralLogWorthy(message)) {
+    const redactedLine = redactLogLine(message, timestamp);
+    alwaysOnBuffer.push(redactedLine);
+    if (alwaysOnBuffer.length >= MAX_BUFFER_SIZE) {
+      flushAlwaysOnBuffer();
     }
   }
 
@@ -144,10 +291,17 @@ export function getLogFilePath(): string | null {
 }
 
 /**
+ * Get the always-on structural log file path
+ */
+export function getAlwaysOnLogPath(): string | null {
+  return alwaysOnLogPath;
+}
+
+/**
  * Check if logging is enabled (useful for optimizing expensive log operations)
  */
 export function isLoggingEnabled(): boolean {
-  return logFilePath !== null;
+  return logFilePath !== null || alwaysOnLogPath !== null;
 }
 
 /**

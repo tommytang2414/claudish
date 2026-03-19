@@ -594,3 +594,53 @@ describe("ProviderProfile table completeness", () => {
 //     expect(extractText(events).length).toBeGreaterThan(0);
 //   });
 // });
+
+describe("Structural log redaction", () => {
+  test("redacts long string content but keeps short strings", async () => {
+    const { structuralRedact } = await import("./logger.js");
+    const input =
+      '{"choices":[{"delta":{"content":"This is a very long text that should be redacted because it exceeds twenty characters"},"finish_reason":null}]}';
+    const result = structuralRedact(input);
+    const parsed = JSON.parse(result);
+    expect(parsed.choices[0].delta.content).toMatch(/^<\d+ chars>$/);
+    expect(parsed.choices[0].finish_reason).toBeNull();
+  });
+
+  test("preserves model names and event types (short strings)", async () => {
+    const { structuralRedact } = await import("./logger.js");
+    const input =
+      '{"type":"message_start","message":{"model":"gpt-5.4","role":"assistant"}}';
+    const result = structuralRedact(input);
+    const parsed = JSON.parse(result);
+    expect(parsed.type).toBe("message_start");
+    expect(parsed.message.model).toBe("gpt-5.4");
+    expect(parsed.message.role).toBe("assistant");
+  });
+
+  test("preserves numbers and booleans", async () => {
+    const { structuralRedact } = await import("./logger.js");
+    const input = '{"usage":{"prompt_tokens":1250,"completion_tokens":89},"stream":true}';
+    const result = structuralRedact(input);
+    const parsed = JSON.parse(result);
+    expect(parsed.usage.prompt_tokens).toBe(1250);
+    expect(parsed.stream).toBe(true);
+  });
+
+  test("preserves tool call names but redacts arguments", async () => {
+    const { structuralRedact } = await import("./logger.js");
+    const input =
+      '{"choices":[{"delta":{"tool_calls":[{"function":{"name":"Read","arguments":"{\\\"file_path\\\":\\\"/Users/jack/secret/important-file.ts\\\"}"}}]}}]}';
+    const result = structuralRedact(input);
+    const parsed = JSON.parse(result);
+    expect(parsed.choices[0].delta.tool_calls[0].function.name).toBe("Read");
+    // Arguments string is >20 chars so should be redacted
+    expect(parsed.choices[0].delta.tool_calls[0].function.arguments).toMatch(/^<\d+ chars>$/);
+  });
+
+  test("handles non-JSON gracefully", async () => {
+    const { structuralRedact } = await import("./logger.js");
+    const input = "[DONE]";
+    const result = structuralRedact(input);
+    expect(result).toBe("[DONE]");
+  });
+});

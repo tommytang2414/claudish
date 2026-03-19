@@ -35,6 +35,8 @@ export interface ClaudishConfig {
 
   // Local model optimizations
   summarizeTools?: boolean; // Summarize tool descriptions to reduce prompt size for local models
+
+  noLogs: boolean; // Disable always-on structural logging
 }
 
 // Anthropic API Types

@@ -93,6 +93,7 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     monitor: false, // Monitor mode disabled by default
     stdin: false, // Read prompt from stdin instead of args
     freeOnly: false, // Show all models by default
+    noLogs: false, // Always-on structural logging enabled by default
     claudeArgs: [],
   };
 
@@ -296,6 +297,9 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     } else if (arg === "--summarize-tools") {
       // Summarize tool descriptions to reduce prompt size for local models
       config.summarizeTools = true;
+    } else if (arg === "--no-logs") {
+      // Disable always-on structural logging to ~/.claudish/logs/
+      config.noLogs = true;
     } else if (arg === "--") {
       // Explicit separator: everything after -- passes directly to Claude Code.
       // This handles edge cases where a value starts with '-' (e.g. a system prompt
@@ -1624,6 +1628,7 @@ OPTIONS:
   -p, --profile <name>     Use named profile for model mapping (default: uses default profile)
   --port <port>            Proxy server port (default: random)
   -d, --debug              Enable debug logging to file (logs/claudish_*.log)
+  --no-logs                Disable always-on structural logging (~/.claudish/logs/)
   --log-level <level>      Log verbosity: debug (full), info (truncated), minimal (labels only)
   -q, --quiet              Suppress [claudish] log messages (default in single-shot mode)
   -v, --verbose            Show [claudish] log messages (default in interactive mode)

@@ -77,6 +77,8 @@ const isTelemetryCommand = args[0] === "telemetry";
 const isStatsCommand = args[0] === "stats";
 // Check for interactive config TUI
 const isConfigCommand = args[0] === "config";
+// Check for team orchestrator subcommand
+const isTeamCommand = args[0] === "team";
 
 if (isMcpMode) {
   // MCP server mode - dynamic import to keep CLI fast
@@ -178,6 +180,9 @@ if (isMcpMode) {
 } else if (isConfigCommand) {
   // Interactive configuration TUI: claudish config (full-screen btop-inspired TUI)
   import("./tui/index.js").then((m) => m.startConfigTui().catch(handlePromptExit));
+} else if (isTeamCommand) {
+  // Team orchestrator: claudish team run|judge|run-and-judge|status
+  import("./team-cli.js").then((m) => m.teamCommand(args.slice(1)));
 } else {
   // CLI mode
   runCli();
@@ -197,7 +202,7 @@ async function runCli() {
     getMissingKeyResolutions,
     getMissingKeysError,
   } = await import("./providers/provider-resolver.js");
-  const { initLogger, getLogFilePath, setStderrQuiet } = await import("./logger.js");
+  const { initLogger, getLogFilePath, getAlwaysOnLogPath, setStderrQuiet } = await import("./logger.js");
   const { findAvailablePort } = await import("./port-manager.js");
   const { createProxyServer } = await import("./proxy-server.js");
   const { checkForUpdates } = await import("./update-checker.js");
@@ -217,8 +222,8 @@ async function runCli() {
     // Parse CLI arguments
     const cliConfig = await parseArgs(process.argv.slice(2));
 
-    // Initialize logger if debug mode with specified log level
-    initLogger(cliConfig.debug, cliConfig.logLevel);
+    // Initialize logger: always-on structural logging + optional debug logging
+    initLogger(cliConfig.debug, cliConfig.logLevel, cliConfig.noLogs);
 
     // Initialize telemetry (reads consent, generates session_id)
     // Must come after parseArgs() so cliConfig.interactive is known
@@ -410,6 +415,13 @@ async function runCli() {
 
     if (!cliConfig.quiet) {
       console.log("[claudish] Done\n");
+    }
+
+    // Suggest sending logs if session had errors
+    const sessionLogPath = getAlwaysOnLogPath();
+    if (exitCode !== 0 && sessionLogPath && !cliConfig.quiet) {
+      console.error(`\n[claudish] Session ended with errors. Log: ${sessionLogPath}`);
+      console.error(`[claudish] To review: /debug-logs ${sessionLogPath}`);
     }
 
     process.exit(exitCode);
