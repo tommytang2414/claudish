@@ -103,9 +103,16 @@ export class TmuxDiagOutput extends LogFileDiagOutput {
     try {
       // Split a small pane (5 lines) at the bottom, detached (-d), print pane id (-P)
       // Uses execFileSync to avoid shell injection from logPath
+      // -t targets the pane where claudish is running (not whichever pane is active)
+      const targetPane = process.env.TMUX_PANE || "";
+      const args = ["split-window", "-v", "-l", "5", "-d", "-P", "-F", "#{pane_id}"];
+      if (targetPane) {
+        args.push("-t", targetPane);
+      }
+      args.push("tail", "-f", this.logPath);
       const output = execFileSync(
         "tmux",
-        ["split-window", "-v", "-l", "5", "-d", "-P", "-F", "#{pane_id}", "tail", "-f", this.logPath],
+        args,
         { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
       );
       this.paneId = output.trim();
