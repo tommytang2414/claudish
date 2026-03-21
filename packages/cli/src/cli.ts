@@ -17,7 +17,11 @@ import { fuzzyScore } from "./utils.js";
 import { getModelMapping } from "./profile-config.js";
 import { parseModelSpec } from "./providers/model-parser.js";
 import { getFallbackChain, warmZenModelCache } from "./providers/auto-route.js";
-import { loadRoutingRules, matchRoutingRule, buildRoutingChain } from "./providers/routing-rules.js";
+import {
+  loadRoutingRules,
+  matchRoutingRule,
+  buildRoutingChain,
+} from "./providers/routing-rules.js";
 // Re-export from centralized provider-resolver for backwards compatibility
 export {
   resolveModelProvider,
@@ -35,7 +39,7 @@ export {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-let VERSION = "5.17.0"; // Fallback version for compiled binaries
+let VERSION = "5.18.0"; // Fallback version for compiled binaries
 try {
   const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf-8"));
   VERSION = packageJson.version;
@@ -244,7 +248,12 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         probeModels.push(args[++i]);
       }
       // Support comma-separated: --probe minimax-m2.5,kimi-k2.5,gemini-3.1-pro-preview
-      const expandedModels = probeModels.flatMap((m) => m.split(",").map((s) => s.trim()).filter(Boolean));
+      const expandedModels = probeModels.flatMap((m) =>
+        m
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
       if (expandedModels.length === 0) {
         console.error("--probe requires at least one model name");
         console.error("Usage: claudish --probe minimax-m2.5 kimi-k2.5 gemini-3.1-pro-preview");
@@ -1466,7 +1475,9 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
     console.log(`  ${DIM}${line}${RESET}`);
 
     if (result.routingSource === "direct") {
-      console.log(`  ${GREEN}  Direct → ${result.nativeProvider}${RESET}  (explicit provider prefix, no fallback chain)`);
+      console.log(
+        `  ${GREEN}  Direct → ${result.nativeProvider}${RESET}  (explicit provider prefix, no fallback chain)`
+      );
     } else if (result.chain.length === 0) {
       console.log(`  ${RED}  No providers available${RESET} — no credentials configured`);
     } else {
@@ -1492,7 +1503,8 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
         }
 
         // Highlight first ready provider
-        const isFirstReady = entry.hasCredentials && !result.chain.slice(0, i).some((c) => c.hasCredentials);
+        const isFirstReady =
+          entry.hasCredentials && !result.chain.slice(0, i).some((c) => c.hasCredentials);
         const prefix = isFirstReady ? `${BG_DIM}` : "";
         const suffix = isFirstReady ? `${RESET}` : "";
 
@@ -1532,8 +1544,7 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
             );
           }
 
-          const parserColor =
-            w.effectiveStreamFormat === w.declaredStreamFormat ? GREEN : YELLOW;
+          const parserColor = w.effectiveStreamFormat === w.declaredStreamFormat ? GREEN : YELLOW;
           const parserNote = w.transportOverride
             ? `${DIM}← transport override wins${RESET}`
             : w.effectiveStreamFormat !== w.declaredStreamFormat
@@ -1555,10 +1566,16 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
   console.log(`  ${RED}○${RESET} missing  API key not set, provider skipped`);
   console.log(`  ${BG_DIM}  highlighted  ${RESET} = first provider that will handle the request`);
   console.log("");
-  console.log(`  ${DIM}Chain order: LiteLLM → Zen Go → Subscription → Native API → OpenRouter${RESET}`);
-  console.log(`  ${DIM}Custom rules in .claudish.json or ~/.claudish/config.json override default chain${RESET}`);
+  console.log(
+    `  ${DIM}Chain order: LiteLLM → Zen Go → Subscription → Native API → OpenRouter${RESET}`
+  );
+  console.log(
+    `  ${DIM}Custom rules in .claudish.json or ~/.claudish/config.json override default chain${RESET}`
+  );
   console.log("");
-  console.log(`  ${DIM}Wiring shows the full adapter composition: format adapter → stream parser${RESET}`);
+  console.log(
+    `  ${DIM}Wiring shows the full adapter composition: format adapter → stream parser${RESET}`
+  );
   console.log(
     `  ${DIM}Override occurs when aggregators (LiteLLM, OpenRouter) normalize response format${RESET}`
   );

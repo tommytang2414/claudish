@@ -582,9 +582,15 @@ interface ClientMetadata {
   duetProject?: string;
 }
 
+interface AllowedTier {
+  id: string;
+  displayName?: string;
+}
+
 interface LoadCodeAssistResponse {
   currentTier?: string;
   cloudaicompanionProject?: string;
+  allowedTiers?: AllowedTier[];
 }
 
 interface LROResponse {
@@ -635,12 +641,17 @@ export async function setupGeminiUser(accessToken: string): Promise<{ projectId:
     }
   }
 
-  // 2. onboardUser - register user for free tier
-  const tierId = "free-tier";
+  // 2. onboardUser - use the best tier available for this user
+  //    The server returns allowedTiers sorted by priority (best first).
+  //    Free tier must NOT send a project ID (Google provisions one).
+  //    Paid tiers (standard, legacy) require a project ID.
+  const tierId = loadRes.allowedTiers?.[0]?.id || "free-tier";
+  const isFree = tierId === "free-tier";
+  const onboardProject = isFree ? undefined : envProject;
   const MAX_POLL_ATTEMPTS = 30; // 60 seconds max (30 * 2s)
 
-  log("[GeminiOAuth] Onboarding user to free-tier...");
-  let lro = await callOnboardUser(accessToken, tierId, envProject);
+  log(`[GeminiOAuth] Onboarding user to ${tierId}...`);
+  let lro = await callOnboardUser(accessToken, tierId, onboardProject);
   log(`[GeminiOAuth] Initial onboardUser response: done=${lro.done}`);
 
   // Poll LRO until done (with timeout)
@@ -649,7 +660,7 @@ export async function setupGeminiUser(accessToken: string): Promise<{ projectId:
     attempts++;
     log(`[GeminiOAuth] Polling onboardUser (attempt ${attempts}/${MAX_POLL_ATTEMPTS})...`);
     await new Promise((r) => setTimeout(r, 2000));
-    lro = await callOnboardUser(accessToken, tierId, envProject);
+    lro = await callOnboardUser(accessToken, tierId, onboardProject);
   }
 
   if (!lro.done) {

@@ -90,7 +90,7 @@ if (isMcpMode) {
       const oauth = GeminiOAuth.getInstance();
       await oauth.login();
       console.log("\n✅ Gemini OAuth login successful!");
-      console.log("You can now use Gemini Code Assist with: claudish --model go@gemini-2.5-flash");
+      console.log("You can now use Gemini Code Assist with: claudish --model go@gemini-3-pro-preview");
       process.exit(0);
     } catch (error) {
       console.error(
