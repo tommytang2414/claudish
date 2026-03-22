@@ -28,6 +28,8 @@ jobs:
             artifact: claudish-linux-arm64
 
     runs-on: ${{ matrix.os }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - uses: actions/checkout@v5
@@ -167,6 +169,8 @@ jobs:
   publish-npm:
     needs: release
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     # OIDC trusted publishing - no NPM_TOKEN needed!
     # Configure at: https://www.npmjs.com/package/claudish/access (Trusted Publishers)
 
@@ -251,6 +255,8 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     if: ${{ vars.ENABLE_HOMEBREW == 'true' }}
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Get release info

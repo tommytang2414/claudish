@@ -16,6 +16,8 @@ permissions:
 jobs:
   claude-code:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     # Skip if comment is from bot (avoid loops)
     # For issue_comment, only process if it's on a PR
     if: |
