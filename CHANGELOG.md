@@ -2,6 +2,17 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [6.0.1] - 2026-03-23
+
+### Bug Fixes
+
+- v6.0.1 - statusline input_tokens and -p flag conflict([`0b46b5f`](https://github.com/MadAppGang/claudish/commit/0b46b5f7253187d1ff1efb5d6c25bae22d37f9b6))
+- statusline input_tokens (#74) and -p flag conflict (#76)([`056835c`](https://github.com/MadAppGang/claudish/commit/056835c69d278d4e1e7b42d62d7edbc799c87586))
+
+### Documentation
+
+- update CHANGELOG.md for v6.0.0([`a791d14`](https://github.com/MadAppGang/claudish/commit/a791d14a76c7d1092e864bbe4922114339215051))
+
 ## [6.0.0] - 2026-03-22
 
 ### Documentation
