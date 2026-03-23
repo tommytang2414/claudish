@@ -416,16 +416,66 @@ describe("Adapter: AnthropicAPIFormat", () => {
 // ─── Model Adapter Quirks Tests ─────────────────────────────────────────────
 
 describe("Model Adapter Quirks", () => {
-  test("MiniMaxAdapter: thinking → reasoning_split", async () => {
+  test("MiniMaxModelDialect: native thinking passthrough (no reasoning_split)", async () => {
     const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
     const adapter = new MiniMaxModelDialect("minimax-m2.5");
 
-    const request: any = { model: "minimax-m2.5", messages: [] };
+    // MiniMax's Anthropic-compatible endpoint supports `thinking` natively.
+    // prepareRequest should NOT convert it to reasoning_split.
+    const request: any = { model: "minimax-m2.5", messages: [], thinking: { budget_tokens: 10000 } };
     const original = { thinking: { budget_tokens: 10000 } };
 
     adapter.prepareRequest(request, original);
-    expect(request.reasoning_split).toBe(true);
-    expect(request.thinking).toBeUndefined();
+    expect(request.reasoning_split).toBeUndefined();
+    expect(request.thinking).toEqual({ budget_tokens: 10000 });
+  });
+
+  test("MiniMaxModelDialect: temperature clamping — 0 → 0.01", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const request: any = { model: "minimax-m2.5", messages: [], temperature: 0 };
+    adapter.prepareRequest(request, {});
+    expect(request.temperature).toBe(0.01);
+  });
+
+  test("MiniMaxModelDialect: temperature clamping — negative → 0.01", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const request: any = { model: "minimax-m2.5", messages: [], temperature: -0.5 };
+    adapter.prepareRequest(request, {});
+    expect(request.temperature).toBe(0.01);
+  });
+
+  test("MiniMaxModelDialect: temperature clamping — >1 → 1.0", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const request: any = { model: "minimax-m2.5", messages: [], temperature: 1.5 };
+    adapter.prepareRequest(request, {});
+    expect(request.temperature).toBe(1.0);
+  });
+
+  test("MiniMaxModelDialect: valid temperature unchanged", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+
+    const request: any = { model: "minimax-m2.5", messages: [], temperature: 0.7 };
+    adapter.prepareRequest(request, {});
+    expect(request.temperature).toBe(0.7);
+  });
+
+  test("MiniMaxModelDialect: context window is 204_800", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+    expect(adapter.getContextWindow()).toBe(204_800);
+  });
+
+  test("MiniMaxModelDialect: supportsVision returns false", async () => {
+    const { MiniMaxModelDialect } = await import("./adapters/minimax-model-dialect.js");
+    const adapter = new MiniMaxModelDialect("minimax-m2.5");
+    expect(adapter.supportsVision()).toBe(false);
   });
 
   test("OpenAIAdapter: thinking → reasoning_effort for o3", async () => {

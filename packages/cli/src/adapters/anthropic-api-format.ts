@@ -8,6 +8,7 @@
 
 import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import type { StreamFormat } from "../providers/transport/types.js";
+import { lookupModel } from "./model-catalog.js";
 
 export class AnthropicAPIFormat extends BaseAPIFormat {
   private providerName: string;
@@ -114,26 +115,14 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
   }
 
   override getContextWindow(): number {
-    const model = this.modelId.toLowerCase();
+    // Try catalog lookup first (handles kimi/minimax model name variants)
+    const catalogEntry = lookupModel(this.modelId);
+    if (catalogEntry) return catalogEntry.contextWindow;
 
-    // Kimi models — context window by model variant
-    if (model.includes("kimi-k2.5") || model.includes("kimi-k2-5")) return 262_144;
-    if (model.includes("kimi-k2")) return 131_000;
-    if (
-      this.providerName === "kimi" ||
-      this.providerName === "kimi-coding" ||
-      model.includes("kimi")
-    ) {
-      return 131_072;
-    }
+    // Provider name fallbacks for when model ID alone doesn't identify the family
+    if (this.providerName === "kimi" || this.providerName === "kimi-coding") return 131_072;
+    if (this.providerName === "minimax" || this.providerName === "minimax-coding") return 204_800;
 
-    // MiniMax models — context window by model variant
-    if (model.includes("minimax-01") || model.includes("minimax-m1")) return 1_000_000;
-    if (model.includes("minimax-m2.7")) return 204_800;
-    if (model.includes("minimax-m2")) return 196_608;
-    if (this.providerName === "minimax" || this.providerName === "minimax-coding") {
-      return 196_608;
-    }
     return 128_000; // Default
   }
 

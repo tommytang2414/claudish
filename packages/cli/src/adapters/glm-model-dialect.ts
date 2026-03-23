@@ -2,37 +2,14 @@
  * GLMModelDialect — Layer 2 dialect for Zhipu AI GLM models.
  *
  * Handles GLM-specific quirks:
- * - Context window sizes per model variant
+ * - Context window sizes per model variant (sourced from model-catalog.ts)
  * - Strips unsupported thinking params (GLM doesn't support explicit thinking API)
- * - Vision support detection
+ * - Vision support detection (sourced from model-catalog.ts)
  */
 
 import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";
 import { log } from "../logger.js";
-
-/** GLM model context windows (pattern-match, checked in order) */
-const GLM_CONTEXT_WINDOWS: Array<[string, number]> = [
-  ["glm-5-turbo", 202_752],
-  ["glm-5", 80_000],
-  ["glm-4.7-flash", 202_752],
-  ["glm-4.7", 202_752],
-  ["glm-4.6v", 131_072],
-  ["glm-4.6", 204_800],
-  ["glm-4.5v", 65_536],
-  ["glm-4.5-flash", 131_072],
-  ["glm-4.5-air", 131_072],
-  ["glm-4.5", 131_072],
-  ["glm-4-long", 1_000_000],
-  ["glm-4-plus", 128_000],
-  ["glm-4-flash", 128_000],
-  ["glm-4-32b", 128_000],
-  ["glm-4", 128_000],
-  ["glm-3-turbo", 128_000],
-  ["glm-", 131_072],
-];
-
-/** GLM models that support vision (explicit list for clarity) */
-const GLM_VISION_MODELS = ["glm-4v", "glm-4v-plus", "glm-4.5v", "glm-4.6v", "glm-5"];
+import { lookupModel } from "./model-catalog.js";
 
 export class GLMModelDialect extends BaseAPIFormat {
   processTextContent(textContent: string, accumulatedText: string): AdapterResult {
@@ -54,24 +31,23 @@ export class GLMModelDialect extends BaseAPIFormat {
   }
 
   shouldHandle(modelId: string): boolean {
-    return matchesModelFamily(modelId, "glm-") || matchesModelFamily(modelId, "chatglm-") || modelId.toLowerCase().includes("zhipu/");
+    return (
+      matchesModelFamily(modelId, "glm-") ||
+      matchesModelFamily(modelId, "chatglm-") ||
+      modelId.toLowerCase().includes("zhipu/")
+    );
   }
 
   getName(): string {
     return "GLMModelDialect";
   }
 
-  getContextWindow(): number {
-    const lower = this.modelId.toLowerCase();
-    for (const [pattern, size] of GLM_CONTEXT_WINDOWS) {
-      if (lower.includes(pattern)) return size;
-    }
-    return 128_000;
+  override getContextWindow(): number {
+    return lookupModel(this.modelId)?.contextWindow ?? 128_000;
   }
 
-  supportsVision(): boolean {
-    const lower = this.modelId.toLowerCase();
-    return GLM_VISION_MODELS.some((m) => lower.includes(m));
+  override supportsVision(): boolean {
+    return lookupModel(this.modelId)?.supportsVision ?? false;
   }
 }
 

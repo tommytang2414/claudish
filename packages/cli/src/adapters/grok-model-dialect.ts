@@ -12,6 +12,7 @@
 
 import { BaseAPIFormat, AdapterResult, ToolCall, matchesModelFamily } from "./base-api-format.js";
 import { log } from "../logger.js";
+import { lookupModel } from "./model-catalog.js";
 
 export class GrokModelDialect extends BaseAPIFormat {
   private xmlBuffer: string = "";
@@ -139,15 +140,7 @@ export class GrokModelDialect extends BaseAPIFormat {
   }
 
   override getContextWindow(): number {
-    const model = this.modelId.toLowerCase();
-    if (model.includes("grok-4.20") || model.includes("grok-4-20")) return 2_000_000;
-    if (model.includes("grok-4.1-fast") || model.includes("grok-4-1-fast")) return 2_000_000;
-    if (model.includes("grok-4-fast")) return 2_000_000;
-    if (model.includes("grok-code-fast")) return 256_000;
-    if (model.includes("grok-4")) return 256_000;
-    if (model.includes("grok-3")) return 131_072;
-    if (model.includes("grok-2")) return 131_072;
-    return 131_072;
+    return lookupModel(this.modelId)?.contextWindow ?? 131_072;
   }
 
   /**

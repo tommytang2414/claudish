@@ -164,14 +164,15 @@ export class ComposedHandler implements ModelHandler {
 
     // Handle image content for models that don't support vision
     if (!this.getModelSupportsVision()) {
-      // Collect all image blocks from all messages with their positions
+      // Collect all image blocks from all messages with their positions.
+      // Supports both OpenAI format (image_url) and Anthropic format (type:"image"|"document").
       const imageBlocks: Array<{ msgIdx: number; partIdx: number; block: OpenAIImageBlock }> = [];
       for (let msgIdx = 0; msgIdx < messages.length; msgIdx++) {
         const msg = messages[msgIdx];
         if (Array.isArray(msg.content)) {
           for (let partIdx = 0; partIdx < msg.content.length; partIdx++) {
             const part = msg.content[partIdx];
-            if (part.type === "image_url") {
+            if (part.type === "image_url" || part.type === "image" || part.type === "document") {
               imageBlocks.push({ msgIdx, partIdx, block: part as OpenAIImageBlock });
             }
           }
@@ -182,28 +183,51 @@ export class ComposedHandler implements ModelHandler {
         log(
           `[ComposedHandler] Non-vision model received ${imageBlocks.length} image(s), calling vision proxy`
         );
-        const auth = extractAuthHeaders(c);
-        const descriptions = await describeImages(
-          imageBlocks.map((b) => b.block),
-          auth
-        );
+        // Only attempt vision proxy for OpenAI-format image_url blocks (proxy expects that format).
+        // Anthropic-format image/document blocks are stripped directly.
+        const openAIImageBlocks = imageBlocks.filter((b) => (b.block as any).type === "image_url");
+        let descriptions: string[] | null = null;
 
-        if (descriptions !== null) {
+        if (openAIImageBlocks.length > 0) {
+          const auth = extractAuthHeaders(c);
+          descriptions = await describeImages(
+            openAIImageBlocks.map((b) => b.block),
+            auth
+          );
+        }
+
+        if (descriptions !== null && openAIImageBlocks.length > 0) {
           // Replace image_url blocks with [Image Description: ...] text blocks
-          for (let i = 0; i < imageBlocks.length; i++) {
-            const { msgIdx, partIdx } = imageBlocks[i];
+          for (let i = 0; i < openAIImageBlocks.length; i++) {
+            const { msgIdx, partIdx } = openAIImageBlocks[i];
             messages[msgIdx].content[partIdx] = {
               type: "text",
               text: `[Image Description: ${descriptions[i]}]`,
             };
           }
           log(`[ComposedHandler] Vision proxy described ${descriptions.length} image(s)`);
-        } else {
-          // Vision proxy failed — fall back to stripping
-          log(`[ComposedHandler] Vision proxy failed, stripping images`);
+          // Strip any remaining Anthropic-format image/document blocks
           for (const msg of messages) {
             if (Array.isArray(msg.content)) {
-              msg.content = msg.content.filter((part: any) => part.type !== "image_url");
+              msg.content = msg.content.filter(
+                (part: any) => part.type !== "image" && part.type !== "document"
+              );
+              if (msg.content.length === 1 && msg.content[0].type === "text") {
+                msg.content = msg.content[0].text;
+              } else if (msg.content.length === 0) {
+                msg.content = "";
+              }
+            }
+          }
+        } else {
+          // Vision proxy failed or not applicable — strip all unsupported image/document blocks
+          log(`[ComposedHandler] Stripping image/document blocks (vision not supported)`);
+          for (const msg of messages) {
+            if (Array.isArray(msg.content)) {
+              msg.content = msg.content.filter(
+                (part: any) =>
+                  part.type !== "image_url" && part.type !== "image" && part.type !== "document"
+              );
               if (msg.content.length === 1 && msg.content[0].type === "text") {
                 msg.content = msg.content[0].text;
               } else if (msg.content.length === 0) {

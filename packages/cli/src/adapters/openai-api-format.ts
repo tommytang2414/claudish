@@ -14,6 +14,7 @@
 import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
+import { lookupModel } from "./model-catalog.js";
 
 export class OpenAIAPIFormat extends BaseAPIFormat {
   constructor(modelId: string) {
@@ -69,16 +70,7 @@ export class OpenAIAPIFormat extends BaseAPIFormat {
   // ─── ComposedHandler integration ───────────────────────────────────
 
   override getContextWindow(): number {
-    const model = this.modelId.toLowerCase();
-
-    // OpenAI models
-    if (model.includes("gpt-5.4")) return 1_050_000;
-    if (model.includes("gpt-5")) return 400_000;
-    if (model.includes("o1") || model.includes("o3") || model.includes("o4")) return 200_000;
-    if (model.includes("gpt-4o") || model.includes("gpt-4-turbo")) return 128_000;
-    if (model.includes("gpt-3.5")) return 16_385;
-
-    return 128_000; // Default
+    return lookupModel(this.modelId)?.contextWindow ?? 128_000;
   }
 
   override buildPayload(claudeRequest: any, messages: any[], tools: any[]): any {
