@@ -2,6 +2,17 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [6.2.2] - 2026-03-24
+
+### Bug Fixes
+
+- v6.2.2 - include mtm binary in npm package (CI fix)([`2c50c2c`](https://github.com/MadAppGang/claudish/commit/2c50c2c9c0c5a3f153ef7ae31d7c6c1c8cb3d550))
+- include native/mtm binaries in npm publish CI step([`b14e4e0`](https://github.com/MadAppGang/claudish/commit/b14e4e0d29377e058e8b08e283a232a1c6bea48d))
+
+### Documentation
+
+- update CHANGELOG.md for v6.2.1([`fd04d4e`](https://github.com/MadAppGang/claudish/commit/fd04d4ebd8296ac64e0923a99acb1fb4deafa9d1))
+
 ## [6.2.1] - 2026-03-24
 
 ### Bug Fixes
