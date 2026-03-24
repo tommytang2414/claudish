@@ -48,31 +48,49 @@ export class OpenAIProviderTransport implements ProviderTransport {
   }
 
   /**
-   * Override fetch with 30-second timeout and detailed error handling.
-   * This replaces the standard ComposedHandler fetch path.
+   * Override fetch with 30-second timeout, 429 retry with exponential backoff,
+   * and detailed error handling.
    */
   async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const maxRetries = 5;
+    let lastResponse: Response | null = null;
 
-    try {
-      // We need to intercept the fetch to add the abort signal.
-      // Since ComposedHandler builds the fetch, we wrap it here.
-      const response = await fetchFn();
-      return response;
-    } catch (fetchError: any) {
-      if (fetchError.name === "AbortError") {
-        log(`[${this.displayName}] Request timed out after 30s`);
-        throw new OpenAITimeoutError(this.provider.baseUrl);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetchFn();
+
+        if (response.status === 429 && attempt < maxRetries) {
+          lastResponse = response;
+          // Parse Retry-After header if present
+          const retryAfter = response.headers.get("Retry-After");
+          let delayMs: number;
+          if (retryAfter && !Number.isNaN(Number(retryAfter))) {
+            delayMs = Math.min(Number(retryAfter) * 1000, 30000);
+          } else {
+            // Exponential backoff: 2s, 4s, 8s, 16s, 30s
+            delayMs = Math.min(2000 * Math.pow(2, attempt), 30000);
+          }
+          log(`[${this.displayName}] 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${(delayMs / 1000).toFixed(1)}s`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+
+        return response;
+      } catch (fetchError: any) {
+        if (fetchError.name === "AbortError") {
+          log(`[${this.displayName}] Request timed out after 30s`);
+          throw new OpenAITimeoutError(this.provider.baseUrl);
+        }
+        if (fetchError.cause?.code === "UND_ERR_CONNECT_TIMEOUT") {
+          log(`[${this.displayName}] Connection timeout: ${fetchError.message}`);
+          throw new OpenAIConnectionError(this.provider.baseUrl, fetchError.cause?.code);
+        }
+        throw fetchError;
       }
-      if (fetchError.cause?.code === "UND_ERR_CONNECT_TIMEOUT") {
-        log(`[${this.displayName}] Connection timeout: ${fetchError.message}`);
-        throw new OpenAIConnectionError(this.provider.baseUrl, fetchError.cause?.code);
-      }
-      throw fetchError;
-    } finally {
-      clearTimeout(timeoutId);
     }
+
+    // All retries exhausted — return the last 429 response
+    return lastResponse!;
   }
 
   static formatDisplayName(name: string): string {
