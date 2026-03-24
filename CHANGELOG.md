@@ -2,6 +2,20 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [6.1.1] - 2026-03-24
+
+### Bug Fixes
+
+- v6.1.1 - Zen Go routing, OpenAI schema sanitization, Kimi reasoning_content([`6563f13`](https://github.com/MadAppGang/claudish/commit/6563f13b748387143e1481b3c2feb70d56943056))
+
+### Documentation
+
+- update CHANGELOG.md for v6.1.0([`dfb7abd`](https://github.com/MadAppGang/claudish/commit/dfb7abd476e3d3f402cd0190d52e2141af11cb26))
+
+### New Features
+
+- first-run auto-approve confirmation (#57)([`aff10b2`](https://github.com/MadAppGang/claudish/commit/aff10b27366eeac7202b4227a7d6764b22005f9e))
+
 ## [6.1.0] - 2026-03-23
 
 ### Bug Fixes
