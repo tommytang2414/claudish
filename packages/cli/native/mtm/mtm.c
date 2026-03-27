@@ -1115,7 +1115,7 @@ draw_statusbar(void) /* Draw the 1-line status bar on the last row. */
         else break;
     }
     /* Draw expand/collapse hint on far right */
-    const char *hint = statusbar_expanded ? " [-] collapse " : " [+] expand ";
+    const char *hint = statusbar_expanded ? " c=copy  ESC=close " : " click to expand ";
     int hlen = strlen(hint);
     if (COLS > x + hlen + 2) {
         short hpair = mtm_alloc_pair(8, 237);
@@ -1139,9 +1139,9 @@ draw_statusbar(void) /* Draw the 1-line status bar on the last row. */
         if (!f) return;
 
         /* Collect all lines, keep last panel_h */
-        char lines[EXPANDED_ROWS][256];
+        char lines[EXPANDED_ROWS][1024];
         int count = 0, total = 0;
-        char linebuf[256];
+        char linebuf[1024];
         while (fgets(linebuf, sizeof(linebuf), f)) {
             size_t l = strlen(linebuf);
             if (l > 0 && linebuf[l-1] == '\n') linebuf[l-1] = '\0';
@@ -1153,26 +1153,42 @@ draw_statusbar(void) /* Draw the 1-line status bar on the last row. */
         count = MIN(total, panel_h);
         int start_idx = total > panel_h ? total - panel_h : 0;
 
-        /* Draw panel background */
+        int usable_w = COLS - 2;
+
+        /* Draw panel background — clear all rows first */
         short bgpair = mtm_alloc_pair(COLOR_WHITE, 235);
         for (int row = 0; row < panel_h; row++) {
             move(panel_y + row, 0);
             attron(COLOR_PAIR(bgpair));
             clrtoeol();
-            if (row < count) {
-                int li = (start_idx + row) % panel_h;
-                /* Color errors red, info dim */
-                char *line = lines[li];
-                bool is_err = (strstr(line, "Error") || strstr(line, "error") ||
-                               strstr(line, "HTTP 4") || strstr(line, "HTTP 5"));
-                short lpair = is_err ? mtm_alloc_pair(COLOR_RED, 235)
-                                     : mtm_alloc_pair(248, 235);
-                attron(COLOR_PAIR(lpair));
-                /* Truncate to terminal width */
-                mvaddnstr(panel_y + row, 1, line, COLS - 2);
-                attroff(COLOR_PAIR(lpair));
-            }
             attroff(COLOR_PAIR(bgpair));
+        }
+
+        /* Render lines bottom-up with wrapping */
+        int draw_row = panel_h - 1;
+        for (int i = count - 1; i >= 0 && draw_row >= 0; i--) {
+            int li = (start_idx + i) % panel_h;
+            char *line = lines[li];
+            int linelen = (int)strlen(line);
+            /* Color errors red, info dim */
+            bool is_err = (strstr(line, "Error") || strstr(line, "error") ||
+                           strstr(line, "HTTP 4") || strstr(line, "HTTP 5"));
+            short lpair = is_err ? mtm_alloc_pair(COLOR_RED, 235)
+                                 : mtm_alloc_pair(248, 235);
+            int wrap_rows = (linelen + usable_w - 1) / usable_w;
+            if (wrap_rows < 1) wrap_rows = 1;
+            for (int wr = wrap_rows - 1; wr >= 0 && draw_row >= 0; wr--) {
+                int offset = wr * usable_w;
+                int chunk = linelen - offset;
+                if (chunk > usable_w) chunk = usable_w;
+                if (chunk > 0) {
+                    move(panel_y + draw_row, 1);
+                    attron(COLOR_PAIR(lpair));
+                    addnstr(line + offset, chunk);
+                    attroff(COLOR_PAIR(lpair));
+                }
+                draw_row--;
+            }
         }
 
         /* Draw top border */
@@ -1185,6 +1201,35 @@ draw_statusbar(void) /* Draw the 1-line status bar on the last row. */
         attroff(COLOR_PAIR(borderpair));
 
         wnoutrefresh(stdscr);
+    }
+}
+
+static void
+copy_diag_to_clipboard(void)
+{
+    const char *logfile = diag_log_file ? diag_log_file : statusbar_file;
+    if (!logfile) return;
+    const char *cmds[] = {"pbcopy", "xclip -selection clipboard", "xsel --clipboard", NULL};
+    for (int i = 0; cmds[i]; i++) {
+        FILE *p = popen(cmds[i], "w");
+        if (!p) continue;
+        FILE *f = fopen(logfile, "r");
+        if (f) {
+            char buf[1024];
+            while (fgets(buf, sizeof(buf), f)) fputs(buf, p);
+            fclose(f);
+        }
+        if (pclose(p) == 0) {
+            /* Flash confirmation */
+            int panel_h = MIN(EXPANDED_ROWS, LINES - 2);
+            move(LINES - 1 - panel_h, 2);
+            short cp = mtm_alloc_pair(COLOR_GREEN, 235);
+            attron(COLOR_PAIR(cp) | A_BOLD);
+            addstr(" \u2713 Copied to clipboard ");
+            attroff(COLOR_PAIR(cp) | A_BOLD);
+            wnoutrefresh(stdscr); doupdate();
+            return;
+        }
     }
 }
 
@@ -1243,8 +1288,12 @@ handlechar(int r, int k) /* Handle a single input character. */
     DO(cmd,   CODE(KEY_RESIZE),    { int bar = statusbar_expanded ? (1 + MIN(EXPANDED_ROWS, LINES - 2)) : (statusbar_visible ? 1 : 0); reshape(root, 0, 0, LINES - bar, COLS); } SB)
     /* Ctrl-G d: toggle expanded diagnostics panel */
     DO(true,  KEY(L'd'),           toggle_statusbar_expand())
-    /* Mouse click on status bar area: toggle expand */
-    DO(false, CODE(KEY_MOUSE),     { MEVENT me; if (getmouse(&me) == OK) { int bar_top = statusbar_expanded ? (LINES - 1 - MIN(EXPANDED_ROWS, LINES - 2)) : (LINES - 1); if (me.y >= bar_top && statusbar_visible) toggle_statusbar_expand(); } })
+    /* c: copy diagnostics to clipboard when panel is expanded, else pass through */
+    DO(false, KEY(L'c'),           { if (statusbar_expanded) copy_diag_to_clipboard(); else SEND(n, "c"); })
+    /* ESC: collapse expanded panel (or pass through ESC to terminal) */
+    DO(false, KEY(L'\x1b'),        { if (statusbar_expanded) toggle_statusbar_expand(); else SEND(n, "\x1b"); })
+    /* Mouse click on status bar area: only expand (never collapse) */
+    DO(false, CODE(KEY_MOUSE),     { MEVENT me; if (getmouse(&me) == OK) { int bar_top = statusbar_expanded ? (LINES - 1 - MIN(EXPANDED_ROWS, LINES - 2)) : (LINES - 1); if (me.y >= bar_top && statusbar_visible && !statusbar_expanded) toggle_statusbar_expand(); } })
     DO(false, KEY(commandkey),     return cmd = true)
     DO(false, KEY(0),              SENDN(n, "\000", 1); SB)
     DO(false, KEY(L'\n'),          SEND(n, "\n"); SB)

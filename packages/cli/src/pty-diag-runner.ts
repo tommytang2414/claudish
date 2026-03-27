@@ -322,6 +322,17 @@ function parseLogMessage(msg: string): { isError: boolean; short: string; provid
   const providerMatch = msg.match(/\[(\w+)\]/);
   const provider = providerMatch?.[1];
 
+  // Fallback chain messages (check BEFORE HTTP — fallback msgs contain "HTTP NNN" too)
+  if (msg.includes("[Fallback]")) {
+    // Extract the key info: "X failed (HTTP 401), trying next" or "succeeded after N"
+    if (msg.includes("succeeded")) {
+      const n = msg.match(/after (\d+)/)?.[1] || "?";
+      return { isError: false, short: `succeeded after ${n} retries`, provider };
+    }
+    const failMatch = msg.match(/(\w[\w\s]*?) failed/);
+    return { isError: false, short: failMatch ? `${failMatch[1]} failed, retrying` : "fallback", provider };
+  }
+
   // HTTP status errors — extract the human-readable part
   const httpMatch = msg.match(/HTTP (\d{3})/);
   if (httpMatch) {
@@ -339,12 +350,6 @@ function parseLogMessage(msg: string): { isError: boolean; short: string; provid
       return { isError: true, short: hintMatch[1], provider };
     }
     return { isError: true, short: `HTTP ${httpMatch[1]}`, provider };
-  }
-
-  // Fallback chain messages
-  if (msg.includes("[Fallback]")) {
-    const countMatch = msg.match(/(\d+) provider/);
-    return { isError: false, short: `fallback: ${countMatch?.[1] || "?"} providers`, provider };
   }
 
   // Generic error

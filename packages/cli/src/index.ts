@@ -231,9 +231,10 @@ async function runCli() {
     // First-run auto-approve confirmation
     // Auto-approve is enabled by default, but on first run we confirm with the user.
     // If user explicitly passed --no-auto-approve, skip the prompt entirely.
+    // If --stdin is set, skip the prompt — no human to confirm when piping input.
     const rawArgs = process.argv.slice(2);
     const explicitNoAutoApprove = rawArgs.includes("--no-auto-approve");
-    if (cliConfig.autoApprove && !explicitNoAutoApprove) {
+    if (cliConfig.autoApprove && !explicitNoAutoApprove && !cliConfig.stdin) {
       const { loadConfig, saveConfig } = await import("./profile-config.js");
       try {
         const cfg = loadConfig();
@@ -498,6 +499,7 @@ async function runCli() {
     process.exit(exitCode);
   } catch (error) {
     console.error("[claudish] Fatal error:", error);
+    console.error("[claudish] Stack:", error instanceof Error ? error.stack : "no stack");
     process.exit(1);
   }
 }

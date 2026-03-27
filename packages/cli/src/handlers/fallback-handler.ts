@@ -23,6 +23,8 @@ export interface FallbackCandidate {
 
 export class FallbackHandler implements ModelHandler {
   private candidates: FallbackCandidate[];
+  /** Index of the last provider that successfully handled a request. */
+  private lastSuccessIndex: number = 0;
 
   constructor(candidates: FallbackCandidate[]) {
     this.candidates = candidates;
@@ -35,10 +37,12 @@ export class FallbackHandler implements ModelHandler {
   // changes to set headers before checking response.ok, this would need revisiting.
   async handle(c: Context, payload: any): Promise<Response> {
     const errors: Array<{ provider: string; status: number; message: string }> = [];
+    const startIndex = this.lastSuccessIndex;
 
-    for (let i = 0; i < this.candidates.length; i++) {
-      const { name, handler } = this.candidates[i];
-      const isLast = i === this.candidates.length - 1;
+    for (let attempt = 0; attempt < this.candidates.length; attempt++) {
+      const idx = (startIndex + attempt) % this.candidates.length;
+      const { name, handler } = this.candidates[idx];
+      const isLast = attempt === this.candidates.length - 1;
 
       try {
         // If previous attempts failed, signal the winning handler to include fallback metadata
@@ -56,8 +60,9 @@ export class FallbackHandler implements ModelHandler {
 
         const response = await handler.handle(c, payload);
 
-        // Success — return immediately
+        // Success — cache the working provider index and return immediately
         if (response.ok) {
+          this.lastSuccessIndex = idx;
           if (errors.length > 0) {
             logStderr(`[Fallback] ${name} succeeded after ${errors.length} failed attempt(s)`);
           }

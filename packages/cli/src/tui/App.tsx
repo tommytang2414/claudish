@@ -3,9 +3,11 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useCallback, useMemo, useState } from "react";
 import {
   loadConfig,
+  loadLocalConfig,
   removeApiKey,
   removeEndpoint,
   saveConfig,
+  saveLocalConfig,
   setApiKey,
   setEndpoint,
 } from "../profile-config.js";
@@ -18,13 +20,39 @@ import { C } from "./theme.js";
 
 const VERSION = "v5.16";
 
-type Tab = "providers" | "routing" | "privacy";
+// ── Common models for autocomplete ────────────────────────────────────────────
+const COMMON_MODELS = [
+  "g@gemini-3.1-pro-preview", "g@gemini-2.5-flash", "g@gemini-2.5-pro",
+  "oai@gpt-4o", "oai@gpt-4o-mini", "oai@o3-mini",
+  "or@anthropic/claude-sonnet-4-20250514",
+  "mm@minimax-m2.5", "kimi@kimi-k2.5", "glm@glm-5",
+  "zen@glm-5", "zen@minimax-m2.5-free",
+  "ll@gemini-2.5-flash", "ll@gpt-4o",
+  "or@google/gemini-3.1-pro-preview", "or@x-ai/grok-code-fast-1",
+  "or@deepseek/deepseek-r1",
+];
+
+// Provider prefix suggestions for the provider picker
+const PROVIDER_PREFIXES = PROVIDERS.map((p) => ({
+  prefix: p.aliases?.[0] ? `${p.aliases[0]}@` : `${p.name}@`,
+  displayName: p.displayName,
+  name: p.name,
+}));
+
+type Tab = "providers" | "profiles" | "routing" | "privacy";
 type Mode =
   | "browse"
   | "input_key"
   | "input_endpoint"
   | "add_routing_pattern"
-  | "add_routing_chain";
+  | "add_routing_chain"
+  | "new_profile"
+  | "pick_profile_scope"
+  | "pick_provider_prefix"
+  | "edit_profile_opus"
+  | "edit_profile_sonnet"
+  | "edit_profile_haiku"
+  | "edit_profile_subagent";
 
 type ProbeMode = "idle" | "input" | "running" | "done";
 
@@ -65,8 +93,25 @@ export function App() {
   const [probeModel, setProbeModel] = useState("");
   const [probeResults, setProbeResults] = useState<ProbeEntry[]>([]);
 
+  // Profile tab state
+  const [profileIndex, setProfileIndex] = useState(0);
+  const [editProfileName, setEditProfileName] = useState("");
+  const [editProfileValue, setEditProfileValue] = useState("");
+  const [profileScope, setProfileScope] = useState<"global" | "project">("global");
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [suggestionIndex, setSuggestionIndex] = useState(-1);
+  const [providerPickerIndex, setProviderPickerIndex] = useState(0);
+  const [providerPickerReturnMode, setProviderPickerReturnMode] = useState<Mode>("edit_profile_opus");
+
   // Chain selector uses same PROVIDERS list for consistent naming
   const CHAIN_PROVIDERS = PROVIDERS;
+
+  // Compute autocomplete suggestions for model input
+  const computeSuggestions = useCallback((input: string): string[] => {
+    if (!input) return COMMON_MODELS.slice(0, 8);
+    const lower = input.toLowerCase();
+    return COMMON_MODELS.filter((m) => m.toLowerCase().includes(lower)).slice(0, 8);
+  }, []);
 
   const quit = useCallback(() => renderer.destroy(), [renderer]);
 
@@ -348,11 +393,230 @@ export function App() {
       return;
     }
 
+    // Profile: scope picker (g = global, p = project)
+    if (mode === "pick_profile_scope") {
+      if (key.raw === "g" || key.raw === "G") {
+        setProfileScope("global");
+        setEditProfileValue("");
+        setMode("new_profile");
+      } else if (key.raw === "p" || key.raw === "P") {
+        setProfileScope("project");
+        setEditProfileValue("");
+        setMode("new_profile");
+      } else if (key.name === "escape") {
+        setMode("browse");
+      }
+      return;
+    }
+
+    // Profile: new profile name input
+    if (mode === "new_profile") {
+      if (key.name === "return" || key.name === "enter") {
+        const name = editProfileValue.trim();
+        if (!name) {
+          setMode("browse");
+          setEditProfileValue("");
+          return;
+        }
+        const now = new Date().toISOString();
+        if (profileScope === "project") {
+          // Save to local .claudish.json
+          const localCfg = loadLocalConfig() ?? { version: "1.0.0", defaultProfile: "", profiles: {} };
+          localCfg.profiles[name] = { name, models: {}, createdAt: now, updatedAt: now };
+          saveLocalConfig(localCfg);
+        } else {
+          // Save to global config
+          const cfg = loadConfig();
+          cfg.profiles[name] = { name, models: {}, createdAt: now, updatedAt: now };
+          saveConfig(cfg);
+        }
+        refreshConfig();
+        setEditProfileName(name);
+        setEditProfileValue("");
+        setSuggestions(computeSuggestions(""));
+        setSuggestionIndex(-1);
+        setMode("edit_profile_opus");
+      } else if (key.name === "escape") {
+        setEditProfileValue("");
+        setMode("browse");
+      } else if (key.name === "backspace" || key.name === "delete") {
+        setEditProfileValue((p) => p.slice(0, -1));
+      } else if (key.raw && key.raw.length === 1 && !key.ctrl && !key.meta) {
+        setEditProfileValue((p) => p + key.raw);
+      }
+      return;
+    }
+
+    // Profile: provider prefix picker
+    if (mode === "pick_provider_prefix") {
+      if (key.name === "up" || key.name === "k") {
+        setProviderPickerIndex((i) => Math.max(0, i - 1));
+      } else if (key.name === "down" || key.name === "j") {
+        setProviderPickerIndex((i) => Math.min(PROVIDER_PREFIXES.length - 1, i + 1));
+      } else if (key.name === "return" || key.name === "enter") {
+        const prefix = PROVIDER_PREFIXES[providerPickerIndex]?.prefix ?? "";
+        setEditProfileValue(prefix);
+        setSuggestions(computeSuggestions(prefix));
+        setSuggestionIndex(-1);
+        setProviderPickerIndex(0);
+        setMode(providerPickerReturnMode);
+      } else if (key.name === "escape") {
+        setProviderPickerIndex(0);
+        setMode(providerPickerReturnMode);
+      }
+      return;
+    }
+
+    // Profile: edit model role fields (opus → sonnet → haiku → subagent)
+    if (
+      mode === "edit_profile_opus" ||
+      mode === "edit_profile_sonnet" ||
+      mode === "edit_profile_haiku" ||
+      mode === "edit_profile_subagent"
+    ) {
+      // Helper: save value to correct scope config
+      const saveModelField = (fieldVal: string) => {
+        const val = fieldVal.trim() === "auto" ? undefined : fieldVal.trim();
+        if (profileScope === "project") {
+          const localCfg = loadLocalConfig() ?? { version: "1.0.0", defaultProfile: "", profiles: {} };
+          const prof = localCfg.profiles[editProfileName];
+          if (prof) {
+            if (mode === "edit_profile_opus") prof.models.opus = val || undefined;
+            else if (mode === "edit_profile_sonnet") prof.models.sonnet = val || undefined;
+            else if (mode === "edit_profile_haiku") prof.models.haiku = val || undefined;
+            else if (mode === "edit_profile_subagent") prof.models.subagent = val || undefined;
+            prof.updatedAt = new Date().toISOString();
+            saveLocalConfig(localCfg);
+          }
+        } else {
+          const cfg = loadConfig();
+          const prof = cfg.profiles[editProfileName];
+          if (prof) {
+            if (mode === "edit_profile_opus") prof.models.opus = val || undefined;
+            else if (mode === "edit_profile_sonnet") prof.models.sonnet = val || undefined;
+            else if (mode === "edit_profile_haiku") prof.models.haiku = val || undefined;
+            else if (mode === "edit_profile_subagent") prof.models.subagent = val || undefined;
+            prof.updatedAt = new Date().toISOString();
+            saveConfig(cfg);
+          }
+        }
+        refreshConfig();
+      };
+
+      const getNextFieldValue = (nextMode: Mode): string => {
+        if (profileScope === "project") {
+          const localCfg = loadLocalConfig();
+          const prof = localCfg?.profiles[editProfileName];
+          if (nextMode === "edit_profile_sonnet") return prof?.models?.sonnet ?? "";
+          if (nextMode === "edit_profile_haiku") return prof?.models?.haiku ?? "";
+          if (nextMode === "edit_profile_subagent") return prof?.models?.subagent ?? "";
+        } else {
+          const cfg = loadConfig();
+          const prof = cfg.profiles[editProfileName];
+          if (nextMode === "edit_profile_sonnet") return prof?.models?.sonnet ?? "";
+          if (nextMode === "edit_profile_haiku") return prof?.models?.haiku ?? "";
+          if (nextMode === "edit_profile_subagent") return prof?.models?.subagent ?? "";
+        }
+        return "";
+      };
+
+      if (key.name === "return" || key.name === "enter") {
+        // Accept highlighted suggestion or typed value
+        let val = editProfileValue;
+        if (suggestionIndex >= 0 && suggestions[suggestionIndex]) {
+          val = suggestions[suggestionIndex];
+        }
+        saveModelField(val);
+        setSuggestions([]);
+        setSuggestionIndex(-1);
+        // Advance to next field or finish
+        if (mode === "edit_profile_opus") {
+          const nextVal = getNextFieldValue("edit_profile_sonnet");
+          setEditProfileValue(nextVal);
+          setSuggestions(computeSuggestions(nextVal));
+          setSuggestionIndex(-1);
+          setMode("edit_profile_sonnet");
+        } else if (mode === "edit_profile_sonnet") {
+          const nextVal = getNextFieldValue("edit_profile_haiku");
+          setEditProfileValue(nextVal);
+          setSuggestions(computeSuggestions(nextVal));
+          setSuggestionIndex(-1);
+          setMode("edit_profile_haiku");
+        } else if (mode === "edit_profile_haiku") {
+          const nextVal = getNextFieldValue("edit_profile_subagent");
+          setEditProfileValue(nextVal);
+          setSuggestions(computeSuggestions(nextVal));
+          setSuggestionIndex(-1);
+          setMode("edit_profile_subagent");
+        } else {
+          // subagent — done
+          setEditProfileValue("");
+          setEditProfileName("");
+          setSuggestions([]);
+          setSuggestionIndex(-1);
+          setMode("browse");
+          setStatusMsg(`Profile "${editProfileName}" saved.`);
+        }
+      } else if (key.name === "tab") {
+        if (editProfileValue === "") {
+          // Empty input + Tab → enter provider prefix picker
+          setProviderPickerReturnMode(mode);
+          setProviderPickerIndex(0);
+          setMode("pick_provider_prefix");
+        } else if (suggestionIndex >= 0 && suggestions[suggestionIndex]) {
+          // Tab with suggestion highlighted → autocomplete into input, keep editing
+          setEditProfileValue(suggestions[suggestionIndex]);
+          setSuggestions(computeSuggestions(suggestions[suggestionIndex]!));
+          setSuggestionIndex(-1);
+        }
+      } else if (key.name === "up" || key.name === "k") {
+        if (suggestions.length > 0) {
+          setSuggestionIndex((i) => Math.max(0, i - 1));
+        }
+      } else if (key.name === "down" || key.name === "j") {
+        if (suggestions.length > 0) {
+          setSuggestionIndex((i) => Math.min(suggestions.length - 1, i + 1));
+        }
+      } else if (key.name === "escape") {
+        if (suggestionIndex >= 0) {
+          // Esc dismisses suggestion selection first
+          setSuggestionIndex(-1);
+        } else {
+          setEditProfileValue("");
+          setEditProfileName("");
+          setSuggestions([]);
+          setSuggestionIndex(-1);
+          setMode("browse");
+        }
+      } else if (key.name === "backspace" || key.name === "delete") {
+        setEditProfileValue((p) => {
+          const next = p.slice(0, -1);
+          setSuggestions(computeSuggestions(next));
+          setSuggestionIndex(-1);
+          return next;
+        });
+      } else if (key.raw && key.raw.length === 1 && !key.ctrl && !key.meta) {
+        setEditProfileValue((p) => {
+          const next = p + key.raw;
+          // Handle 'auto' shortcut with empty input + 'a'
+          if (p === "" && key.raw === "a") {
+            setSuggestions([]);
+            setSuggestionIndex(-1);
+            return "auto";
+          }
+          setSuggestions(computeSuggestions(next));
+          setSuggestionIndex(-1);
+          return next;
+        });
+      }
+      return;
+    }
+
     // Browse mode
     if (key.name === "q") return quit();
 
     if (key.name === "tab") {
-      const tabs: Tab[] = ["providers", "routing", "privacy"];
+      const tabs: Tab[] = ["providers", "profiles", "routing", "privacy"];
       const idx = tabs.indexOf(activeTab);
       setActiveTab(tabs[(idx + 1) % tabs.length]!);
       setStatusMsg(null);
@@ -366,11 +630,16 @@ export function App() {
       return;
     }
     if (key.name === "2") {
-      setActiveTab("routing");
+      setActiveTab("profiles");
       setStatusMsg(null);
       return;
     }
     if (key.name === "3") {
+      setActiveTab("routing");
+      setStatusMsg(null);
+      return;
+    }
+    if (key.name === "4") {
       setActiveTab("privacy");
       setStatusMsg(null);
       return;
@@ -427,6 +696,85 @@ export function App() {
               : { status: "failed", error: result, ms },
           }));
         });
+      }
+    } else if (activeTab === "profiles") {
+      // Build profile list for navigation
+      const globalCfg = loadConfig();
+      const localCfg = loadLocalConfig();
+      const localNames = localCfg ? Object.keys(localCfg.profiles) : [];
+      const globalNames = Object.keys(globalCfg.profiles);
+      const allNames = [...new Set([...localNames, ...globalNames])];
+
+      if (key.name === "up" || key.name === "k") {
+        setProfileIndex((i) => Math.max(0, i - 1));
+        setStatusMsg(null);
+      } else if (key.name === "down" || key.name === "j") {
+        setProfileIndex((i) => Math.min(Math.max(0, allNames.length - 1), i + 1));
+        setStatusMsg(null);
+      } else if (key.name === "return" || key.name === "enter" || key.name === "a") {
+        // Activate selected profile
+        const selectedName = allNames[profileIndex];
+        if (selectedName) {
+          const cfg = loadConfig();
+          cfg.defaultProfile = selectedName;
+          saveConfig(cfg);
+          refreshConfig();
+          setStatusMsg(`Profile "${selectedName}" activated.`);
+        }
+      } else if (key.name === "n") {
+        // New profile — first pick scope
+        setEditProfileValue("");
+        setProfileScope("global");
+        setMode("pick_profile_scope");
+        setStatusMsg(null);
+      } else if (key.name === "e") {
+        // Edit selected profile's model mappings
+        const selectedName = allNames[profileIndex];
+        if (selectedName) {
+          // Determine which scope the selected profile is in
+          const isLocal = localCfg ? !!localCfg.profiles[selectedName] : false;
+          const scope: "global" | "project" = isLocal ? "project" : "global";
+          setProfileScope(scope);
+          const prof = isLocal
+            ? localCfg?.profiles[selectedName]
+            : loadConfig().profiles[selectedName];
+          setEditProfileName(selectedName);
+          const opusVal = prof?.models?.opus ?? "";
+          setEditProfileValue(opusVal);
+          setSuggestions(computeSuggestions(opusVal));
+          setSuggestionIndex(-1);
+          setMode("edit_profile_opus");
+          setStatusMsg(null);
+        }
+      } else if (key.name === "d") {
+        // Delete selected profile (can't delete active one)
+        const selectedName = allNames[profileIndex];
+        const cfg = loadConfig();
+        if (!selectedName) {
+          setStatusMsg("No profile selected.");
+        } else if (selectedName === cfg.defaultProfile) {
+          setStatusMsg("Cannot delete the active profile.");
+        } else {
+          // Check if it's a local profile
+          const localCfgCheck = loadLocalConfig();
+          if (localCfgCheck?.profiles[selectedName]) {
+            delete localCfgCheck.profiles[selectedName];
+            saveLocalConfig(localCfgCheck);
+            refreshConfig();
+            setProfileIndex((i) => Math.max(0, i - 1));
+            setStatusMsg(`Project profile "${selectedName}" deleted.`);
+          } else if (Object.keys(cfg.profiles).length <= 1) {
+            setStatusMsg("Cannot delete the last global profile.");
+          } else if (cfg.profiles[selectedName]) {
+            delete cfg.profiles[selectedName];
+            saveConfig(cfg);
+            refreshConfig();
+            setProfileIndex((i) => Math.max(0, i - 1));
+            setStatusMsg(`Profile "${selectedName}" deleted.`);
+          } else {
+            setStatusMsg("Profile not found.");
+          }
+        }
       }
     } else if (activeTab === "routing") {
       if (key.name === "a") {
@@ -504,6 +852,14 @@ export function App() {
 
   const isInputMode = mode === "input_key" || mode === "input_endpoint";
   const isRoutingInput = mode === "add_routing_pattern" || mode === "add_routing_chain";
+  const isProfileEditMode =
+    mode === "new_profile" ||
+    mode === "pick_profile_scope" ||
+    mode === "pick_provider_prefix" ||
+    mode === "edit_profile_opus" ||
+    mode === "edit_profile_sonnet" ||
+    mode === "edit_profile_haiku" ||
+    mode === "edit_profile_subagent";
 
   // ── Layout math ───────────────────────────────────────────────────────────
   // header(1) + tab-bar(3) + content(flex) + detail(fixed) + footer(1)
@@ -517,8 +873,9 @@ export function App() {
   function TabBar() {
     const tabs: Array<{ label: string; value: Tab; num: string }> = [
       { label: "Providers", value: "providers", num: "1" },
-      { label: "Routing", value: "routing", num: "2" },
-      { label: "Privacy", value: "privacy", num: "3" },
+      { label: "Profiles", value: "profiles", num: "2" },
+      { label: "Routing", value: "routing", num: "3" },
+      { label: "Privacy", value: "privacy", num: "4" },
     ];
 
     return (
@@ -556,7 +913,9 @@ export function App() {
                     statusMsg.startsWith("Endpoint") ||
                     statusMsg.startsWith("Telemetry") ||
                     statusMsg.startsWith("Usage") ||
-                    statusMsg.startsWith("Stats buffer")
+                    statusMsg.startsWith("Stats buffer") ||
+                    statusMsg.startsWith("Profile") ||
+                    statusMsg.startsWith("Key removed")
                       ? C.green
                       : C.yellow
                   }
@@ -802,6 +1161,302 @@ export function App() {
                 {tr.error && <span fg={C.red}>{`  ${tr.error}`}</span>}
               </>
             )}
+          </text>
+        )}
+      </box>
+    );
+  }
+
+  // ── Profiles tab ──────────────────────────────────────────────────────────
+
+  function ProfilesContent() {
+    const globalCfg = config;
+    const localCfg = loadLocalConfig();
+    const localProfileNames = localCfg ? new Set(Object.keys(localCfg.profiles)) : new Set<string>();
+
+    // Build unified list: local profiles first, then global
+    const allEntries: Array<{ name: string; scope: "local" | "global"; models: Record<string, string | undefined> }> = [];
+    if (localCfg) {
+      for (const [name, prof] of Object.entries(localCfg.profiles)) {
+        allEntries.push({ name, scope: "local", models: prof.models });
+      }
+    }
+    for (const [name, prof] of Object.entries(globalCfg.profiles)) {
+      allEntries.push({ name, scope: "global", models: prof.models });
+    }
+
+    const activeProfileName = globalCfg.defaultProfile;
+    const listH = contentH - 2;
+
+    // Edit mode prompt
+    const editPromptLabel =
+      mode === "new_profile" ? `New ${profileScope} profile — name:`
+      : mode === "pick_profile_scope" ? "Scope for new profile:"
+      : mode === "pick_provider_prefix" ? "Select provider:"
+      : mode === "edit_profile_opus" ? `${editProfileName} — opus model:`
+      : mode === "edit_profile_sonnet" ? `${editProfileName} — sonnet model:`
+      : mode === "edit_profile_haiku" ? `${editProfileName} — haiku model:`
+      : mode === "edit_profile_subagent" ? `${editProfileName} — subagent model (optional):`
+      : null;
+
+    return (
+      <box
+        height={contentH}
+        border
+        borderStyle="single"
+        borderColor={activeTab === "profiles" && !isProfileEditMode ? C.blue : C.dim}
+        backgroundColor={C.bg}
+        flexDirection="column"
+        paddingX={1}
+      >
+        {/* Active profile indicator */}
+        <text>
+          <span fg={C.dim}>{"  "}</span>
+          <span fg={C.fgMuted}>Active profile: </span>
+          <span fg={C.orange} bold>{activeProfileName}</span>
+        </text>
+        {/* Column header */}
+        <text>
+          <span fg={C.dim}>{"   "}</span>
+          <span fg={C.blue} bold>{"PROFILE         "}</span>
+          <span fg={C.blue} bold>{"SCOPE    "}</span>
+          <span fg={C.blue} bold>{"MODELS"}</span>
+        </text>
+        {/* Profile rows */}
+        {allEntries.slice(0, Math.max(0, listH - 3)).map((entry, idx) => {
+          const isActive = entry.name === activeProfileName;
+          const selected = idx === profileIndex;
+          const namePad = entry.name.padEnd(16).substring(0, 16);
+          const scopePad = entry.scope.padEnd(8).substring(0, 8);
+          const shadowed = entry.scope === "global" && localProfileNames.has(entry.name);
+
+          const modelSummary = [
+            entry.models.opus ? `opus→${entry.models.opus.substring(0, 14)}` : null,
+            entry.models.sonnet ? `sonnet→${entry.models.sonnet.substring(0, 14)}` : null,
+          ]
+            .filter(Boolean)
+            .join("  ") || "(auto-route)";
+
+          return (
+            <box key={`${entry.scope}-${entry.name}`} height={1} flexDirection="row" backgroundColor={selected ? C.bgHighlight : C.bg}>
+              <text>
+                <span fg={isActive ? C.orange : C.dim}>
+                  {isActive ? "●" : " "}
+                </span>
+                <span fg={C.dim}>{" "}</span>
+                <span fg={selected ? C.white : isActive ? C.orange : C.fgMuted} bold={selected || isActive}>
+                  {namePad}
+                </span>
+                <span fg={C.dim}>{"  "}</span>
+                <span fg={entry.scope === "local" ? C.cyan : C.fgMuted}>
+                  {scopePad}
+                </span>
+                <span fg={C.dim}>{"  "}</span>
+                <span fg={selected ? C.white : shadowed ? C.dim : C.fgMuted}>
+                  {shadowed ? "(shadowed by local)  " : modelSummary}
+                </span>
+              </text>
+            </box>
+          );
+        })}
+
+        {/* Local profiles note */}
+        {!localCfg && (
+          <text>
+            <span fg={C.dim}>{"  No project-level profiles (.claudish.json)"}</span>
+          </text>
+        )}
+
+        {/* Edit mode input */}
+        {isProfileEditMode && editPromptLabel && (
+          <box flexDirection="column" paddingTop={1}>
+            <text>
+              <span fg={C.blue} bold>{editPromptLabel + " "}</span>
+            </text>
+
+            {/* Scope picker */}
+            {mode === "pick_profile_scope" && (
+              <box flexDirection="column">
+                <box height={1} flexDirection="row">
+                  <box width={16} height={1} backgroundColor={C.bgHighlight} paddingX={1}>
+                    <text><span fg={C.green} bold>g</span><span fg={C.white}> global</span></text>
+                  </box>
+                  <box width={2} />
+                  <box width={16} height={1} paddingX={1}>
+                    <text><span fg={C.cyan} bold>p</span><span fg={C.fgMuted}> project (.claudish.json)</span></text>
+                  </box>
+                </box>
+                <text>
+                  <span fg={C.green} bold>g </span>
+                  <span fg={C.fgMuted}>global · </span>
+                  <span fg={C.cyan} bold>p </span>
+                  <span fg={C.fgMuted}>project · </span>
+                  <span fg={C.red} bold>Esc </span>
+                  <span fg={C.fgMuted}>cancel</span>
+                </text>
+              </box>
+            )}
+
+            {/* Provider prefix picker */}
+            {mode === "pick_provider_prefix" && (
+              <box flexDirection="column">
+                {PROVIDER_PREFIXES.slice(0, 8).map((p, idx) => (
+                  <box key={p.name} height={1} backgroundColor={idx === providerPickerIndex ? C.bgHighlight : C.bg}>
+                    <text>
+                      <span fg={idx === providerPickerIndex ? C.white : C.dim}>{" "}</span>
+                      <span fg={idx === providerPickerIndex ? C.cyan : C.fgMuted} bold={idx === providerPickerIndex}>
+                        {p.prefix.padEnd(14).substring(0, 14)}
+                      </span>
+                      <span fg={C.dim}>{"  "}</span>
+                      <span fg={idx === providerPickerIndex ? C.fgMuted : C.dim}>{p.displayName}</span>
+                    </text>
+                  </box>
+                ))}
+                <text>
+                  <span fg={C.blue} bold>↑↓ </span>
+                  <span fg={C.fgMuted}>navigate · </span>
+                  <span fg={C.green} bold>Enter </span>
+                  <span fg={C.fgMuted}>select prefix · </span>
+                  <span fg={C.red} bold>Esc </span>
+                  <span fg={C.fgMuted}>back</span>
+                </text>
+              </box>
+            )}
+
+            {/* Normal text input (not scope/provider picker) */}
+            {mode !== "pick_profile_scope" && mode !== "pick_provider_prefix" && (
+              <box flexDirection="column">
+                <text>
+                  <span fg={C.green} bold>{"> "}</span>
+                  <span fg={editProfileValue === "auto" ? C.yellow : C.white}>{editProfileValue}</span>
+                  <span fg={C.cyan}>{"█"}</span>
+                </text>
+
+                {/* Suggestion list */}
+                {suggestions.length > 0 && (
+                  <box flexDirection="column">
+                    {suggestions.map((s, idx) => {
+                      const selected = idx === suggestionIndex;
+                      // Highlight matching portion
+                      const lower = editProfileValue.toLowerCase();
+                      const matchIdx = lower ? s.toLowerCase().indexOf(lower) : -1;
+                      return (
+                        <box key={s} height={1} backgroundColor={selected ? C.bgHighlight : C.bg}>
+                          <text>
+                            <span fg={selected ? C.dim : C.dim}>{"  "}</span>
+                            {matchIdx >= 0 && lower ? (
+                              <>
+                                <span fg={selected ? C.fgMuted : C.dim}>{s.substring(0, matchIdx)}</span>
+                                <span fg={selected ? C.white : C.cyan} bold>{s.substring(matchIdx, matchIdx + lower.length)}</span>
+                                <span fg={selected ? C.fgMuted : C.dim}>{s.substring(matchIdx + lower.length)}</span>
+                              </>
+                            ) : (
+                              <span fg={selected ? C.white : C.fgMuted}>{s}</span>
+                            )}
+                          </text>
+                        </box>
+                      );
+                    })}
+                  </box>
+                )}
+
+                {editProfileValue === "auto" ? (
+                  <text>
+                    <span fg={C.yellow} bold>auto-route </span>
+                    <span fg={C.fgMuted}>— claudish will use the routing table · </span>
+                    <span fg={C.green} bold>Enter </span>
+                    <span fg={C.fgMuted}>to confirm · </span>
+                    <span fg={C.red} bold>Esc </span>
+                    <span fg={C.fgMuted}>cancel</span>
+                  </text>
+                ) : (
+                  <text>
+                    <span fg={C.green} bold>Enter </span>
+                    <span fg={C.fgMuted}>save · </span>
+                    <span fg={C.blue} bold>Tab </span>
+                    <span fg={C.fgMuted}>{editProfileValue === "" ? "pick provider · " : "autocomplete · "}</span>
+                    <span fg={C.blue} bold>↑↓ </span>
+                    <span fg={C.fgMuted}>suggestion · </span>
+                    <span fg={C.yellow} bold>a </span>
+                    <span fg={C.fgMuted}>auto-route · </span>
+                    <span fg={C.red} bold>Esc </span>
+                    <span fg={C.fgMuted}>cancel</span>
+                  </text>
+                )}
+              </box>
+            )}
+          </box>
+        )}
+      </box>
+    );
+  }
+
+  function ProfileDetail() {
+    const globalCfg = config;
+    const localCfg = loadLocalConfig();
+    const localProfileNames = localCfg ? new Set(Object.keys(localCfg.profiles)) : new Set<string>();
+
+    // Resolve selected profile entry
+    const allEntries: Array<{ name: string; scope: "local" | "global"; models: Record<string, string | undefined> }> = [];
+    if (localCfg) {
+      for (const [name, prof] of Object.entries(localCfg.profiles)) {
+        allEntries.push({ name, scope: "local", models: prof.models });
+      }
+    }
+    for (const [name, prof] of Object.entries(globalCfg.profiles)) {
+      allEntries.push({ name, scope: "global", models: prof.models });
+    }
+
+    const entry = allEntries[profileIndex];
+    const isActive = entry ? entry.name === globalCfg.defaultProfile : false;
+    const shadowed = entry ? (entry.scope === "global" && localProfileNames.has(entry.name)) : false;
+
+    return (
+      <box
+        height={DETAIL_H}
+        border
+        borderStyle="single"
+        borderColor={C.dim}
+        title={entry ? ` ${entry.name} ` : " (no selection) "}
+        backgroundColor={C.bgAlt}
+        flexDirection="column"
+        paddingX={1}
+      >
+        {entry ? (
+          <>
+            {(["opus", "sonnet", "haiku", "subagent"] as const).map((role) => {
+              const val = entry.models[role];
+              const isAuto = !val;
+              const label = role.padEnd(8);
+              return (
+                <text key={role}>
+                  <span fg={C.blue} bold>{label + ": "}</span>
+                  {isAuto ? (
+                    <>
+                      <span fg={C.yellow}>(auto-route</span>
+                      <span fg={C.dim}> — uses routing table</span>
+                      <span fg={C.yellow}>)</span>
+                    </>
+                  ) : (
+                    <span fg={C.cyan}>{val}</span>
+                  )}
+                </text>
+              );
+            })}
+            <text>
+              <span fg={C.blue} bold>{"Scope:    "}</span>
+              <span fg={entry.scope === "local" ? C.cyan : C.fgMuted}>
+                {entry.scope === "local"
+                  ? `local (.claudish.json)`
+                  : `global (~/.claudish/config.json)`}
+              </span>
+              {isActive && <span fg={C.orange} bold>{"  ● active"}</span>}
+              {shadowed && <span fg={C.dim}>{"  (shadowed)"}</span>}
+            </text>
+          </>
+        ) : (
+          <text>
+            <span fg={C.fgMuted}>{"No profiles configured."}</span>
           </text>
         )}
       </box>
@@ -1377,6 +2032,36 @@ export function App() {
         [C.blue, "Tab", "section"],
         [C.dim, "q", "quit"],
       ];
+    } else if (activeTab === "profiles" && mode === "pick_profile_scope") {
+      keys = [
+        [C.green, "g", "global"],
+        [C.cyan, "p", "project"],
+        [C.red, "Esc", "cancel"],
+      ];
+    } else if (activeTab === "profiles" && mode === "pick_provider_prefix") {
+      keys = [
+        [C.blue, "↑↓", "navigate"],
+        [C.green, "Enter", "select prefix"],
+        [C.red, "Esc", "back"],
+      ];
+    } else if (activeTab === "profiles" && isProfileEditMode) {
+      keys = [
+        [C.green, "Enter", "save field"],
+        [C.blue, "Tab", "provider picker"],
+        [C.blue, "↑↓", "suggestion"],
+        [C.yellow, "a", "auto-route"],
+        [C.red, "Esc", "cancel"],
+      ];
+    } else if (activeTab === "profiles") {
+      keys = [
+        [C.blue, "↑↓", "navigate"],
+        [C.green, "Enter", "activate"],
+        [C.cyan, "n", "new"],
+        [C.green, "e", "edit"],
+        [C.red, "d", "delete"],
+        [C.blue, "Tab", "section"],
+        [C.dim, "q", "quit"],
+      ];
     } else if (activeTab === "routing") {
       keys = [
         [C.blue, "↑↓", "navigate"],
@@ -1449,6 +2134,12 @@ export function App() {
         <>
           <ProvidersContent />
           <ProviderDetail />
+        </>
+      )}
+      {activeTab === "profiles" && (
+        <>
+          <ProfilesContent />
+          <ProfileDetail />
         </>
       )}
       {activeTab === "routing" && (
