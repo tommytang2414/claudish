@@ -2,6 +2,25 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [6.4.2] - 2026-03-28
+
+### Bug Fixes
+
+- v6.4.2 - channel mode test coverage + scrollback indexOf bug fix([`d2610e8`](https://github.com/MadAppGang/claudish/commit/d2610e880c60a8d1a63f8872178a8f0020be443b))
+- add ignoreUndefinedProperties for Firestore writes([`fef0a59`](https://github.com/MadAppGang/claudish/commit/fef0a596427985761c61a4e5b4a3c47567c91db9))
+
+### Documentation
+
+- update CHANGELOG.md for v6.4.1([`7b1e6ec`](https://github.com/MadAppGang/claudish/commit/7b1e6ec921d4c31bddee1af7ef1b1804211f365a))
+
+### New Features
+
+- model catalog collector — Firebase Cloud Functions([`4e97178`](https://github.com/MadAppGang/claudish/commit/4e9717890cc492852a09f6eeb1eefa0ab00ffc3d))
+
+### Other Changes
+
+- change catalog schedule from every 6h to daily at 03:00 UTC([`a1b5d91`](https://github.com/MadAppGang/claudish/commit/a1b5d915a061a72a914d6adbd1dc36e123e211d5))
+
 ## [6.4.1] - 2026-03-28
 
 ### Bug Fixes
