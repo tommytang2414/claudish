@@ -40,6 +40,7 @@ import {
 } from "../services/vision-proxy.js";
 import { reportError, classifyError } from "../telemetry.js";
 import { recordStats } from "../stats.js";
+import { lookupModel } from "../adapters/model-catalog.js";
 
 function extractAuthHeaders(c: Context): VisionProxyAuthHeaders {
   const headers = c.req.header();
@@ -160,7 +161,16 @@ export class ComposedHandler implements ModelHandler {
 
     // 3. Convert messages and tools
     const messages = adapter.convertMessages(claudeRequest, filterIdentity);
-    const tools = adapter.convertTools(claudeRequest, this.options.summarizeTools);
+    let tools = adapter.convertTools(claudeRequest, this.options.summarizeTools);
+
+    // Enforce per-model tool count limits (e.g., OpenAI max 128)
+    const maxToolCount = lookupModel(this.targetModel)?.maxToolCount;
+    if (maxToolCount && tools.length > maxToolCount) {
+      log(
+        `[ComposedHandler] Truncating tools from ${tools.length} to ${maxToolCount} (model limit for ${this.targetModel})`
+      );
+      tools = tools.slice(0, maxToolCount);
+    }
 
     // Handle image content for models that don't support vision
     if (!this.getModelSupportsVision()) {

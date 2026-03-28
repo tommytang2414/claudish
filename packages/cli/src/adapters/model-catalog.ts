@@ -17,6 +17,8 @@ export interface ModelEntry {
   temperatureRange?: { min: number; max: number };
   /** Tool name length limit */
   toolNameLimit?: number;
+  /** Maximum number of tools allowed per request */
+  maxToolCount?: number;
 }
 
 /**
@@ -68,14 +70,14 @@ export const MODEL_CATALOG: ModelEntry[] = [
   },
 
   // ── OpenAI ──────────────────────────────────────────
-  { pattern: "gpt-5.4", contextWindow: 1_050_000 },
-  { pattern: "gpt-5", contextWindow: 400_000 },
-  { pattern: "o1", contextWindow: 200_000 },
-  { pattern: "o3", contextWindow: 200_000 },
-  { pattern: "o4", contextWindow: 200_000 },
-  { pattern: "gpt-4o", contextWindow: 128_000 },
-  { pattern: "gpt-4-turbo", contextWindow: 128_000 },
-  { pattern: "gpt-3.5", contextWindow: 16_385 },
+  { pattern: "gpt-5.4", contextWindow: 1_050_000, maxToolCount: 128 },
+  { pattern: "gpt-5", contextWindow: 400_000, maxToolCount: 128 },
+  { pattern: "o1", contextWindow: 200_000, maxToolCount: 128 },
+  { pattern: "o3", contextWindow: 200_000, maxToolCount: 128 },
+  { pattern: "o4", contextWindow: 200_000, maxToolCount: 128 },
+  { pattern: "gpt-4o", contextWindow: 128_000, maxToolCount: 128 },
+  { pattern: "gpt-4-turbo", contextWindow: 128_000, maxToolCount: 128 },
+  { pattern: "gpt-3.5", contextWindow: 16_385, maxToolCount: 128 },
 
   // ── Kimi ────────────────────────────────────────────
   { pattern: "kimi-k2.5", contextWindow: 262_144 },

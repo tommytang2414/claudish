@@ -157,6 +157,32 @@ describe("lookupModel", () => {
     });
   });
 
+  describe("OpenAI maxToolCount", () => {
+    test("gpt-5.4 → maxToolCount: 128", () => {
+      const entry = lookupModel("gpt-5.4");
+      expect(entry).toBeDefined();
+      expect(entry!.maxToolCount).toBe(128);
+    });
+
+    test("gpt-4o → maxToolCount: 128", () => {
+      const entry = lookupModel("gpt-4o");
+      expect(entry).toBeDefined();
+      expect(entry!.maxToolCount).toBe(128);
+    });
+
+    test("o3 → maxToolCount: 128", () => {
+      const entry = lookupModel("o3");
+      expect(entry).toBeDefined();
+      expect(entry!.maxToolCount).toBe(128);
+    });
+
+    test("non-OpenAI model has no maxToolCount", () => {
+      const entry = lookupModel("grok-4");
+      expect(entry).toBeDefined();
+      expect(entry!.maxToolCount).toBeUndefined();
+    });
+  });
+
   describe("Unknown model", () => {
     test("unknown-model → undefined", () => {
       expect(lookupModel("unknown-model")).toBeUndefined();
