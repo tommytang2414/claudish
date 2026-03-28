@@ -159,11 +159,11 @@ const CATALOG_SECRETS = [
 ];
 
 // ─────────────────────────────────────────────────────────────
-// Scheduled collector — every 6 hours
+// Scheduled collector — daily at 03:00 UTC
 // ─────────────────────────────────────────────────────────────
 export const collectModelCatalog = onSchedule(
   {
-    schedule: "every 6 hours",
+    schedule: "0 3 * * *",
     region: "us-central1",
     timeoutSeconds: 540,       // 9 minutes — plenty for all collectors in parallel
     memory: "512MiB",
