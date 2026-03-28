@@ -2,6 +2,16 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [6.4.4] - 2026-03-28
+
+### Bug Fixes
+
+- v6.4.3 - error reporting hints on all MCP tool failures, mtm grid improvements
+
+### New Features
+
+- Add team-grid orchestrator for parallel multi-model execution with grid layout
+
 ## [6.4.2] - 2026-03-28
 
 ### Bug Fixes
