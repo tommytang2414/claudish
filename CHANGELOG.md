@@ -6,12 +6,22 @@ All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
 ### Bug Fixes
 
-- v6.4.2 - channel mode test coverage + scrollback indexOf bug fix([`d2610e8`](https://github.com/MadAppGang/claudish/commit/d2610e880c60a8d1a63f8872178a8f0020be443b))
+- Fix scrollback-buffer indexOf("") bug — empty strings in middle of input were incorrectly skipped
+- Make SignalWatcher quiet period injectable for faster test execution (14x speedup)
 - add ignoreUndefinedProperties for Firestore writes([`fef0a59`](https://github.com/MadAppGang/claudish/commit/fef0a596427985761c61a4e5b4a3c47567c91db9))
+
+### Tests
+
+- Add 21 SessionManager unit tests (lifecycle, timeout, cancel, concurrent sessions, artifacts)
+- Add notification ordering verification in E2E lifecycle test
+- Add tool group filtering tests (CLAUDISH_MCP_TOOLS=channel/low-level modes)
+- Add fake-claudish test helper for process spawning tests
+- 59 channel tests total, all passing (was 35)
 
 ### Documentation
 
-- update CHANGELOG.md for v6.4.1([`7b1e6ec`](https://github.com/MadAppGang/claudish/commit/7b1e6ec921d4c31bddee1af7ef1b1804211f365a))
+- Add Channel Mode section to CLAUDE.md
+- Update MCP server docs with channel tools and team tool
 
 ### New Features
 

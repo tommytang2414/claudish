@@ -177,6 +177,48 @@ bun run packages/cli/src/test-fixtures/extract-sse-from-log.ts logs/claudish_*.l
 bun test packages/cli/src/format-translation.test.ts
 ```
 
+## Channel Mode (v6.4.0+)
+
+The MCP server supports a channel mode that enables async model sessions with push notifications.
+
+### Architecture
+
+Uses the low-level `Server` class (not `McpServer`) from `@modelcontextprotocol/sdk/server/index.js` to declare `experimental: { 'claude/channel': {} }` capability. The SDK's `assertNotificationCapability()` has no default case — custom notification methods like `notifications/claude/channel` pass through.
+
+### Components (`packages/cli/src/channel/`)
+
+- **SessionManager** — spawns `claudish --model X --stdin --quiet` child processes, tracks lifecycle, enforces timeouts
+- **SignalWatcher** — per-session state machine (starting→running→tool_executing→waiting_for_input→completed/failed/cancelled)
+- **ScrollbackBuffer** — in-memory ring buffer (2000 lines) for session output
+
+### MCP Tools (11 total)
+
+- **Low-level** (4): `run_prompt`, `list_models`, `search_models`, `compare_models`
+- **Agentic** (2): `team`, `report_error`
+- **Channel** (5): `create_session`, `send_input`, `get_output`, `cancel_session`, `list_sessions`
+
+Tool gating via `CLAUDISH_MCP_TOOLS` env var: `all` (default), `low-level`, `agentic`, `channel`.
+
+### Tool Registration Pattern
+
+Uses a `ToolDefinition[]` registry with raw JSON Schema (not Zod). Two `setRequestHandler` calls replace McpServer's ergonomic API:
+- `ListToolsRequestSchema` → returns filtered tool list
+- `CallToolRequestSchema` → dispatches to handler by name
+
+### Channel Notifications
+
+`server.notification({ method: "notifications/claude/channel", params: { content, meta } })` — pushed by SessionManager's `onStateChange` callback on state transitions.
+
+### Testing
+
+```bash
+bun test --cwd . ./packages/cli/src/channel/*.test.ts
+```
+
+59 tests across 4 files: scrollback-buffer (11), signal-watcher (12), session-manager (21), e2e-channel (15).
+
+E2E tests use `--strict-mcp-config --bare --dangerously-skip-permissions` for isolation. SessionManager tests use a fake-claudish PATH shim (`channel/test-helpers/fake-claudish.ts`).
+
 ## Test Infrastructure
 
 ### Format Translation Test Harness
