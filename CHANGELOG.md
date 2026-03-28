@@ -2,36 +2,37 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
-## [6.4.4] - 2026-03-28
+## [6.4.5] - 2026-03-28
 
 ### Bug Fixes
 
-- v6.4.3 - error reporting hints on all MCP tool failures, mtm grid improvements
+- v6.4.5 - enforce per-model tool count limits (OpenAI 128 max)([`498a2ed`](https://github.com/MadAppGang/claudish/commit/498a2ede644daa5ed67e7119143ecedfb607f5dc))
 
 ### New Features
 
-- Add team-grid orchestrator for parallel multi-model execution with grid layout
+- v6.4.4 - team-grid orchestrator for parallel multi-model execution([`1971b71`](https://github.com/MadAppGang/claudish/commit/1971b7193aa34e160cee31fd1fc39c0685c0e48a))
+
+## [6.4.3] - 2026-03-28
+
+### Bug Fixes
+
+- v6.4.3 - error reporting hints on all MCP tool failures, mtm grid improvements([`781362b`](https://github.com/MadAppGang/claudish/commit/781362bd9e207145f8458ecf1be955633a5ba2a3))
+
+### Documentation
+
+- update documentation for channel mode and v6.4.2([`db9fcdb`](https://github.com/MadAppGang/claudish/commit/db9fcdb9dc76075a99e06cabdadfed05424c1381))
+- update CHANGELOG.md for v6.4.2([`431a473`](https://github.com/MadAppGang/claudish/commit/431a4734c1284d345324ac2d5350dbf47749c19a))
 
 ## [6.4.2] - 2026-03-28
 
 ### Bug Fixes
 
-- Fix scrollback-buffer indexOf("") bug — empty strings in middle of input were incorrectly skipped
-- Make SignalWatcher quiet period injectable for faster test execution (14x speedup)
+- v6.4.2 - channel mode test coverage + scrollback indexOf bug fix([`d2610e8`](https://github.com/MadAppGang/claudish/commit/d2610e880c60a8d1a63f8872178a8f0020be443b))
 - add ignoreUndefinedProperties for Firestore writes([`fef0a59`](https://github.com/MadAppGang/claudish/commit/fef0a596427985761c61a4e5b4a3c47567c91db9))
-
-### Tests
-
-- Add 21 SessionManager unit tests (lifecycle, timeout, cancel, concurrent sessions, artifacts)
-- Add notification ordering verification in E2E lifecycle test
-- Add tool group filtering tests (CLAUDISH_MCP_TOOLS=channel/low-level modes)
-- Add fake-claudish test helper for process spawning tests
-- 59 channel tests total, all passing (was 35)
 
 ### Documentation
 
-- Add Channel Mode section to CLAUDE.md
-- Update MCP server docs with channel tools and team tool
+- update CHANGELOG.md for v6.4.1([`7b1e6ec`](https://github.com/MadAppGang/claudish/commit/7b1e6ec921d4c31bddee1af7ef1b1804211f365a))
 
 ### New Features
 
