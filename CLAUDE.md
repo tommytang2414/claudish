@@ -16,6 +16,27 @@
 - `bun run build:ci` - CI build (bundles only, no model extraction)
 - `bun run dev` - Development mode
 
+## Windows Build (Standalone EXE)
+
+For Windows users, build a standalone executable:
+
+```bash
+cd packages/cli
+bun build src/index.ts --compile --outfile claudish.exe
+```
+
+This creates `claudish.exe` (standalone, no Node.js/Bun required).
+
+**Launcher scripts** (in `C:\Users\User\bin\`):
+- `claudish.exe` - Standalone executable
+- `claudish.cmd` - Windows CMD launcher (default MiniMax M2.7)
+- `claudish.ps1` - PowerShell launcher
+
+**Usage**:
+```cmd
+claudish --model mm@MiniMax-M2.7
+```
+
 ## Model Routing (v4.0+)
 
 ### New Syntax: `provider@model[:concurrency]`
@@ -237,4 +258,35 @@ When releasing a new version, update ALL of these locations:
 2. `packages/cli/package.json` (npm-published package - **CI/CD publishes from here**)
 3. `packages/cli/src/cli.ts` (fallback VERSION constant, line ~27)
 
-The fallback VERSION in cli.ts ensures compiled binaries (Homebrew, standalone) display the correct version when package.json isn't available. The `packages/cli/package.json` version is what npm publishes - if it's not updated, npm publish will fail.
+The fallback VERSION in cli.ts ensures compiled binaries (Homebrew/standalone) display the correct version when package.json isn't available. The `packages/cli/package.json` version is what npm publishes - if it's not updated, npm publish will fail.
+
+## Windows Modifications (Fork)
+
+This fork adds Windows TTY support for interactive mode via `cmd.exe /c start`.
+
+### Key Changes
+
+**`pty-diag-runner.ts`**:
+- Added `WindowsSpawnRunner` class - uses `cmd.exe /c start` to open Claude Code in a new terminal window with proper TTY
+- Added `tryCreateWindowsPtyRunner()` factory function
+- Added `PtyRunner` interface for common PTY runner abstraction
+
+**`claude-runner.ts`**:
+- Changed `needsShell` condition from `.cmd extension check` to `isWindows()` - spawns all Windows processes with `shell: true` for better TTY propagation
+- Interactive mode now uses `WindowsSpawnRunner.run()` which opens a new terminal window
+
+### How It Works
+
+1. Interactive mode spawns Claude Code via `cmd.exe /c start /wait cmd.exe /k batchFile`
+2. Batch file sets environment variables and launches Claude Code
+3. `start /wait` ensures parent process waits for the new window to close
+4. Claude Code gets a proper TTY in the new terminal window
+
+### Build
+
+```bash
+cd packages/cli
+bun build src/index.ts --compile --outfile ../../../bin/claudish.exe
+```
+
+Binary output: `C:\Users\User\bin\claudish.exe` (standalone, ~120MB)

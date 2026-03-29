@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { WriteStream } from "node:fs";
-import type { MtmDiagRunner } from "./pty-diag-runner.js";
+import type { MtmDiagRunner, PtyRunner } from "./pty-diag-runner.js";
 
 // Backward-compat alias so old call sites using PtyDiagRunner still compile
 type PtyDiagRunner = MtmDiagRunner;
@@ -146,7 +146,7 @@ export class TmuxDiagOutput extends LogFileDiagOutput {
  * The mtm bottom pane shows the log live via `tail -f`.
  */
 export class MtmDiagOutput implements DiagOutput {
-  constructor(private runner: MtmDiagRunner) {}
+  constructor(private runner: PtyRunner) {}
 
   write(msg: string): void {
     this.runner.write(msg);
@@ -210,7 +210,7 @@ export class NullDiagOutput implements DiagOutput {
 export function createDiagOutput(options: {
   interactive: boolean;
   ptyRunner?: PtyDiagRunner | null;
-  mtmRunner?: MtmDiagRunner | null;
+  mtmRunner?: PtyRunner | null;
   diagMode?: "auto" | "pty" | "tmux" | "logfile" | "off";
 }): DiagOutput {
   if (!options.interactive) {

@@ -417,14 +417,14 @@ export async function runClaudeWithProxy(
   // terminal, runs Claude Code in the top pane (real PTY), and shows diagnostics
   // in the bottom pane via tail -f on the diag log.
   // Fallback path: standard stdio: 'inherit' spawn (non-interactive or no mtm).
-  const needsShell = isWindows() && claudeBinary.endsWith(".cmd");
+  const needsShell = isWindows();
   const spawnCommand = needsShell ? `"${claudeBinary}"` : claudeBinary;
 
   let exitCode: number;
 
   if (config.interactive && ptyDiagRunner) {
     // MTM path: mtm handles terminal setup and launches Claude Code
-    exitCode = await ptyDiagRunner.run(spawnCommand, claudeArgs, env);
+    exitCode = await ptyDiagRunner.run(spawnCommand, claudeArgs, env, needsShell);
 
     // Clean up temporary settings file
     try {

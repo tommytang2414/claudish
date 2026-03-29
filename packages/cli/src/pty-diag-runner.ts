@@ -368,8 +368,14 @@ function parseLogMessage(msg: string): { isError: boolean; short: string; provid
 
 /**
  * Try to create an MtmDiagRunner. Returns null if mtm binary is not available.
+ * On Windows, returns a WindowsSpawnRunner using spawn.
  */
-export async function tryCreateMtmRunner(): Promise<MtmDiagRunner | null> {
+export async function tryCreateMtmRunner(): Promise<MtmDiagRunner | WindowsSpawnRunner | null> {
+  // On Windows, use spawn directly
+  if (process.platform === "win32") {
+    return tryCreateWindowsPtyRunner();
+  }
+
   try {
     const runner = new MtmDiagRunner();
     // Verify we can find the mtm binary before committing
@@ -386,9 +392,17 @@ export interface DiagMessage {
   level: "error" | "warn" | "info";
 }
 
+export interface PtyRunner {
+  run(claudeCommand: string, claudeArgs: string[], env: Record<string, string>, shell?: boolean): Promise<number>;
+  write(msg: string): void;
+  setModel(name: string): void;
+  getLogPath(): string;
+  cleanup(): void;
+}
+
 /**
  * PtyDiagRunner is kept as a type alias for backward compatibility.
- * New code should use MtmDiagRunner directly.
+ * New code should use MtmDiagRunner
  * @deprecated Use MtmDiagRunner
  */
 export { MtmDiagRunner as PtyDiagRunner };
@@ -398,3 +412,119 @@ export { MtmDiagRunner as PtyDiagRunner };
  * @deprecated Use tryCreateMtmRunner
  */
 export const tryCreatePtyRunner = tryCreateMtmRunner;
+
+// ─── Windows Spawn Runner (no PTY needed) ─────────────────────────────────────
+
+export class WindowsSpawnRunner {
+  private proc: ChildProcess | null = null;
+  private logPath: string;
+  private logStream: WriteStream | null = null;
+
+  constructor() {
+    const dir = join(homedir(), ".claudish");
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      // Already exists
+    }
+    this.logPath = join(dir, `diag-${process.pid}.log`);
+    this.logStream = createWriteStream(this.logPath, { flags: "w" });
+    this.logStream.on("error", () => {});
+  }
+
+  async run(
+    claudeCommand: string,
+    claudeArgs: string[],
+    env: Record<string, string>,
+    _shell: boolean = false
+  ): Promise<number> {
+    const mergedEnv = { ...process.env, ...env } as Record<string, string>;
+    const argsStr = claudeArgs.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(" ");
+
+    const { writeFileSync, unlinkSync } = require("fs");
+    const { join } = require("path");
+    const { homedir } = require("os");
+
+    const batchPath = join(homedir(), ".claudish", "run-claude.bat");
+    const envLines = Object.entries(mergedEnv)
+      .map(([k, v]) => `set "${k}=${v.replace(/"/g, '\\"')}"`)
+      .join("\r\n");
+    const batchContent = `@echo off\r\n${envLines}\r\n${claudeCommand} ${argsStr}\r\n`;
+    writeFileSync(batchPath, batchContent, { encoding: "utf8" });
+
+    return new Promise<number>((resolve) => {
+      this.proc = spawn("cmd.exe", ["/c", "start", "/wait", "cmd.exe", "/k", batchPath], {
+        env: mergedEnv,
+        stdio: "inherit",
+        shell: false,
+      });
+
+      this.proc.on("exit", (code) => {
+        try {
+          unlinkSync(batchPath);
+        } catch {}
+        if (this.logStream) {
+          try {
+            this.logStream.write(`[spawn] exited with code ${code}\n`);
+          } catch {}
+        }
+        resolve(code ?? 1);
+      });
+
+      this.proc.on("error", (err) => {
+        try {
+          unlinkSync(batchPath);
+        } catch {}
+        if (this.logStream) {
+          try {
+            this.logStream.write(`[spawn] error: ${err.message}\n`);
+          } catch {}
+        }
+        resolve(1);
+      });
+    });
+  }
+
+  write(msg: string): void {
+    if (!this.logStream) return;
+    const timestamp = new Date().toISOString();
+    try {
+      this.logStream.write(`[${timestamp}] ${msg}\n`);
+    } catch {}
+  }
+
+  setModel(_name: string): void {
+    // Status bar not supported
+  }
+
+  getLogPath(): string {
+    return this.logPath;
+  }
+
+  cleanup(): void {
+    if (this.logStream) {
+      try {
+        this.logStream.end();
+      } catch {}
+      this.logStream = null;
+    }
+    try {
+      unlinkSync(this.logPath);
+    } catch {}
+    if (this.proc) {
+      try {
+        this.proc.kill();
+      } catch {}
+      this.proc = null;
+    }
+  }
+}
+
+export async function tryCreateWindowsPtyRunner(): Promise<WindowsSpawnRunner | null> {
+  try {
+    const runner = new WindowsSpawnRunner();
+    return runner;
+  } catch {
+    return null;
+  }
+}
