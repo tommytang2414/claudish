@@ -34,6 +34,8 @@ export function createAnthropicPassthroughStream(
           const reader = response.body!.getReader();
           let buffer = "";
           let inputTokens = 0;
+          let cacheReadInputTokens = 0;
+          let cacheCreationInputTokens = 0;
           let outputTokens = 0;
 
           let totalLines = 0;
@@ -44,30 +46,45 @@ export function createAnthropicPassthroughStream(
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+            buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
 
-            for (const line of lines) {
-              totalLines++;
+            // Split by \n\n to get complete SSE events (same pattern as other stream parsers).
+            // This ensures each enqueued chunk is a complete event, which prevents
+            // consumers from receiving partial events that cause parse failures.
+            const eventChunks = buffer.split("\n\n");
+            buffer = eventChunks.pop() || "";
+
+            for (const eventChunk of eventChunks) {
+              if (!eventChunk.trim()) continue;
+              totalLines += eventChunk.split("\n").length;
+
               if (!isClosed) {
-                // Pass through SSE events as-is
-                controller.enqueue(encoder.encode(line + "\n"));
+                // Pass through complete SSE event with double-newline terminator
+                controller.enqueue(encoder.encode(eventChunk + "\n\n"));
               }
 
-              // Extract usage and debug info from SSE events
-              if (line.startsWith("data: ")) {
-                log(`[SSE:anthropic] ${line.slice(6).substring(0, 300)}`);
+              // Extract usage and debug info from the data line of this event
+              const dataLine = eventChunk.split("\n").find((l) => l.startsWith("data: "));
+              if (dataLine) {
+                log(`[SSE:anthropic] ${dataLine.slice(6).substring(0, 300)}`);
 
                 try {
-                  const data = JSON.parse(line.slice(6));
+                  const data = JSON.parse(dataLine.slice(6));
                   if (data.message?.usage) {
                     inputTokens = data.message.usage.input_tokens || inputTokens;
                     outputTokens = data.message.usage.output_tokens || outputTokens;
+                    cacheReadInputTokens =
+                      data.message.usage.cache_read_input_tokens || cacheReadInputTokens;
+                    cacheCreationInputTokens =
+                      data.message.usage.cache_creation_input_tokens || cacheCreationInputTokens;
                   }
                   if (data.usage) {
                     inputTokens = data.usage.input_tokens || inputTokens;
                     outputTokens = data.usage.output_tokens || outputTokens;
+                    cacheReadInputTokens =
+                      data.usage.cache_read_input_tokens || cacheReadInputTokens;
+                    cacheCreationInputTokens =
+                      data.usage.cache_creation_input_tokens || cacheCreationInputTokens;
                   }
                   // Log text content for debugging
                   if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
@@ -99,7 +116,14 @@ export function createAnthropicPassthroughStream(
           );
 
           if (opts.onTokenUpdate) {
-            opts.onTokenUpdate(inputTokens, outputTokens);
+            const totalInputTokens =
+              inputTokens + cacheReadInputTokens + cacheCreationInputTokens;
+            if (cacheReadInputTokens > 0 || cacheCreationInputTokens > 0) {
+              log(
+                `[AnthropicSSE] Cache tokens: input=${inputTokens}, cache_read=${cacheReadInputTokens}, cache_creation=${cacheCreationInputTokens}, total=${totalInputTokens}, output=${outputTokens}`
+              );
+            }
+            opts.onTokenUpdate(totalInputTokens, outputTokens);
           }
 
           if (!isClosed) {
