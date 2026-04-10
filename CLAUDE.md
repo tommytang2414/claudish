@@ -145,6 +145,33 @@ Located in `handlers/shared/stream-parsers/`:
 - `ollama-jsonl.ts` — Ollama JSONL → Claude SSE
 - `openai-responses-sse.ts` — OpenAI Responses API → Claude SSE (Codex)
 
+### Lesson Learned — `anthropic-sse.ts` (2026-04-10, commit cbfb60c)
+
+**症狀**: Claude Code 出 `Cannot read properties of undefined (reading 'input_tokens')`，只發生在用 Anthropic passthrough 嘅 provider（MiniMax、Kimi、Z.AI）。
+
+**根本原因 — 兩個 bug 疊埋：**
+
+**Bug 1 — 逐行 enqueue（主因）**
+原本用 `buffer.split("\n")` 逐行 enqueue，Claude Code 收到嘅係半截 SSE event。SSE 格式要求 `event:` + `data:` + `\n\n` 作為完整單位，consumer (`parseClaudeSseStream`) 才能 parse 到 `usage`。Bun ReadableStream 唔保證 chunk delivery 順序，半截 event 令 `usage` 係 `undefined`。
+
+**Bug 2 — CRLF line endings（Z.AI / Windows-origin streams）**
+Z.AI 等 provider 回傳 `\r\n` 換行。修咗 Bug 1 之後改用 `split("\n\n")`，但 CRLF 檔案嘅 event 分隔符係 `\r\n\r\n`，唔含 `\n\n` substring，整個 stream 變成一個大 chunk。`find()` 只攞第一條 `data:` 行（`message_start` 嘅 `input_tokens: 0`），之後 `message_delta` 裡面嘅真實 token count 永遠讀唔到。
+
+**Fix（兩行）**:
+```typescript
+// 1. Decode 後即刻 normalize 換行
+buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+
+// 2. 以完整 SSE event 為單位 enqueue（唔係逐行）
+const eventChunks = buffer.split("\n\n");
+buffer = eventChunks.pop() || "";
+for (const eventChunk of eventChunks) {
+  controller.enqueue(encoder.encode(eventChunk + "\n\n"));
+}
+```
+
+**如果呢個 error 再出現**：先用 `--debug` 捕捉 raw SSE，check 係咪有 `\r\n`，再確認 consumer 收到嘅 chunk 係完整 event 還是碎片。
+
 ## Debug Logging
 
 Debug logging is behind the `--debug` flag and outputs to `logs/` directory. It's disabled by default.
