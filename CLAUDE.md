@@ -172,6 +172,31 @@ for (const eventChunk of eventChunks) {
 
 **如果呢個 error 再出現**：先用 `--debug` 捕捉 raw SSE，check 係咪有 `\r\n`，再確認 consumer 收到嘅 chunk 係完整 event 還是碎片。
 
+### 持續監察清單 — 每次 update 都要 check
+
+呢個 project 由 Claude Code 管理，每次有以下變動都要留意：
+
+**1. 新增 Anthropic passthrough provider**
+任何新 provider 用 `anthropic-sse` 格式（即 `getStreamFormat()` 返回 `"anthropic-sse"`），必須：
+- 用 `--debug` 抽一個真實 SSE fixture
+- 加 regression test 入 `format-translation.test.ts`
+- 特別確認 `input_tokens` 係咪從 `message_delta`（唔係 `message_start`）讀
+
+**2. 修改 `anthropic-sse.ts`**
+任何改動後必須跑：
+```bash
+bun test packages/cli/src/format-translation.test.ts
+```
+確保 53 tests 全 pass，特別係：
+- `SEED: text-only Anthropic response passes through text events`
+- `Regression: Z.AI GLM-5 input_tokens in final usage event (#74)`
+
+**3. Provider API 有變**
+MiniMax / Kimi / Z.AI 任何一個改咗 SSE 格式（event 順序、usage 位置），token count 會靜靜地變 0，唔會 throw error。症狀係 token 顯示一直係 0，唔係 crash。偵測方法：`--debug` 後 grep `input_tokens`。
+
+**4. 其他 stream parser 同類風險**
+`openai-sse.ts`、`gemini-sse.ts` 等未經同樣審查，如果出現類似 `undefined` error，從同一方向入手：check 係咪逐行 enqueue、check 換行格式。
+
 ## Debug Logging
 
 Debug logging is behind the `--debug` flag and outputs to `logs/` directory. It's disabled by default.
