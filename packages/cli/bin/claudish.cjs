@@ -8,12 +8,17 @@ const { execFileSync, execSync } = require("child_process");
 const { resolve } = require("path");
 
 function findBun() {
+  const isWin = process.platform === "win32";
   try {
-    const path = execSync("which bun", { encoding: "utf-8" }).trim();
+    const cmd = isWin ? "where bun" : "which bun";
+    const paths = execSync(cmd, { encoding: "utf-8" }).trim().split('\n').map(p => p.trim());
+    const path = isWin ? paths.find(p => p.toLowerCase().endsWith('.exe')) : paths[0];
     if (path) return path;
   } catch {}
   // Common install locations
-  const candidates = [
+  const candidates = isWin ? [
+    (process.env.USERPROFILE || process.env.HOME) + "\\.bun\\bin\\bun.exe"
+  ] : [
     process.env.HOME + "/.bun/bin/bun",
     "/usr/local/bin/bun",
     "/opt/homebrew/bin/bun",
