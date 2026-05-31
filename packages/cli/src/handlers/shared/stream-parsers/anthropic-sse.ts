@@ -46,7 +46,8 @@ export function createAnthropicPassthroughStream(
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+            buffer += decoder.decode(value, { stream: true });
+            buffer = buffer.replace(/\r\n/g, "\n");
 
             // Split by \n\n to get complete SSE events (same pattern as other stream parsers).
             // This ensures each enqueued chunk is a complete event, which prevents

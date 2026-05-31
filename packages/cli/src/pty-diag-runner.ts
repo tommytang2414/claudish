@@ -445,7 +445,7 @@ export class WindowsSpawnRunner {
     const { join } = require("path");
     const { homedir } = require("os");
 
-    const batchPath = join(homedir(), ".claudish", "run-claude.bat");
+    const batchPath = join(homedir(), ".claudish", `run-claude-${process.pid}.bat`);
     const envLines = Object.entries(mergedEnv)
       .map(([k, v]) => `set "${k}=${v.replace(/"/g, '\\"')}"`)
       .join("\r\n");

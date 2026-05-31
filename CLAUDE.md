@@ -1,5 +1,11 @@
 # Claudish - Development Notes
 
+## Changelog
+
+### 2026-05-31 — Critical Bug Fixes
+- Fixed race condition in `WindowsSpawnRunner` (`pty-diag-runner.ts`) where concurrent instances overwrite the same `run-claude.bat` file by appending `process.pid`.
+- Fixed CRLF boundary bug in `anthropic-sse.ts` where split chunks caused unnormalized `\r\n` characters by executing `replace` on the entire buffer instead of incoming chunks.
+
 ## Release Process
 
 **Releases are handled by CI/CD** - do NOT manually run `npm publish`.
