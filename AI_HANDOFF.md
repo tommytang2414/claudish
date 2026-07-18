@@ -2,7 +2,7 @@
 
 ## Current state
 
-- Branch / commit: `main` / merge baseline `5a73355`; revival changes are ready to commit.
+- Branch / functional commit: `main` / `b914a42`.
 - Last agent: Codex
 - Updated: 2026-07-18 HKT
 
