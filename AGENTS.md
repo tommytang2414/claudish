@@ -23,6 +23,8 @@ Read `CLAUDE.md` and `AI_HANDOFF.md` before changing this fork. Follow `C:\Users
 - `--probe --json` can include raw credential values. Do not share its output or commit it.
 - Anthropic-compatible transient 429s retry twice, then open a short circuit. The first automatic retry while the circuit is open becomes a surfaced HTTP 400 so Claude Code stops an infinite silent retry loop.
 - Preserve CRLF normalization on the complete Anthropic SSE buffer. Normalizing only each incoming chunk misses `\r` / `\n` split across chunk boundaries.
+- MiniMax M3 is catalogued at a 1,000,000-token context window. Claudish tracks and displays that limit but does not compact messages; Claude Code owns `/compact` and automatic compaction.
+- Treat the Claudish context percentage as an estimate. `TokenTracker` keeps cumulative session output, so the status line can be conservative after compaction or multiple internal requests.
 - `backup/pre-revival-20260718` contains the complete pre-v7.15 fork state and MiniMax M3 work at commit `0823846`.
 - Do not add `.claude/settings.json` from upstream without explicit approval; the upstream file enables multiple plugins and changes security posture.
 
@@ -37,3 +39,4 @@ Read `CLAUDE.md` and `AI_HANDOFF.md` before changing this fork. Follow `C:\Users
 - Restored Windows CRLF-safe Anthropic SSE parsing and retained cache-token accounting.
 - Added a bounded 429 circuit breaker for MiniMax/Kimi/Z.AI transports with regression coverage.
 - Kept the active CLI typecheck clean and separated the legacy macOS bridge typecheck.
+- Replaced the obsolete README dual-accounting claim with the current context ownership and MiniMax M3 1M behavior.

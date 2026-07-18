@@ -1209,34 +1209,13 @@ No more hardcoded lists or manual flags. Claudish dynamically queries OpenRouter
     - Use "ultrathink" or "think hard" prompts with ANY supported model
     - Claudish handles the translation layer for you
 
-## Context Scaling & Auto-Compaction
+## Context Windows and Compaction
 
-**NEW in v1.2.0**: Claudish now intelligently manages token counting to support ANY context window size (from 128k to 2M+) while preserving Claude Code's native auto-compaction behavior.
+Claudish discovers each provider model's context window from its model catalog and uses it for token tracking and the status line. For example, the MiniMax M3 catalog entry is 1,000,000 tokens, matching MiniMax's published limit of up to 1M tokens (with a guaranteed minimum of 512K): <https://www.minimax.io/models/text/m3>.
 
-### The Challenge
+Claudish does **not** summarize, remove, or compact conversation messages. It translates the request format and forwards the message history supplied by Claude Code. Claude Code owns `/compact`, automatic compaction, and `/context`: <https://code.claude.com/docs/en/context-window>.
 
-Claude Code naturally assumes a fixed context window (typically 200k tokens for Sonnet).
-- **Small Models (e.g., Grok 128k)**: Claude might overuse context and crash.
-- **Massive Models (e.g., Gemini 2M)**: Claude would compact way too early (at 10% usage), wasting the model's potential.
-
-### The Solution: Token Scaling
-
-Claudish implements a "Dual-Accounting" system:
-
-1. **Internal Scaling (For Claude):**
-   - We fetch the *real* context limit from OpenRouter (e.g., 1M tokens).
-   - We scale reported token usage so Claude *thinks* 1M tokens is 200k.
-   - **Result:** Auto-compaction triggers at the correct *percentage* of usage (e.g., 90% full), regardless of the actual limit.
-
-2. **Accurate Reporting (For You):**
-   - The status line displays the **Real Unscaled Usage** and **Real Context %**.
-   - You see specific costs and limits, while Claude remains blissfully unaware and stable.
-
-**Benefits:**
-- ✅ **Works with ANY model** size (128k, 1M, 2M, etc.)
-- ✅ **Unlocks massive context** windows (Claude Code becomes 10x more powerful with Gemini!)
-- ✅ **Prevents crashes** on smaller models (Grok)
-- ✅ **Native behavior** (compaction just works)
+The Claudish status line is observational rather than an API limit. It reads the local token tracker, whose session output count is cumulative; after compaction or many internal requests, its percentage can be conservative and should not be treated as proof that the provider rejected a larger context. Use Claude Code's `/context` for the client-side breakdown and the provider error/log for an actual context-limit failure.
 
 
 ## Development
