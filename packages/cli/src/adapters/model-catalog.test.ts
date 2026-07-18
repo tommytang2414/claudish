@@ -33,6 +33,28 @@ describe("lookupModel", () => {
       expect(entry).toBeDefined();
       expect(entry!.temperatureRange).toEqual({ min: 0.01, max: 1.0 });
     });
+
+    test("MiniMax-M3 → contextWindow: 1_048_576, supportsVision: false", () => {
+      const entry = lookupModel("MiniMax-M3");
+      expect(entry).toBeDefined();
+      expect(entry!.contextWindow).toBe(1_048_576);
+      expect(entry!.supportsVision).toBe(false);
+      expect(entry!.temperatureRange).toEqual({ min: 0.01, max: 1.0 });
+    });
+
+    test("minimax/minimax-m3 (OpenRouter prefixed) → 1_048_576", () => {
+      const entry = lookupModel("minimax/minimax-m3");
+      expect(entry).toBeDefined();
+      expect(entry!.contextWindow).toBe(1_048_576);
+    });
+
+    test("MiniMax-M3 takes precedence over minimax catch-all (1M, not 204800)", () => {
+      // Regression: if M3 entry is removed/misordered, this falls through to 204_800
+      const m3 = lookupModel("MiniMax-M3");
+      const m27 = lookupModel("MiniMax-M2.7");
+      expect(m3!.contextWindow).not.toBe(m27!.contextWindow);
+      expect(m3!.contextWindow).toBe(1_048_576);
+    });
   });
 
   describe("Grok models", () => {

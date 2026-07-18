@@ -2,10 +2,13 @@
  * MiniMaxModelDialect — Layer 2 dialect for MiniMax models.
  *
  * Handles MiniMax-specific quirks:
- * - Context window: all models are 204,800 tokens
+ * - Context window: 204,800 (M2.x) or 1,048,576 (M3 / M1 / 01) — sourced from model catalog
  * - Temperature: must be in (0.0, 1.0] — clamps 0 → 0.01, >1 → 1.0
  * - Thinking: native support via standard `thinking` param (no conversion needed)
  * - Vision: not supported — supportsVision() returns false so ComposedHandler strips images
+ *
+ * M3 (released 2026-06-01) brings 1M context and native Interleaved Thinking,
+ * handled automatically by the dialect via the catalog lookup.
  */
 
 import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";

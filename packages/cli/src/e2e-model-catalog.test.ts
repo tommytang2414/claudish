@@ -35,6 +35,29 @@ describe("Group 1: Model Catalog — lookupModel()", () => {
     expect(entry!.temperatureRange).toEqual({ min: 0.01, max: 1.0 });
   });
 
+  test("MiniMax-M3 → contextWindow 1048576 (1M), supportsVision false, temperatureRange", () => {
+    const entry = lookupModel("MiniMax-M3");
+    expect(entry).toBeDefined();
+    expect(entry!.contextWindow).toBe(1_048_576);
+    expect(entry!.supportsVision).toBe(false);
+    expect(entry!.temperatureRange).toEqual({ min: 0.01, max: 1.0 });
+  });
+
+  test("minimax/minimax-m3 (vendor prefix) → 1M context", () => {
+    const entry = lookupModel("minimax/minimax-m3");
+    expect(entry).toBeDefined();
+    expect(entry!.contextWindow).toBe(1_048_576);
+  });
+
+  test("MiniMax-M3 is not collapsed into the M2.7 204800 catch-all", () => {
+    // Regression guard: if M3 entry is reordered below the `minimax` catch-all,
+    // first-match-wins would return the 204_800 catch-all instead of 1_048_576.
+    const m3 = lookupModel("MiniMax-M3");
+    const m27 = lookupModel("MiniMax-M2.7");
+    expect(m3!.contextWindow).toBe(1_048_576);
+    expect(m27!.contextWindow).toBe(204_800);
+  });
+
   test("minimax-m2.5 → same entry as MiniMax-M2.7 (case insensitive, catch-all)", () => {
     const entry = lookupModel("minimax-m2.5");
     expect(entry).toBeDefined();
@@ -123,6 +146,37 @@ describe("Group 2: MiniMaxModelDialect — catalog integration", () => {
   test("minimax-01 returns contextWindow 1000000", () => {
     const dialect = new MiniMaxModelDialect("minimax-01");
     expect(dialect.getContextWindow()).toBe(1_000_000);
+  });
+
+  test("MiniMax-M3 returns contextWindow 1048576 (1M)", () => {
+    const dialect = new MiniMaxModelDialect("MiniMax-M3");
+    expect(dialect.getContextWindow()).toBe(1_048_576);
+  });
+
+  test("MiniMax-M3 supportsVision returns false", () => {
+    const dialect = new MiniMaxModelDialect("MiniMax-M3");
+    expect(dialect.supportsVision()).toBe(false);
+  });
+
+  test("MiniMax-M3 temperature 0 is clamped to 0.01", () => {
+    const dialect = new MiniMaxModelDialect("MiniMax-M3");
+    const request: any = { temperature: 0, messages: [], max_tokens: 50 };
+    dialect.prepareRequest(request, request);
+    expect(request.temperature).toBe(0.01);
+  });
+
+  test("MiniMax-M3 thinking param passes through (Interleaved Thinking native)", () => {
+    const dialect = new MiniMaxModelDialect("MiniMax-M3");
+    const originalRequest: any = {
+      thinking: { type: "enabled", budget_tokens: 16000 },
+      messages: [],
+      max_tokens: 200,
+    };
+    const request: any = { ...originalRequest };
+    dialect.prepareRequest(request, originalRequest);
+    expect(request.thinking).toBeDefined();
+    expect(request.thinking.type).toBe("enabled");
+    expect(request.thinking.budget_tokens).toBe(16000);
   });
 });
 
@@ -359,6 +413,60 @@ describe.skipIf(SKIP_REAL_API)("Group 3: Real API — MiniMax E2E", () => {
 
     expect(response.status).toBe(401);
   }, 10000);
+
+  test("basic text response from MiniMax-M3", async () => {
+    // M3 emits interleaved thinking + text by default; max_tokens: 400 covers both
+    const response = await fetch(MINIMAX_API_BASE, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MINIMAX_API_KEY}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "MiniMax-M3",
+        max_tokens: 400,
+        messages: [{ role: "user", content: "Reply with exactly: ok" }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.content).toBeDefined();
+    expect(data.content.length).toBeGreaterThan(0);
+    const textBlock = data.content.find((b: any) => b.type === "text");
+    expect(textBlock).toBeDefined();
+    expect(textBlock.text.toLowerCase()).toContain("ok");
+  }, 30000);
+
+  test("MiniMax-M3 thinking blocks are returned by default (Interleaved Thinking)", async () => {
+    const response = await fetch(MINIMAX_API_BASE, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MINIMAX_API_KEY}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "MiniMax-M3",
+        max_tokens: 400,
+        messages: [{ role: "user", content: "What is 2+2? Be brief." }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.content).toBeDefined();
+
+    // M3 returns a thinking block first, then a text block
+    const thinkingBlock = data.content.find((b: any) => b.type === "thinking");
+    expect(thinkingBlock).toBeDefined();
+    expect(thinkingBlock.thinking).toBeTruthy();
+    expect(thinkingBlock.signature).toBeTruthy();
+
+    const textBlock = data.content.find((b: any) => b.type === "text");
+    expect(textBlock).toBeDefined();
+  }, 30000);
 });
 
 // ─── Group 4: Full Pipeline Integration (no API calls) ───────────────────────

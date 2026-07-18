@@ -62,6 +62,14 @@ export const MODEL_CATALOG: ModelEntry[] = [
   // ── MiniMax ─────────────────────────────────────────
   { pattern: "minimax-01", contextWindow: 1_000_000, supportsVision: false },
   { pattern: "minimax-m1", contextWindow: 1_000_000, supportsVision: false },
+  // M3 (2026-06-01): 1M context, native interleaved thinking, Anthropic passthrough SSE
+  // Must come before the `minimax` catch-all so it overrides the 204,800 default
+  {
+    pattern: "minimax-m3",
+    contextWindow: 1_048_576,
+    supportsVision: false,
+    temperatureRange: { min: 0.01, max: 1.0 },
+  },
   {
     pattern: "minimax",
     contextWindow: 204_800,

@@ -1,22 +1,22 @@
 {
-  "version": "1.2.0",
-  "lastUpdated": "2026-03-16",
+  "version": "1.3.0",
+  "lastUpdated": "2026-06-14",
   "source": "https://openrouter.ai/models?categories=programming&fmt=cards&order=top-weekly",
   "models": [
     {
-      "id": "minimax-m2.5",
-      "openrouterId": "minimax/minimax-m2.5",
-      "name": "MiniMax: MiniMax M2.5",
-      "description": "MiniMax-M2.5 is a SOTA large language model designed for real-world productivity. Trained in a diverse range of complex real-world digital working environments, M2.5 builds upon the coding expertise of M2.1 to extend into general office work, reaching fluency in generating and operating Word, Excel, and Powerpoint files, context switching between diverse software environments, and working across different agent and human teams. Scoring 80.2% on SWE-Bench Verified, 51.3% on Multi-SWE-Bench, and 76.3% on BrowseComp, M2.5 is also more token efficient than previous generations, having been trained to optimize its actions and output through planning.",
+      "id": "minimax-m3",
+      "openrouterId": "minimax/minimax-m3",
+      "name": "MiniMax: MiniMax M3",
+      "description": "MiniMax-M3 is MiniMax's latest M-series language model (released 2026-06-01) for agentic reasoning, tool use, coding, multimodal chat input, and long-context tasks. Natively supports Interleaved Thinking, reasoning between each round of tool interactions to decide the next action. Achieves SOTA on SWE, BrowseCamp, and xBench benchmarks. Uses MiniMax's Anthropic-compatible API (https://api.minimax.io/anthropic) with full `thinking` block passthrough.",
       "provider": "Minimax",
       "category": "programming",
       "priority": 1,
       "pricing": {
-        "input": "$0.29/1M",
+        "input": "$0.30/1M",
         "output": "$1.20/1M",
         "average": "$0.75/1M"
       },
-      "context": "196K",
+      "context": "1048K",
       "maxOutputTokens": 196608,
       "modality": "text->text",
       "supportsTools": true,

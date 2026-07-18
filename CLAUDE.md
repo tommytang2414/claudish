@@ -2,6 +2,16 @@
 
 ## Changelog
 
+### 2026-06-14 — Default Model Upgrade: MiniMax M2.7 → MiniMax M3
+- Upgraded default model from M2.7 (204K context) to M3 (1M context), released 2026-06-01.
+- `packages/cli/src/adapters/model-catalog.ts` — added explicit `MiniMax-M3` entry (1,048,576 context, supportsVision false, temperatureRange 0.01-1.0) ordered before the `MiniMax` catch-all to prevent first-match-wins regression.
+- `packages/cli/src/adapters/minimax-model-dialect.ts` — updated JSDoc to reflect 1M context for M3 and other long-context variants.
+- `packages/cli/src/adapters/model-catalog.test.ts` — added 3 M3 unit tests (basic lookup, OpenRouter prefixed `minimax/minimax-m3`, regression guard for catch-all precedence).
+- `packages/cli/src/e2e-model-catalog.test.ts` — added 2 catalog unit tests, 4 dialect integration tests, 2 real API E2E tests for M3 (basic text response + Interleaved Thinking block with signature).
+- `packages/cli/recommended-models.json` — replaced M2.5 (priority 1) with M3; bumped version to 1.3.0; lastUpdated 2026-06-14.
+- `C:\Users\User\bin\claudish.cmd` and `claudish.ps1` — default model changed to `mm@MiniMax-M3`.
+- M3 details: native Interleaved Thinking (SOTA on SWE / BrowseCamp / xBench), Anthropic passthrough SSE with `thinking` blocks (same shape as M2.7, so `anthropic-sse.ts` parser works unchanged), OpenRouter ID `minimax/minimax-m3`, pricing $0.30/$1.20 per 1M tokens.
+
 ### 2026-05-31 — Critical Bug Fixes
 - Fixed race condition in `WindowsSpawnRunner` (`pty-diag-runner.ts`) where concurrent instances overwrite the same `run-claude.bat` file by appending `process.pid`.
 - Fixed CRLF boundary bug in `anthropic-sse.ts` where split chunks caused unnormalized `\r\n` characters by executing `replace` on the entire buffer instead of incoming chunks.
@@ -35,12 +45,12 @@ This creates `claudish.exe` (standalone, no Node.js/Bun required).
 
 **Launcher scripts** (in `C:\Users\User\bin\`):
 - `claudish.exe` - Standalone executable
-- `claudish.cmd` - Windows CMD launcher (default MiniMax M2.7)
+- `claudish.cmd` - Windows CMD launcher (default MiniMax M3)
 - `claudish.ps1` - PowerShell launcher
 
 **Usage**:
 ```cmd
-claudish --model mm@MiniMax-M2.7
+claudish --model mm@MiniMax-M3
 ```
 
 ## Model Routing (v4.0+)
