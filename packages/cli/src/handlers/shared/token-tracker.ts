@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../../logger.js";
-import { getModelPricing, type ModelPricing } from "./remote-provider-types.js";
+import { type ModelPricing, getModelPricing } from "./remote-provider-types.js";
 
 export interface TokenTrackerConfig {
   contextWindow: number;
@@ -30,10 +30,34 @@ export class TokenTracker {
   private sessionTotalCost = 0;
   private sessionInputTokens = 0;
   private sessionOutputTokens = 0;
+  /** Override model name in status line (e.g., after capacity fallback) */
+  private modelNameOverride: string | undefined;
+  /** Quota remaining fraction (0-1) for the current model */
+  private quotaRemaining: number | undefined;
 
   constructor(port: number, config: TokenTrackerConfig) {
     this.port = port;
     this.config = config;
+  }
+
+  /** Set an override model name (shown in status line instead of original) */
+  setActiveModelName(name: string): void {
+    this.modelNameOverride = name;
+  }
+
+  /** Update provider display name (e.g., after OAuth resolves the tier) */
+  setProviderDisplayName(name: string): void {
+    this.config.providerDisplayName = name;
+  }
+
+  /** Set quota remaining fraction (0-1) for the current model */
+  setQuotaRemaining(fraction: number): void {
+    this.quotaRemaining = fraction;
+  }
+
+  /** Force rewrite the token file with current state */
+  rewrite(): void {
+    this.writeFile(this.sessionInputTokens, this.sessionOutputTokens);
   }
 
   /**
@@ -190,8 +214,9 @@ export class TokenTracker {
     try {
       const total = inputTokens + outputTokens;
       const cw = this.config.contextWindow;
+      // context_left_percent: -1 means "unknown" (no catalog entry for this model)
       const leftPct =
-        cw > 0 ? Math.max(0, Math.min(100, Math.round(((cw - total) / cw) * 100))) : 100;
+        cw > 0 ? Math.max(0, Math.min(100, Math.round(((cw - total) / cw) * 100))) : -1;
 
       const pricing = this.getPricing();
       const isFreeModel =
@@ -202,13 +227,21 @@ export class TokenTracker {
         output_tokens: outputTokens,
         total_tokens: total,
         total_cost: this.sessionTotalCost,
-        context_window: cw,
+        context_window: cw > 0 ? cw : "unknown",
         context_left_percent: leftPct,
         provider_name: this.getDisplayName(),
         updated_at: Date.now(),
         is_free: isFreeModel,
         is_estimated: isEstimate || false,
       };
+      // When a fallback model is active, include it so the status line shows the actual model
+      if (this.modelNameOverride) {
+        data.model_name = this.modelNameOverride;
+      }
+      // Include quota remaining if available (e.g., from Gemini Code Assist)
+      if (this.quotaRemaining !== undefined) {
+        data.quota_remaining = this.quotaRemaining;
+      }
 
       const claudishDir = join(homedir(), ".claudish");
       mkdirSync(claudishDir, { recursive: true });

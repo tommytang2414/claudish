@@ -19,8 +19,35 @@ export interface ClaudishConfig {
   openrouterApiKey?: string; // Optional in monitor mode
   anthropicApiKey?: string; // Required in monitor mode
   freeOnly?: boolean; // Show only free models in selector
+  /**
+   * --models-refresh flag. Today: forces a fresh fetch on `--models-top`/`--models`.
+   * After the launcher catalog warm lands, this also forces the warm step to refetch
+   * the slim catalog from Firebase (ignoring TTL).
+   */
+  forceUpdate?: boolean;
+  /**
+   * --models-skip-update flag. When true, the launcher catalog warm step is skipped
+   * entirely. No runtime effect yet — warm step lands in a later commit.
+   */
+  skipModelsUpdate?: boolean;
   profile?: string; // Profile name to use for model mapping
+  /** --default-provider <name> CLI flag (Phase 1 of LiteLLM-demotion refactor) */
+  defaultProvider?: string;
+  /** --op-env <id>: load vars from a 1Password Environment (highest priority). Requires op CLI ≥ 2.35 beta. */
+  opEnv?: string;
+  /**
+   * --op <glob>: 1Password item glob import. Consumed (and stripped from argv)
+   * by index.ts's applyOpImport() BEFORE parseArgs runs, so this is normally
+   * undefined here. parseArgs keeps a defensive branch that consumes it (so a
+   * stray --op never leaks to Claude Code as a passthrough arg).
+   */
+  opImport?: string;
+  /** Resolved default provider (computed via resolveDefaultProvider() after argv parsing) */
+  resolvedDefaultProvider?: import("./default-provider.js").ResolvedDefaultProvider;
   claudeArgs: string[];
+  _hasPositionalPrompt?: boolean; // Internal: true when a positional prompt arg was found (not a flag value)
+  _hasPrintFlag?: boolean; // Internal: true when a passthrough -p/--print flag was found (implies single-shot, not interactive)
+  _sawVerbose?: boolean; // Internal: true when --verbose/-v was passed; forwarded to child `claude` in single-shot mode (Claude Code requires it with --print --output-format stream-json)
 
   // Model Mapping
   modelOpus?: string;
@@ -37,7 +64,17 @@ export interface ClaudishConfig {
   summarizeTools?: boolean; // Summarize tool descriptions to reduce prompt size for local models
 
   noLogs: boolean; // Disable always-on structural logging
-  diagMode: "auto" | "pty" | "tmux" | "logfile" | "off"; // Diagnostic output mode
+  diagMode: "auto" | "logfile" | "off"; // Diagnostic output mode
+
+  // Team mode
+  team?: string[]; // Model IDs for team mode (from --team flag)
+  teamMode?: "default" | "interactive" | "json"; // Team execution mode
+  teamKeep?: boolean; // Keep magmux open after all panes finish (--keep)
+  inputFile?: string; // File path for prompt input (-f / --file)
+
+  // Advisor mode
+  advisorModels?: string[]; // Advisor models from --advisor flag
+  advisorCollector?: string | null; // Collector model (null = no synthesis)
 }
 
 // Anthropic API Types
@@ -116,6 +153,17 @@ export interface ProxyServer {
   port: number;
   url: string;
   shutdown: () => Promise<void>;
+  /**
+   * Drop any cached per-provider handlers so the next request rebuilds
+   * the transport with current config (URL, API key, etc.). Called by the
+   * TUI when the user saves a URL/key change so the next probe doesn't
+   * reuse a stale transport.
+   *
+   * `providerSlug` is optional — when omitted, all handler caches are
+   * cleared. The local registry (provider-registry) rebuilds its provider
+   * list from env/config on every call, so dropping handlers is sufficient.
+   */
+  invalidateHandlerCache: (providerSlug?: string) => void;
 }
 
 // Model Handler interface

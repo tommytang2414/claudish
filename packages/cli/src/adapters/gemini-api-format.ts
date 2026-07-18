@@ -11,11 +11,16 @@
  * Used with GeminiProviderTransport (direct API) and GeminiCodeAssistProviderTransport (OAuth).
  */
 
-import { BaseAPIFormat, type AdapterResult, matchesModelFamily } from "./base-api-format.js";
 import { convertToolsToGemini } from "../handlers/shared/gemini-schema.js";
 import { filterIdentity } from "../handlers/shared/openai-compat.js";
 import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
+import {
+  type AdapterResult,
+  BaseAPIFormat,
+  type EffortLevel,
+  matchesModelFamily,
+} from "./base-api-format.js";
 
 /**
  * Patterns that indicate internal reasoning/monologue that should be filtered.
@@ -73,10 +78,6 @@ export class GeminiAPIFormat extends BaseAPIFormat {
   private inReasoningBlock = false;
   private reasoningBlockDepth = 0;
 
-  constructor(modelId: string) {
-    super(modelId);
-  }
-
   // ─── Message Conversion (Claude → Gemini parts) ─────────────────
 
   override convertMessages(claudeRequest: any, _filterIdentityFn?: (s: string) => string): any[] {
@@ -119,15 +120,51 @@ export class GeminiAPIFormat extends BaseAPIFormat {
             );
             continue;
           }
-          parts.push({
-            functionResponse: {
-              name: toolInfo.name,
-              response: {
-                content:
-                  typeof block.content === "string" ? block.content : JSON.stringify(block.content),
+
+          // Extract images from array content and send as separate inlineData parts.
+          // Claude sends tool_results like browser_screenshot as [{type:"text",...},{type:"image",...}].
+          // Gemini can't interpret images embedded in a JSON string — they need inlineData parts.
+          if (Array.isArray(block.content)) {
+            const textParts: string[] = [];
+            const imageParts: any[] = [];
+
+            for (const item of block.content) {
+              if (item.type === "image" && item.source?.data) {
+                imageParts.push({
+                  inlineData: {
+                    mimeType: item.source.media_type,
+                    data: item.source.data,
+                  },
+                });
+              } else if (item.type === "text") {
+                textParts.push(item.text);
+              }
+            }
+
+            parts.push({
+              functionResponse: {
+                name: toolInfo.name,
+                response: {
+                  content: textParts.join("\n") || "OK",
+                },
               },
-            },
-          });
+            });
+
+            // Append image parts after the functionResponse
+            parts.push(...imageParts);
+          } else {
+            parts.push({
+              functionResponse: {
+                name: toolInfo.name,
+                response: {
+                  content:
+                    typeof block.content === "string"
+                      ? block.content
+                      : JSON.stringify(block.content),
+                },
+              },
+            });
+          }
         }
       }
     } else if (typeof msg.content === "string") {
@@ -224,25 +261,95 @@ export class GeminiAPIFormat extends BaseAPIFormat {
       payload.tools = tools;
     }
 
-    // Thinking/reasoning configuration
-    if (claudeRequest.thinking) {
+    // Thinking/reasoning configuration.
+    // output_config.effort (modern Claude Code) takes priority; the legacy
+    // thinking.budget_tokens path is the fallback. Gemini 3 and Gemini 2.5 use
+    // DIFFERENT controls — and Gemini 3 400s if both thinkingLevel and
+    // thinkingBudget are sent, so we only ever emit one.
+    const effort = this.resolveEffortLevel(claudeRequest);
+    if (effort) {
+      if (matchesModelFamily(this.modelId, "gemini-3")) {
+        payload.generationConfig.thinkingConfig = {
+          thinkingLevel: this.effortToThinkingLevel(effort),
+        };
+        log(
+          `[GeminiAPIFormat] thinkingLevel -> ${payload.generationConfig.thinkingConfig.thinkingLevel} (from ${effort}) for ${this.modelId}`
+        );
+      } else {
+        payload.generationConfig.thinkingConfig = {
+          thinkingBudget: this.effortToThinkingBudget(effort),
+        };
+        log(
+          `[GeminiAPIFormat] thinkingBudget -> ${payload.generationConfig.thinkingConfig.thinkingBudget} (from ${effort}) for ${this.modelId}`
+        );
+      }
+    } else if (claudeRequest.thinking) {
+      // Legacy fallback: raw thinking.budget_tokens.
       const { budget_tokens } = claudeRequest.thinking;
 
-      if (this.modelId.includes("gemini-3")) {
+      if (matchesModelFamily(this.modelId, "gemini-3")) {
         // Gemini 3 uses thinking_level
         payload.generationConfig.thinkingConfig = {
           thinkingLevel: budget_tokens >= 16000 ? "high" : "low",
         };
       } else {
         // Gemini 2.5 uses thinking_budget
-        const MAX_GEMINI_BUDGET = 24576;
         payload.generationConfig.thinkingConfig = {
-          thinkingBudget: Math.min(budget_tokens, MAX_GEMINI_BUDGET),
+          thinkingBudget: Math.min(budget_tokens, GeminiAPIFormat.MAX_GEMINI_BUDGET),
         };
       }
     }
 
     return payload;
+  }
+
+  /** Gemini 2.5 thinkingBudget ceiling (live API caps ~24576 even where docs say 32768). */
+  private static readonly MAX_GEMINI_BUDGET = 24576;
+
+  /**
+   * Gemini 3 `thinkingLevel` (string). Accepted values: minimal | low | medium |
+   * high. Note: original Gemini 3 Pro lacks `minimal` (→low) and `medium`
+   * (→high); we emit the documented level and let model-specific gates degrade.
+   */
+  private effortToThinkingLevel(effort: EffortLevel): string {
+    switch (effort) {
+      case "none":
+      case "minimal":
+        return "minimal";
+      case "low":
+        return "low";
+      case "medium":
+        return "medium";
+      case "high":
+      case "xhigh":
+      case "max":
+        return "high";
+      default:
+        return "high";
+    }
+  }
+
+  /**
+   * Gemini 2.5 `thinkingBudget` (int). 0 = off (Flash/Lite only; Pro min 128,
+   * can't disable). Token tiers per the research §4.3, capped at MAX_GEMINI_BUDGET.
+   */
+  private effortToThinkingBudget(effort: EffortLevel): number {
+    switch (effort) {
+      case "none":
+      case "minimal":
+        return 0;
+      case "low":
+        return 1024;
+      case "medium":
+        return 8192;
+      case "high":
+        return 16384;
+      case "xhigh":
+      case "max":
+        return GeminiAPIFormat.MAX_GEMINI_BUDGET; // 24576
+      default:
+        return 8192;
+    }
   }
 
   // ─── Tool Call Registration (called by stream parser) ─────────────

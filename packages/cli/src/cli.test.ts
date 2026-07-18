@@ -8,9 +8,8 @@
  * These tests validate behavior described in requirements, not implementation details.
  */
 
-import { test, expect, describe } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { parseArgs } from "./cli.js";
-import type { ClaudishConfig } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Group 1: Backward Compatibility (existing behavior preserved)
@@ -38,8 +37,8 @@ describe("Group 1: Backward compatibility", () => {
     expect(config.claudeArgs).toEqual(["task"]);
   });
 
-  test("model + debug flag", async () => {
-    const config = await parseArgs(["--model", "grok", "--debug"]);
+  test("model + debug-claudish flag", async () => {
+    const config = await parseArgs(["--model", "grok", "--debug-claudish"]);
     expect(config.model).toBe("grok");
     expect(config.debug).toBe(true);
   });
@@ -152,39 +151,10 @@ describe("Group 4: Mixed ordering edge cases", () => {
 // Group 5: Dead Agent Code Removed
 // ---------------------------------------------------------------------------
 
-describe("Group 5: Dead agent code removed", () => {
-  test("--agent passes through to claudeArgs and config has no agent property", async () => {
-    const config = await parseArgs(["--model", "grok", "--agent", "detective", "--stdin"]);
-    // --agent detective must land in claudeArgs
-    expect(config.claudeArgs).toContain("--agent");
-    expect(config.claudeArgs).toContain("detective");
-
-    // ClaudishConfig must NOT have an agent field
-    // This validates that the dead code (agent?: string) has been removed from types.ts
-    // If config.agent were defined, TypeScript would allow this access.
-    // We check at runtime that the property is absent from the returned object.
-    expect((config as Record<string, unknown>)["agent"]).toBeUndefined();
-
-    // Also verify the config object's own keys do not include 'agent'
-    const keys = Object.keys(config);
-    expect(keys).not.toContain("agent");
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Group 6: Monitor Mode
 // REGRESSION: --monitor flag set ANTHROPIC_MODEL="unknown" — Fixed in /fix session dev-fix-20260303-122306-f3bfd19b
 // ---------------------------------------------------------------------------
-
-/**
- * Inline helper extracted from claude-runner.ts:239-240 to make the modelId
- * calculation unit-testable without spawning processes or creating temp files.
- */
-function computeModelId(config: ClaudishConfig): string | undefined {
-  const hasProfileMappings =
-    config.modelOpus || config.modelSonnet || config.modelHaiku || config.modelSubagent;
-  return config.model || (hasProfileMappings || config.monitor ? undefined : "unknown");
-}
 
 describe("Group 6: Monitor mode", () => {
   test("monitor mode without --model does not set modelId", async () => {
@@ -197,42 +167,6 @@ describe("Group 6: Monitor mode", () => {
     const config = await parseArgs(["--monitor", "--model", "claude-sonnet-4-6", "hello"]);
     expect(config.monitor).toBe(true);
     expect(config.model).toBe("claude-sonnet-4-6");
-  });
-
-  test("monitor mode modelId calculation returns undefined", () => {
-    // When monitor=true and no model specified, modelId must be undefined (not "unknown")
-    // so ANTHROPIC_MODEL is not set in the child process environment.
-    const config: ClaudishConfig = {
-      monitor: true,
-      model: undefined,
-      claudeArgs: ["hello"],
-      interactive: false,
-      stdin: false,
-      quiet: false,
-      debug: false,
-      autoApprove: false,
-      concurrency: 1,
-    } as unknown as ClaudishConfig;
-    const modelId = computeModelId(config);
-    expect(modelId).toBeUndefined();
-  });
-
-  test("non-monitor mode without model falls back to unknown", () => {
-    // When monitor=false and no model or profile mappings, modelId must be "unknown"
-    // to preserve existing proxy behavior for unspecified model routing.
-    const config: ClaudishConfig = {
-      monitor: false,
-      model: undefined,
-      claudeArgs: ["hello"],
-      interactive: false,
-      stdin: false,
-      quiet: false,
-      debug: false,
-      autoApprove: false,
-      concurrency: 1,
-    } as unknown as ClaudishConfig;
-    const modelId = computeModelId(config);
-    expect(modelId).toBe("unknown");
   });
 });
 
@@ -250,5 +184,132 @@ describe("Regression: -p flag is not consumed by claudish (#76)", () => {
   test("--profile still works without -p shorthand", async () => {
     const config = await parseArgs(["--profile", "myprofile", "--model", "grok"]);
     expect(config.profile).toBe("myprofile");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interactive mode detection (PR #103)
+// ---------------------------------------------------------------------------
+
+describe("Interactive mode detection with flag-only args", () => {
+  test("flags with values but no prompt → interactive", async () => {
+    const config = await parseArgs([
+      "--model",
+      "grok",
+      "--session-id",
+      "abc-123",
+      "--dangerously-skip-permissions",
+    ]);
+    expect(config.interactive).toBe(true);
+  });
+
+  test("positional prompt → single-shot (not interactive)", async () => {
+    const config = await parseArgs(["--model", "grok", "hello world"]);
+    expect(config.interactive).toBe(false);
+  });
+
+  test("prompt after -- separator → single-shot (not interactive)", async () => {
+    const config = await parseArgs(["--model", "grok", "--", "hello world"]);
+    expect(config.interactive).toBe(false);
+  });
+
+  // Regression: a passthrough -p/--print flag with NO positional prompt must
+  // NOT default to interactive mode. Previously claudish flipped interactive=true,
+  // ran the model picker, then forwarded a bare `-p` (no prompt) to the child
+  // `claude`, which crashed with "Input must be provided either through stdin or
+  // as a prompt argument when using --print". This affected EVERY provider
+  // (OpenAI, Kimi Coding, …) launched via bare interactive `claudish`.
+  test("bare -p flag without prompt → single-shot (not interactive)", async () => {
+    const config = await parseArgs(["--model", "grok", "-p"]);
+    expect(config._hasPrintFlag).toBe(true);
+    expect(config.interactive).toBe(false);
+    expect(config.claudeArgs).toContain("-p");
+  });
+
+  test("bare --print flag without prompt → single-shot (not interactive)", async () => {
+    const config = await parseArgs(["--model", "grok", "--print"]);
+    expect(config._hasPrintFlag).toBe(true);
+    expect(config.interactive).toBe(false);
+    expect(config.claudeArgs).toContain("--print");
+  });
+
+  test("-p with a positional prompt stays single-shot (#76 unchanged)", async () => {
+    const config = await parseArgs(["--model", "grok", "-p", "hello"]);
+    expect(config.interactive).toBe(false);
+    expect(config.claudeArgs).toContain("-p");
+  });
+
+  test("no args at all → interactive", async () => {
+    const config = await parseArgs(["--model", "grok"]);
+    expect(config.interactive).toBe(true);
+  });
+
+  test("--stdin → not interactive (reads from stdin)", async () => {
+    const config = await parseArgs(["--model", "grok", "--stdin"]);
+    expect(config.interactive).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Global / persistent debug mode (CLAUDISH_DEBUG env + --no-debug-claudish)
+// ---------------------------------------------------------------------------
+
+describe("Persistent debug mode", () => {
+  const KEY = "CLAUDISH_DEBUG";
+
+  async function withEnv(value: string | undefined, fn: () => Promise<void>) {
+    const prev = process.env[KEY];
+    if (value === undefined) delete process.env[KEY];
+    else process.env[KEY] = value;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env[KEY];
+      else process.env[KEY] = prev;
+    }
+  }
+
+  test("CLAUDISH_DEBUG=1 enables debug and bumps log level to debug", async () => {
+    await withEnv("1", async () => {
+      const config = await parseArgs(["--model", "grok"]);
+      expect(config.debug).toBe(true);
+      expect(config.logLevel).toBe("debug");
+    });
+  });
+
+  test("CLAUDISH_DEBUG=true enables debug", async () => {
+    await withEnv("true", async () => {
+      const config = await parseArgs(["--model", "grok"]);
+      expect(config.debug).toBe(true);
+    });
+  });
+
+  test("CLAUDISH_DEBUG=0 keeps debug off", async () => {
+    await withEnv("0", async () => {
+      const config = await parseArgs(["--model", "grok"]);
+      expect(config.debug).toBe(false);
+    });
+  });
+
+  test("--debug-claudish still works with CLAUDISH_DEBUG unset", async () => {
+    await withEnv(undefined, async () => {
+      const config = await parseArgs(["--model", "grok", "-d"]);
+      expect(config.debug).toBe(true);
+    });
+  });
+
+  test("--no-debug-claudish overrides CLAUDISH_DEBUG=1 for this run", async () => {
+    await withEnv("1", async () => {
+      const config = await parseArgs(["--model", "grok", "--no-debug-claudish"]);
+      expect(config.debug).toBe(false);
+    });
+  });
+
+  test("explicit --log-level wins over the debug auto-bump", async () => {
+    await withEnv("1", async () => {
+      const config = await parseArgs(["--model", "grok", "--log-level", "minimal"]);
+      expect(config.debug).toBe(true);
+      expect(config.logLevel).toBe("minimal");
+    });
   });
 });

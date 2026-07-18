@@ -36,7 +36,9 @@ all-models.json
 
 # Claude Code local files
 .claude/
-.claudemem/
+
+# Local claudish profile/config state (per-user, not source)
+.claudish.json
 
 # npm lockfile (we use bun.lock)
 package-lock.json
@@ -49,6 +51,8 @@ logs/
 # AI session files
 ai-docs/
 ai_docs/
+ai-sessions/
+**/ai-sessions/
 
 # Build artifacts
 *.tsbuildinfo
@@ -73,3 +77,14 @@ test-results/
 # Smoke test results
 packages/cli/results/*.json
 .worktrees
+
+# Model validation
+validation/
+
+# Added by claudeup
+.mnemex/
+gtd/sessions/
+.agents/
+
+# Added by claudeup
+# Local claudemem indexes are generated from the repo and should not be committed.

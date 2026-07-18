@@ -17,7 +17,8 @@
  *   mm, mmax      -> minimax
  *   kimi, moon    -> kimi/moonshot
  *   glm, zhipu    -> glm/zhipu
- *   zai           -> z.ai
+ *   z-ai, zai     -> z-ai (z.ai)
+ *   x-ai, grok    -> x-ai (xAI / Grok)
  *   oc            -> ollamacloud
  *   zen           -> opencode-zen
  *   v, vertex     -> vertex
@@ -35,8 +36,8 @@
  *   minimax/*              -> minimax (direct)
  *   moonshot/*, kimi-*     -> kimi (direct)
  *   zhipu/*, glm-*         -> glm (direct)
- *   deepseek/*             -> openrouter (no direct API)
- *   x-ai/*, grok-*         -> openrouter (no direct API)
+ *   deepseek/*, deepseek-*  -> auto-routed (no direct API, falls to OpenRouter)
+ *   x-ai/*, grok-*         -> x-ai (direct with XAI_API_KEY, else OpenRouter)
  *   qwen/*,  qwen*         -> auto-routed (no direct API, falls to OpenRouter)
  *   anthropic/*            -> native-anthropic
  *   (anything else with /) -> openrouter
@@ -65,11 +66,11 @@ export interface ParsedModel {
  * Re-exported for backward compatibility.
  */
 import {
-  getShortcuts as _getShortcuts,
   getLegacyPrefixPatterns as _getLegacyPrefixPatterns,
   getNativeModelPatterns as _getNativeModelPatterns,
-  isLocalTransport,
+  getShortcuts as _getShortcuts,
   isDirectApiProvider as _isDirectApiProvider,
+  isLocalTransport,
 } from "./provider-definitions.js";
 
 export const PROVIDER_SHORTCUTS: Record<string, string> = _getShortcuts();
@@ -137,7 +138,7 @@ export function parseModelSpec(modelSpec: string): ParsedModel {
     const concurrencyMatch = modelPart.match(/^(.+):(\d+)$/);
     if (concurrencyMatch) {
       modelPart = concurrencyMatch[1];
-      concurrency = parseInt(concurrencyMatch[2], 10);
+      concurrency = Number.parseInt(concurrencyMatch[2], 10);
     }
 
     // Resolve provider shortcut
@@ -166,7 +167,7 @@ export function parseModelSpec(modelSpec: string): ParsedModel {
         const concurrencyMatch = model.match(/^(.+):(\d+)$/);
         if (concurrencyMatch) {
           modelName = concurrencyMatch[1];
-          concurrency = parseInt(concurrencyMatch[2], 10);
+          concurrency = Number.parseInt(concurrencyMatch[2], 10);
         }
       }
 

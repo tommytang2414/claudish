@@ -8,12 +8,15 @@
  * - Vision: not supported — supportsVision() returns false so ComposedHandler strips images
  */
 
-import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";
 import { log } from "../logger.js";
+import { type AdapterResult, BaseAPIFormat, matchesModelFamily } from "./base-api-format.js";
 import { lookupModel } from "./model-catalog.js";
 
+/** MiniMax API requires temperature in (0.0, 1.0]. Sourced from MiniMax's published API docs, not per-model. */
+const TEMPERATURE_RANGE = { min: 0.01, max: 1.0 } as const;
+
 export class MiniMaxModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     // MiniMax interleaved thinking is handled by the model
     return {
       cleanedText: textContent,
@@ -23,27 +26,34 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
   }
 
   /**
-   * Handle request preparation — clamp temperature to MiniMax's accepted range.
-   * The valid range is sourced from the model catalog (temperatureRange field).
-   * The standard `thinking` parameter is supported natively by MiniMax's Anthropic-compatible
-   * endpoint, so no conversion is needed here.
+   * Handle request preparation — clamp temperature to MiniMax's accepted range,
+   * and map Claude Code's effort to MiniMax's `thinking` toggle.
+   *
+   * MiniMax's enable value is `adaptive` (NOT "enabled"). On the Anthropic-compat
+   * endpoint: none → `{type:"disabled"}` (effective only on M3; M2.x is
+   * always-on and ignores it); every other level → `{type:"adaptive"}`. The raw
+   * <think> round-trip in history is NOT touched here — only the request knob.
    */
   override prepareRequest(request: any, originalRequest: any): any {
-    const entry = lookupModel(this.modelId);
-    const tempRange = entry?.temperatureRange;
-
-    if (request.temperature !== undefined && tempRange) {
-      if (request.temperature < tempRange.min) {
+    if (request.temperature !== undefined) {
+      if (request.temperature < TEMPERATURE_RANGE.min) {
         log(
-          `[MiniMaxModelDialect] Clamping temperature ${request.temperature} → ${tempRange.min} (MiniMax requires >= ${tempRange.min})`
+          `[MiniMaxModelDialect] Clamping temperature ${request.temperature} → ${TEMPERATURE_RANGE.min} (MiniMax requires >= ${TEMPERATURE_RANGE.min})`
         );
-        request.temperature = tempRange.min;
-      } else if (request.temperature > tempRange.max) {
+        request.temperature = TEMPERATURE_RANGE.min;
+      } else if (request.temperature > TEMPERATURE_RANGE.max) {
         log(
-          `[MiniMaxModelDialect] Clamping temperature ${request.temperature} → ${tempRange.max} (MiniMax requires <= ${tempRange.max})`
+          `[MiniMaxModelDialect] Clamping temperature ${request.temperature} → ${TEMPERATURE_RANGE.max} (MiniMax requires <= ${TEMPERATURE_RANGE.max})`
         );
-        request.temperature = tempRange.max;
+        request.temperature = TEMPERATURE_RANGE.max;
       }
+    }
+
+    const effort = this.resolveEffortLevel(originalRequest);
+    if (effort) {
+      const type = effort === "none" ? "disabled" : "adaptive";
+      request.thinking = { type };
+      log(`[MiniMaxModelDialect] effort ${effort} -> thinking.type: ${type} for ${this.modelId}`);
     }
 
     return request;
@@ -54,7 +64,7 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    * Defaults to 204,800 (MiniMax standard context) if not in catalog.
    */
   override getContextWindow(): number {
-    return lookupModel(this.modelId)?.contextWindow ?? 204_800;
+    return lookupModel(this.modelId)?.contextWindow ?? 0;
   }
 
   /**
@@ -64,6 +74,14 @@ export class MiniMaxModelDialect extends BaseAPIFormat {
    */
   override supportsVision(): boolean {
     return lookupModel(this.modelId)?.supportsVision ?? false;
+  }
+
+  /**
+   * MiniMax's Anthropic-compatible endpoint returns thinking blocks that leak
+   * to the user when passed through. Filter them from the SSE stream.
+   */
+  override shouldFilterThinking(): boolean {
+    return true;
   }
 
   shouldHandle(modelId: string): boolean {

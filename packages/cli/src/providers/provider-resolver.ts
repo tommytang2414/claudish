@@ -16,7 +16,7 @@
  *
  * Provider Categories:
  * - local: ollama@, lmstudio@, vllm@, mlx@, http://... - No API key needed
- * - direct-api: google@, openai@, minimax@, kimi@, glm@, zai@, zen@ - Provider-specific key
+ * - direct-api: google@, openai@, minimax@, kimi@, glm@, z-ai@, x-ai@, zen@ - Provider-specific key
  * - openrouter: openrouter@ or unspecified provider for models with "/" - OPENROUTER_API_KEY
  * - native-anthropic: No "/" in model ID (e.g., claude-3-opus-20240229) - Claude Code native auth
  *
@@ -24,23 +24,20 @@
  * - g/, gemini/, oai/, mmax/, etc. prefixes still work with deprecation warnings
  */
 
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { resolveProvider, parseUrlModel } from "./provider-registry.js";
-import { resolveRemoteProvider } from "./remote-provider-registry.js";
-import { autoRoute, getAutoRouteHint } from "./auto-route.js";
+import { credentials } from "../auth/credentials/authority.js";
 import {
-  parseModelSpec,
-  isLocalProviderName,
-  isDirectApiProvider,
-  getLegacySyntaxWarning,
   type ParsedModel,
+  getLegacySyntaxWarning,
+  isLocalProviderName,
+  parseModelSpec,
 } from "./model-parser.js";
 import {
   getApiKeyInfo as getApiKeyInfoFromDefs,
   getDisplayName as getDisplayNameFromDefs,
 } from "./provider-definitions.js";
+import { parseUrlModel, resolveProvider } from "./provider-registry.js";
+import { resolveRemoteProvider } from "./remote-provider-registry.js";
+import { buildCredentialHint } from "./routing-hints.js";
 
 /**
  * Provider category types
@@ -60,6 +57,12 @@ export interface ProviderResolution {
   category: ProviderCategory;
   /** Human-readable provider name (e.g., "Gemini", "OpenRouter", "Ollama") */
   providerName: string;
+  /**
+   * The credential-authority catalog name for this provider (e.g. "minimax",
+   * "openrouter", "google"), used to resolve availability through the single
+   * authority. Null for categories with no authority provider (unknown).
+   */
+  catalogName: string | null;
   /** The model name after stripping the prefix */
   modelName: string;
   /** Full original model ID */
@@ -149,42 +152,6 @@ const PROVIDER_DISPLAY_NAMES = new Proxy<Record<string, string>>(
 );
 
 /**
- * Check if any of the API keys (including aliases) are available
- */
-function isApiKeyAvailable(info: ApiKeyInfo): boolean {
-  if (!info.envVar) {
-    return true; // No key required (OAuth or free tier)
-  }
-
-  if (process.env[info.envVar]) {
-    return true;
-  }
-
-  // Check aliases
-  if (info.aliases) {
-    for (const alias of info.aliases) {
-      if (process.env[alias]) {
-        return true;
-      }
-    }
-  }
-
-  // Check for OAuth credential file as fallback
-  if (info.oauthFallback) {
-    try {
-      const credPath = join(homedir(), ".claudish", info.oauthFallback);
-      if (existsSync(credPath)) {
-        return true;
-      }
-    } catch {
-      // Ignore filesystem errors
-    }
-  }
-
-  return false;
-}
-
-/**
  * Resolve a model ID to its provider information
  *
  * This is THE single source of truth for provider resolution.
@@ -211,11 +178,12 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
     const info = API_KEY_INFO.openrouter;
     return {
       category: "openrouter",
+      catalogName: "openrouter",
       providerName: "OpenRouter",
       modelName: "",
       fullModelId: "",
       requiredApiKeyEnvVar: info.envVar,
-      apiKeyAvailable: isApiKeyAvailable(info),
+      apiKeyAvailable: false, // authoritatively set by validateApiKeysForModels (credentials.isAvailable)
       apiKeyDescription: info.description,
       apiKeyUrl: info.url,
     };
@@ -253,6 +221,7 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
 
     return addCommonFields({
       category: "local",
+      catalogName: parsed.provider,
       providerName,
       modelName,
       fullModelId: modelId,
@@ -268,6 +237,7 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
     const urlParsed = parseUrlModel(modelId);
     return addCommonFields({
       category: "local",
+      catalogName: null,
       providerName: "Custom URL",
       modelName: urlParsed?.modelName || modelId,
       fullModelId: modelId,
@@ -282,6 +252,7 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
   if (parsed.provider === "native-anthropic") {
     return addCommonFields({
       category: "native-anthropic",
+      catalogName: "native-anthropic",
       providerName: "Anthropic (Native)",
       modelName: parsed.model,
       fullModelId: modelId,
@@ -297,58 +268,21 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
     const info = API_KEY_INFO.openrouter;
     return addCommonFields({
       category: "openrouter",
+      catalogName: "openrouter",
       providerName: "OpenRouter",
       modelName: parsed.model,
       fullModelId: modelId,
       requiredApiKeyEnvVar: info.envVar,
-      apiKeyAvailable: isApiKeyAvailable(info),
+      apiKeyAvailable: false, // authoritatively set by validateApiKeysForModels (credentials.isAvailable)
       apiKeyDescription: info.description,
       apiKeyUrl: info.url,
     });
   }
 
-  // 5. Auto-routing: when no explicit provider was given, use priority chain
-  let pendingAutoRouteMessage: string | undefined;
-  if (!parsed.isExplicitProvider && parsed.provider !== "native-anthropic") {
-    const autoResult = autoRoute(parsed.model, parsed.provider);
-
-    if (autoResult) {
-      if (autoResult.provider === "litellm") {
-        const info = API_KEY_INFO.litellm;
-        return addCommonFields({
-          category: "direct-api",
-          providerName: "LiteLLM",
-          modelName: autoResult.modelName,
-          fullModelId: autoResult.resolvedModelId,
-          requiredApiKeyEnvVar: info.envVar || null,
-          apiKeyAvailable: isApiKeyAvailable(info),
-          apiKeyDescription: info.description,
-          apiKeyUrl: info.url,
-          wasAutoRouted: true,
-          autoRouteMessage: autoResult.displayMessage,
-        });
-      }
-
-      if (autoResult.provider === "openrouter") {
-        const info = API_KEY_INFO.openrouter;
-        return addCommonFields({
-          category: "openrouter",
-          providerName: "OpenRouter",
-          modelName: autoResult.modelName,
-          fullModelId: autoResult.resolvedModelId,
-          requiredApiKeyEnvVar: info.envVar,
-          apiKeyAvailable: isApiKeyAvailable(info),
-          apiKeyDescription: info.description,
-          apiKeyUrl: info.url,
-          wasAutoRouted: true,
-          autoRouteMessage: autoResult.displayMessage,
-        });
-      }
-
-      // For oauth/api-key routes: fall through to resolveRemoteProvider() with annotation
-      pendingAutoRouteMessage = autoResult.displayMessage;
-    }
-  }
+  // 5. Auto-routing for bare model names is handled upstream in proxy-server.ts
+  // by route() (see providers/routing-rules.ts). This resolver runs ahead of
+  // request handling and only annotates `wasAutoRouted` for diagnostics; the
+  // actual chain construction lives in route().
 
   // 6. Try to resolve as direct API provider
   const remoteResolved = resolveRemoteProvider(modelId);
@@ -371,16 +305,17 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
     // Return direct-api resolution — report missing key instead of silent fallback
     return addCommonFields({
       category: "direct-api",
+      catalogName: provider.name,
       providerName: providerDisplayName,
       modelName: remoteResolved.modelName,
       fullModelId: modelId,
       requiredApiKeyEnvVar: info.envVar || null,
-      apiKeyAvailable: isApiKeyAvailable(info),
+      apiKeyAvailable: false, // authoritatively set by validateApiKeysForModels (credentials.isAvailable)
       apiKeyDescription: info.envVar ? info.description : null,
       apiKeyUrl: info.envVar ? info.url : null,
       wasAutoRouted,
       autoRouteMessage: wasAutoRouted
-        ? (pendingAutoRouteMessage ?? `Auto-routed: ${parsed.model} -> ${providerDisplayName}`)
+        ? `Auto-routed: ${parsed.model} -> ${providerDisplayName}`
         : undefined,
     });
   }
@@ -390,6 +325,7 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
   if (parsed.provider === "unknown") {
     return addCommonFields({
       category: "unknown",
+      catalogName: null,
       providerName: "Unknown",
       modelName: parsed.model,
       fullModelId: modelId,
@@ -403,6 +339,7 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
   // 8. Fallback for any remaining cases (shouldn't normally reach here)
   return addCommonFields({
     category: "unknown",
+    catalogName: null,
     providerName: "Unknown",
     modelName: parsed.model,
     fullModelId: modelId,
@@ -421,8 +358,29 @@ export function resolveModelProvider(modelId: string | undefined): ProviderResol
  * @param models - Array of model IDs to validate (undefined entries are skipped)
  * @returns Array of resolutions for models that are defined
  */
-export function validateApiKeysForModels(models: (string | undefined)[]): ProviderResolution[] {
-  return models.filter((m): m is string => m !== undefined).map((m) => resolveModelProvider(m));
+export async function validateApiKeysForModels(
+  models: (string | undefined)[]
+): Promise<ProviderResolution[]> {
+  const resolutions = models
+    .filter((m): m is string => m !== undefined)
+    .map((m) => resolveModelProvider(m));
+
+  // SINGLE ORACLE: availability is decided by the credential authority
+  // (credentials.isAvailable → env → config → oauth-file → op://, lazy SDK) — the
+  // one source of truth that also gap-fills process.env with any resolved op://
+  // key (for downstream sign-time + spawned children). The sync apiKeyAvailable
+  // hint from resolveModelProvider is overwritten here with the authority's
+  // answer, so validation can never disagree with routing/sign-time.
+  await Promise.all(
+    resolutions.map(async (r) => {
+      // No key required (local / native / OAuth-or-free) → already true.
+      if (!r.requiredApiKeyEnvVar) return;
+      if (!r.catalogName) return; // unknown provider — leave as resolved
+      r.apiKeyAvailable = await credentials.isAvailable(r.catalogName);
+    })
+  );
+
+  return resolutions;
 }
 
 /**
@@ -444,7 +402,6 @@ export function getMissingKeyResolutions(resolutions: ProviderResolution[]): Pro
 export function getMissingKeyError(resolution: ProviderResolution): string {
   // Handle unknown provider
   if (resolution.category === "unknown") {
-    const vendor = resolution.fullModelId.split("/")[0];
     return [
       `Error: Unknown provider for model "${resolution.fullModelId}"`,
       "",
@@ -494,7 +451,7 @@ export function getMissingKeyError(resolution: ProviderResolution): string {
       parsed.provider !== "unknown" &&
       parsed.provider !== "native-anthropic"
     ) {
-      const hint = getAutoRouteHint(parsed.model, parsed.provider);
+      const hint = buildCredentialHint(parsed.model, [parsed.provider]);
       if (hint) {
         lines.push("");
         lines.push(hint);

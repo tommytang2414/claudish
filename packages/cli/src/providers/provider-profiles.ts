@@ -13,33 +13,33 @@
  *   proxy-server.ts. Profiles do not know about caching or invocationMode.
  */
 
+import type { BaseAPIFormat } from "../adapters/base-api-format.js";
 import type { ComposedHandlerOptions } from "../handlers/composed-handler.js";
 import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
-import type { ProviderTransport } from "./transport/types.js";
-import type { BaseAPIFormat } from "../adapters/base-api-format.js";
 // Alias for readability within this file
 type BaseModelAdapter = BaseAPIFormat;
+import { AnthropicAPIFormat } from "../adapters/anthropic-api-format.js";
+import { DefaultAPIFormat } from "../adapters/base-api-format.js";
+import { CodexAPIFormat } from "../adapters/codex-api-format.js";
+import { GeminiAPIFormat } from "../adapters/gemini-api-format.js";
+import { LiteLLMAPIFormat } from "../adapters/litellm-api-format.js";
+import { OllamaAPIFormat } from "../adapters/ollama-api-format.js";
+import { OpenAIAPIFormat } from "../adapters/openai-api-format.js";
+import { getVertexConfig, validateVertexOAuthConfig } from "../auth/vertex-auth.js";
 import { ComposedHandler } from "../handlers/composed-handler.js";
+import type { ModelHandler } from "../handlers/types.js";
+import { log, logStderr } from "../logger.js";
+import { formatProvenanceLog, resolveApiKeyProvenance } from "./api-key-provenance.js";
+import { getRegisteredRemoteProviders } from "./remote-provider-registry.js";
+import { getRuntimeProfiles } from "./runtime-providers.js";
+import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
 import { GeminiProviderTransport } from "./transport/gemini-apikey.js";
 import { GeminiCodeAssistProviderTransport } from "./transport/gemini-codeassist.js";
-import { GeminiAPIFormat } from "../adapters/gemini-api-format.js";
-import { OpenAIProviderTransport } from "./transport/openai.js";
-import { OpenAIAPIFormat } from "../adapters/openai-api-format.js";
-import { AnthropicProviderTransport } from "./transport/anthropic-compat.js";
-import { AnthropicAPIFormat } from "../adapters/anthropic-api-format.js";
-import { OllamaProviderTransport } from "./transport/ollamacloud.js";
-import { OllamaAPIFormat } from "../adapters/ollama-api-format.js";
 import { LiteLLMProviderTransport } from "./transport/litellm.js";
-import { LiteLLMAPIFormat } from "../adapters/litellm-api-format.js";
-import { CodexAPIFormat } from "../adapters/codex-api-format.js";
+import { OllamaProviderTransport } from "./transport/ollamacloud.js";
+import { OpenAICodexTransport } from "./transport/openai-codex.js";
+import { OpenAIProviderTransport } from "./transport/openai.js";
 import { VertexProviderTransport, parseVertexModel } from "./transport/vertex-oauth.js";
-import { DefaultAPIFormat } from "../adapters/base-api-format.js";
-import { OpenRouterProvider } from "./transport/openrouter.js";
-import { getRegisteredRemoteProviders } from "./remote-provider-registry.js";
-import { getVertexConfig, validateVertexOAuthConfig } from "../auth/vertex-auth.js";
-import { log, logStderr } from "../logger.js";
-import { resolveApiKeyProvenance, formatProvenanceLog } from "./api-key-provenance.js";
-import type { ModelHandler } from "../handlers/types.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,8 +111,35 @@ const geminiCodeAssistProfile: ProviderProfile = {
   },
 };
 
+/**
+ * Models that reject function tools + reasoning_effort on /v1/chat/completions
+ * (OpenAI 400: "use /v1/responses or set reasoning_effort to 'none'"). This is
+ * a PER-MODEL constraint, not family-wide. TEMPORARY name gate — replaced by
+ * the catalog capability record (endpoints.openai.toolsWithReasoning ===
+ * "requires-responses") once route-time capability fetch lands.
+ */
+function requiresResponsesApi(modelName: string): boolean {
+  return /^gpt-5\.6/.test(modelName.toLowerCase());
+}
+
 const openaiProfile: ProviderProfile = {
   createHandler(ctx) {
+    // Claude Code always sends tools, so requires-responses models must get the
+    // whole Responses-API slice (endpoint + CodexAPIFormat payload + responses
+    // SSE) swapped together — same composition the Zen profile uses for gpt-*.
+    if (requiresResponsesApi(ctx.modelName)) {
+      const responsesProvider = { ...ctx.provider, apiPath: "/v1/responses" };
+      const transport = new OpenAIProviderTransport(responsesProvider, ctx.modelName, ctx.apiKey);
+      const adapter = new CodexAPIFormat(ctx.modelName);
+      const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
+        adapter,
+        tokenStrategy: "delta-aware",
+        ...ctx.sharedOpts,
+      });
+      log(`[Proxy] Created OpenAI handler (Responses API composed): ${ctx.modelName}`);
+      return handler;
+    }
+
     const transport = new OpenAIProviderTransport(ctx.provider, ctx.modelName, ctx.apiKey);
     const adapter = new OpenAIAPIFormat(ctx.modelName);
     const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
@@ -121,6 +148,23 @@ const openaiProfile: ProviderProfile = {
       ...ctx.sharedOpts,
     });
     log(`[Proxy] Created OpenAI handler (composed): ${ctx.modelName}`);
+    return handler;
+  },
+};
+
+/** OpenAI Codex — uses the Responses API (/v1/responses) with CodexAPIFormat.
+ *  Uses OpenAICodexTransport which checks for OAuth credentials first (ChatGPT subscription),
+ *  falling back to API key (OPENAI_CODEX_API_KEY). */
+const openaiCodexProfile: ProviderProfile = {
+  createHandler(ctx) {
+    const transport = new OpenAICodexTransport(ctx.provider, ctx.modelName, ctx.apiKey);
+    const adapter = new CodexAPIFormat(ctx.modelName);
+    const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
+      adapter,
+      tokenStrategy: "delta-aware",
+      ...ctx.sharedOpts,
+    });
+    log(`[Proxy] Created OpenAI Codex handler (composed): ${ctx.modelName}`);
     return handler;
   },
 };
@@ -159,8 +203,10 @@ const glmProfile: ProviderProfile = {
  *   zen/  (opencode-zen):    free anonymous models + full paid access (OPENCODE_API_KEY)
  *   zgo/  (opencode-zen-go): go-plan models (glm-5, minimax-m2.5, kimi-k2.5) via zen/go/v1/
  *
- * Free anonymous models work without a key; uses "public" as fallback for consistent
- * rate-limit bucketing.
+ * Free anonymous models work without a key: the catalog's publicKeyFallback
+ * ("public") is emitted by the credential authority (ApiKeyCredentialProvider)
+ * when no real key resolves, so ctx.apiKey is always populated here — keeps
+ * rate-limit bucketing consistent without a second inline fallback.
  *
  * Model routing inside the profile:
  *   - MiniMax models  → AnthropicProviderTransport + AnthropicAPIFormat
@@ -169,7 +215,7 @@ const glmProfile: ProviderProfile = {
  */
 const openCodeZenProfile: ProviderProfile = {
   createHandler(ctx) {
-    const zenApiKey = ctx.apiKey || "public";
+    const zenApiKey = ctx.apiKey;
     const isGoProvider = ctx.provider.name === "opencode-zen-go";
 
     if (ctx.modelName.toLowerCase().includes("minimax")) {
@@ -269,11 +315,9 @@ const vertexProfile: ProviderProfile = {
       // because the vertex provider config has empty baseUrl/apiPath (designed for OAuth mode).
       const geminiConfig = getRegisteredRemoteProviders().find((p) => p.name === "gemini");
       const expressProvider = geminiConfig || ctx.provider;
-      const transport = new GeminiProviderTransport(
-        expressProvider,
-        ctx.modelName,
-        process.env.VERTEX_API_KEY!
-      );
+      // ctx.apiKey is the authority-resolved Vertex credential (Express key when
+      // VERTEX_API_KEY is set) — single source of truth, no raw env read here.
+      const transport = new GeminiProviderTransport(expressProvider, ctx.modelName, ctx.apiKey);
       const adapter = new GeminiAPIFormat(ctx.modelName);
       const handler = new ComposedHandler(transport, ctx.targetModel, ctx.modelName, ctx.port, {
         adapter,
@@ -315,7 +359,7 @@ const vertexProfile: ProviderProfile = {
       return handler;
     }
 
-    log(`[Proxy] Vertex AI requires either VERTEX_API_KEY or VERTEX_PROJECT`);
+    log("[Proxy] Vertex AI requires either VERTEX_API_KEY or VERTEX_PROJECT");
     return null;
   },
 };
@@ -333,15 +377,33 @@ export const PROVIDER_PROFILES: Record<string, ProviderProfile> = {
   gemini: geminiProfile,
   "gemini-codeassist": geminiCodeAssistProfile,
   openai: openaiProfile,
+  "openai-codex": openaiCodexProfile,
+  // xAI's API is OpenAI Chat-Completions compatible. Without this entry
+  // requests silently fell through to OpenRouter, which would only succeed
+  // if the model name suffix-matched an OpenRouter ID. Recent xAI models
+  // like grok-4.20-0309-reasoning didn't match → confusing 400 attributed
+  // to "x-ai" when xAI was never actually called.
+  "x-ai": openaiProfile,
+  // Qwen API is OpenAI-compatible (DashScope).
+  qwen: openaiProfile,
+  // NOTE: poe uses transport: "poe" which has no profile factory yet —
+  // PoeProvider class exists in transport/poe.ts but isn't wired up here.
+  // Adding it requires a poeProfile factory analogous to openaiProfile.
+  // Left out for now; Poe probe will still show 'no probe model in catalog'.
   minimax: anthropicCompatProfile,
   "minimax-coding": anthropicCompatProfile,
   kimi: anthropicCompatProfile,
   "kimi-coding": anthropicCompatProfile,
-  zai: anthropicCompatProfile,
+  "z-ai": anthropicCompatProfile,
   glm: glmProfile,
   "glm-coding": glmProfile,
   "opencode-zen": openCodeZenProfile,
   "opencode-zen-go": openCodeZenProfile,
+  deepseek: openaiProfile,
+  // Sakana Fugu is OpenAI Chat-Completions compatible. Both siblings (token +
+  // subscription) hit the identical endpoint, so both reuse openaiProfile.
+  sakana: openaiProfile,
+  "sakana-subscription": openaiProfile,
   ollamacloud: ollamaCloudProfile,
   litellm: litellmProfile,
   vertex: vertexProfile,
@@ -359,7 +421,8 @@ export const PROVIDER_PROFILES: Record<string, ProviderProfile> = {
  * - The profile's createHandler() returns null (e.g. missing config)
  */
 export function createHandlerForProvider(ctx: ProfileContext): ModelHandler | null {
-  const profile = PROVIDER_PROFILES[ctx.provider.name];
+  const profile =
+    PROVIDER_PROFILES[ctx.provider.name] ?? getRuntimeProfiles().get(ctx.provider.name);
   if (!profile) {
     return null; // Unknown provider — caller should fall through to OpenRouter or return null
   }

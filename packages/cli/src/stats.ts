@@ -15,19 +15,19 @@
  * Env var override: CLAUDISH_STATS=0|false|off disables all collection.
  */
 
-import { createRequire } from "node:module";
 import { loadConfig, saveConfig } from "./profile-config.js";
-import { detectRuntime, detectInstallMethod, sanitizeModelId } from "./telemetry.js";
 import { parseModelSpec } from "./providers/model-parser.js";
 import {
   appendEvent,
-  readBuffer,
   clearBuffer,
-  getBufferStats,
   flushBufferToDisk,
+  getBufferStats,
+  readBuffer,
 } from "./stats-buffer.js";
-import { formatOtlpBatch, type StatsEvent, type OtlpResource } from "./stats-otlp.js";
+import { type OtlpResource, type StatsEvent, formatOtlpBatch } from "./stats-otlp.js";
+import { detectInstallMethod, detectRuntime, sanitizeModelId } from "./telemetry.js";
 import type { ClaudishConfig } from "./types.js";
+import { VERSION } from "./version.js";
 
 export type { StatsEvent } from "./stats-otlp.js";
 export type { StatsConsent } from "./stats-otlp.js";
@@ -69,13 +69,7 @@ let envAttributes: {
 // ─── Version Helper ───────────────────────────────────────────────────────────
 
 function getVersion(): string {
-  try {
-    const require = createRequire(import.meta.url);
-    const pkg = require("../package.json") as { version?: string };
-    return pkg.version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
+  return VERSION;
 }
 
 // ─── Environment Detection ────────────────────────────────────────────────────
@@ -99,7 +93,7 @@ function isStatsDisabledByEnv(): boolean {
  * Initialize the stats module. Called once at process startup after config loads.
  * Synchronous and fast (< 1ms). No network calls.
  */
-export function initStats(config: ClaudishConfig): void {
+export function initStats(_config: ClaudishConfig): void {
   try {
     if (initialized) return;
     initialized = true;
@@ -368,6 +362,7 @@ export async function handleStatsCommand(subcommand: string): Promise<void> {
         "[claudish] Usage stats enabled. Anonymous provider performance data will be sent daily.\n"
       );
       process.exit(0);
+      break;
     }
 
     case "off": {
@@ -377,6 +372,7 @@ export async function handleStatsCommand(subcommand: string): Promise<void> {
       saveConfig(cfg);
       process.stderr.write("[claudish] Usage stats disabled. No data will be sent.\n");
       process.exit(0);
+      break;
     }
 
     case "status": {
@@ -416,6 +412,7 @@ export async function handleStatsCommand(subcommand: string): Promise<void> {
       process.stderr.write("\nFormat: OpenTelemetry Protocol (OTLP) Logs\n");
       process.stderr.write("Manage: claudish stats on|off|reset\n");
       process.exit(0);
+      break;
     }
 
     case "reset": {
@@ -429,12 +426,12 @@ export async function handleStatsCommand(subcommand: string): Promise<void> {
         "[claudish] Stats consent reset and buffer cleared. You will see the opt-in banner on next run.\n"
       );
       process.exit(0);
+      break;
     }
 
     default:
       process.stderr.write(
-        `[claudish] Unknown stats subcommand: "${subcommand}"\n` +
-          "Usage: claudish stats on|off|status|reset\n"
+        `[claudish] Unknown stats subcommand: "${subcommand}"\nUsage: claudish stats on|off|status|reset\n`
       );
       process.exit(1);
   }

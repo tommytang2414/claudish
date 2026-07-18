@@ -8,12 +8,13 @@
  * - Others: Future model-specific behaviors
  */
 
-import { truncateToolName } from "./tool-name-utils.js";
 import type { ModelPricing } from "../handlers/shared/remote-provider-types.js";
 import { getModelPricing } from "../handlers/shared/remote-provider-types.js";
 import type { StreamFormat } from "../providers/transport/types.js";
 import type { APIFormat } from "./api-format.js";
+import { lookupModel } from "./model-catalog.js";
 import type { ModelDialect } from "./model-dialect.js";
+import { truncateToolName } from "./tool-name-utils.js";
 
 /**
  * Match a model ID against a model family name, handling vendor-prefixed IDs.
@@ -38,6 +39,16 @@ export interface ToolCall {
   arguments: Record<string, any>;
 }
 
+/**
+ * Canonical reasoning-effort levels emitted by Claude Code via
+ * `output_config.effort`. Every dialect maps these onto its provider's native
+ * reasoning knob (or strips, when the provider has none).
+ */
+export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** The seven canonical levels, ascending — also the membership set for validation. */
+const EFFORT_ORDER: EffortLevel[] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 export interface AdapterResult {
   /** Cleaned text content (with XML/special formats removed) */
   cleanedText: string;
@@ -58,6 +69,11 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
 
   constructor(modelId: string) {
     this.modelId = modelId;
+  }
+
+  /** The model ID this format/dialect was constructed for. */
+  getModelId(): string {
+    return this.modelId;
   }
 
   /**
@@ -87,6 +103,18 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
   }
 
   /**
+   * Maximum number of tools this API accepts in a single request. Returns null
+   * if no limit (default). OpenAI's Chat Completions API hard-caps the `tools`
+   * array at 128 — exceeding it fails the whole request with HTTP 400
+   * "Invalid 'tools': array too long". The ComposedHandler head-slices the
+   * converted tools to this count so a session with many MCP tools still works
+   * (Claude Code's built-in tools come first and are preserved).
+   */
+  getMaxToolCount(): number | null {
+    return null;
+  }
+
+  /**
    * Get the tool name map (truncated -> original).
    * Use after prepareRequest() to get the mapping for response processing.
    */
@@ -108,8 +136,43 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
    * @param originalRequest - The original Claude-format request
    * @returns The modified request payload
    */
-  prepareRequest(request: any, originalRequest: any): any {
+  prepareRequest(request: any, _originalRequest: any): any {
     return request;
+  }
+
+  /**
+   * Normalize Claude Code's effort signal to a canonical {@link EffortLevel}
+   * (or undefined when the request carries no effort hint).
+   *
+   * Priority:
+   *  1. `output_config.effort` — the modern string level Claude Code (Opus
+   *     4.7/4.8) sends (none/minimal/low/medium/high/xhigh/max).
+   *  2. Legacy `thinking.budget_tokens` — older clients sent a token budget;
+   *     bucket it into a canonical level.
+   *
+   * Every dialect calls this, then clamps the result to its provider's
+   * accepted value set (or strips, when the provider has no reasoning knob).
+   */
+  protected resolveEffortLevel(originalRequest: any): EffortLevel | undefined {
+    const lvl = originalRequest?.output_config?.effort;
+    if (typeof lvl === "string") {
+      const lower = lvl.toLowerCase();
+      if (EFFORT_ORDER.includes(lower as EffortLevel)) {
+        return lower as EffortLevel;
+      }
+    }
+
+    // Legacy fallback: thinking.budget_tokens → bucketed effort.
+    const budget = originalRequest?.thinking?.budget_tokens;
+    if (typeof budget === "number") {
+      if (budget <= 0) return "none";
+      if (budget < 4000) return "low";
+      if (budget < 16000) return "medium";
+      if (budget < 32000) return "high";
+      return "xhigh";
+    }
+
+    return undefined;
   }
 
   /**
@@ -177,7 +240,7 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
    * Used for token tracking and context-left-percent calculation.
    */
   getContextWindow(): number {
-    return 200_000;
+    return lookupModel(this.modelId)?.contextWindow ?? 0;
   }
 
   /**
@@ -193,6 +256,14 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
    */
   supportsVision(): boolean {
     return true;
+  }
+
+  /**
+   * Whether thinking blocks should be filtered from the SSE response.
+   * Override to return true for providers whose thinking blocks leak to the user.
+   */
+  shouldFilterThinking(): boolean {
+    return false;
   }
 
   /**
@@ -249,7 +320,7 @@ export abstract class BaseAPIFormat implements APIFormat, ModelDialect {
  * Default format/dialect that does no transformation
  */
 export class DefaultAPIFormat extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
       extractedToolCalls: [],
@@ -257,7 +328,7 @@ export class DefaultAPIFormat extends BaseAPIFormat {
     };
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return false; // Default is fallback
   }
 

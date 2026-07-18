@@ -1,28 +1,34 @@
 /**
  * Model Selector with Fuzzy Search
  *
- * Uses @inquirer/search for fuzzy search model selection
+ * Two-step interactive picker over the Firebase-backed `CatalogClient`:
+ *   1. Pick a provider (filtered by `isProviderAvailable()`).
+ *   2. Pick a model — either:
+ *      - cross-vendor `catalog.searchModels()` (when "All providers" is chosen),
+ *      - vendor-scoped `catalog.modelsByVendor()` (when a specific provider is chosen),
+ *      - or a free-text input (when the provider is local / user-deployed).
+ *
+ * Pure helpers (`pickerProviderToFirebaseSlug`, `isUserDeployedProvider`,
+ * `buildExplicitModelSpec`) are exported for unit tests; the inquirer-driven
+ * flow is exercised end-to-end via the headless tmux smoke run.
  */
 
-import { search, select, input, confirm } from "@inquirer/prompts";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
-import { fileURLToPath } from "node:url";
-import type { OpenRouterModel } from "./types.js";
-import { getAvailableModels, fetchLiteLLMModels } from "./model-loader.js";
-import { getProviderByName, isProviderAvailable } from "./providers/provider-definitions.js";
-
-// Get __dirname equivalent in ESM
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-// Cache paths - use ~/.claudish/ for writable cache (binaries can't write to __dirname)
-const CLAUDISH_CACHE_DIR = join(homedir(), ".claudish");
-const ALL_MODELS_JSON_PATH = join(CLAUDISH_CACHE_DIR, "all-models.json");
-const RECOMMENDED_MODELS_JSON_PATH = join(__dirname, "../recommended-models.json");
-const CACHE_MAX_AGE_DAYS = 2;
-const FREE_MODELS_CACHE_MAX_AGE_HOURS = 3; // Free models change frequently, refresh every 3 hours
+import { confirm, input, search, select } from "@inquirer/prompts";
+import { credentials } from "./auth/credentials/authority.js";
+import {
+  type AggregatorEntry,
+  type ModelDoc,
+  type RecommendedModelEntry,
+  getRecommendedModels,
+  getTop100Models,
+} from "./model-loader.js";
+import {
+  type CatalogClient,
+  type CatalogModel,
+  createCatalogClient,
+} from "./providers/model-catalog.js";
+import { fetchOllamaModels } from "./providers/ollama-discovery.js";
+import { getDisplayName, getProviderByName } from "./providers/provider-definitions.js";
 
 /**
  * Model data structure
@@ -32,6 +38,8 @@ export interface ModelInfo {
   name: string;
   description: string;
   provider: string;
+  providerSlug?: string;
+  releaseDate?: string;
   pricing?: {
     input: string;
     output: string;
@@ -43,886 +51,332 @@ export interface ModelInfo {
   supportsReasoning?: boolean;
   supportsVision?: boolean;
   isFree?: boolean;
-  source?:
-    | "OpenRouter"
-    | "Zen"
-    | "xAI"
-    | "Gemini"
-    | "OpenAI"
-    | "GLM"
-    | "GLM Coding"
-    | "MiniMax"
-    | "MiniMax Coding"
-    | "Kimi"
-    | "Kimi Coding"
-    | "Z.AI"
-    | "OllamaCloud"
-    | "LiteLLM"
-    | "Recommended"; // Which platform the model is from
+  source?: string; // Which platform the model is from
+  /**
+   * Per-provider routing index: which providers serve this model and under
+   * what externalId (vendor-prefixed where the provider requires it, e.g.
+   * `openai/gpt-5` for OpenRouter). Preserved so the picker can render each
+   * row as the exact callable spec for the selected provider.
+   */
+  aggregators?: AggregatorEntry[];
 }
 
 /**
- * Load recommended models from JSON
- * IDs are provider-agnostic — auto-routing decides the provider
+ * Picker provider value → Firebase aggregator/owner slug.
+ *
+ * Picker values come from `ALL_PROVIDER_CHOICES.value` (e.g. "zen", "openai-codex");
+ * Firebase aggregator/owner slugs come from `VendorRecord.vendor` /
+ * `aggregators[].provider` in the slim catalog (e.g. "opencode-zen", "openai").
+ *
+ * Subscription endpoints (codex, kimi-coding, glm-coding, gemini-codeassist) reuse
+ * the underlying owner's catalog because they serve the same models.
+ *
+ * Picker-local glue, intentionally not exported as a global concept.
+ * Exported for unit tests only.
  */
-function loadRecommendedModels(): ModelInfo[] {
-  if (existsSync(RECOMMENDED_MODELS_JSON_PATH)) {
-    try {
-      const content = readFileSync(RECOMMENDED_MODELS_JSON_PATH, "utf-8");
-      const data = JSON.parse(content);
-      return (data.models || []).map((model: ModelInfo) => ({
-        ...model,
-        source: "Recommended" as const,
-      }));
-    } catch {
-      return [];
-    }
-  }
-  return [];
+export const pickerProviderToFirebaseSlug: Record<string, string> = {
+  openrouter: "openrouter",
+  google: "google",
+  "gemini-codeassist": "google",
+  openai: "openai",
+  "openai-codex": "openai",
+  "x-ai": "x-ai",
+  deepseek: "deepseek",
+  minimax: "minimax",
+  "minimax-coding": "minimax",
+  kimi: "moonshotai",
+  "kimi-coding": "moonshotai",
+  glm: "z-ai",
+  "glm-coding": "z-ai",
+  "z-ai": "z-ai",
+  sakana: "sakana",
+  "sakana-subscription": "sakana",
+  zen: "opencode-zen",
+  "opencode-zen": "opencode-zen",
+  "opencode-zen-go": "opencode-zen-go",
+  ollamacloud: "ollamacloud",
+};
+
+/**
+ * Providers whose catalogs aren't in Firebase by design — picker shows a
+ * neutral free-text input instead of a model list. Anything else falls
+ * through to the Firebase-backed catalog client.
+ */
+const LOCAL_OR_USER_DEPLOYED = new Set<string>(["litellm", "ollama", "lmstudio"]);
+
+/**
+ * Pure predicate — exported for unit tests.
+ */
+export function isUserDeployedProvider(value: string): boolean {
+  return LOCAL_OR_USER_DEPLOYED.has(value);
 }
 
 /**
- * Fetch all models from OpenRouter API
+ * Friendly display name for a Firebase provider slug. Routes through
+ * `provider-definitions.ts` `getDisplayName()` after mapping Firebase
+ * vendor slugs (e.g. "moonshotai") to the canonical claudish provider
+ * name (e.g. "kimi"). For genuinely unknown slugs (e.g. "perplexity")
+ * the canonical-name path falls back to a capitalized rendering of the
+ * slug. (Note: "x-ai"/"z-ai" now match the catalog slug 1:1.)
  */
-async function fetchAllModels(forceUpdate = false): Promise<any[]> {
-  // Check cache
-  if (!forceUpdate && existsSync(ALL_MODELS_JSON_PATH)) {
-    try {
-      const cacheData = JSON.parse(readFileSync(ALL_MODELS_JSON_PATH, "utf-8"));
-      const lastUpdated = new Date(cacheData.lastUpdated);
-      const now = new Date();
-      const ageInDays = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-
-      if (ageInDays <= CACHE_MAX_AGE_DAYS) {
-        return cacheData.models;
-      }
-    } catch {
-      // Cache error, will fetch
-    }
+function firebaseSlugToProviderName(slug: string): string {
+  const lower = slug.toLowerCase();
+  // Reverse-lookup: pick the FIRST picker-value that maps to this slug.
+  // Order matters — the more "canonical" entries (e.g. "x-ai" before
+  // "openai-codex") sit higher in pickerProviderToFirebaseSlug.
+  for (const [pickerValue, firebaseSlug] of Object.entries(pickerProviderToFirebaseSlug)) {
+    if (firebaseSlug === lower) return pickerValue;
   }
+  return lower;
+}
 
-  // Fetch from API
-  console.log("Fetching models from OpenRouter...");
+function formatFirebaseProviderLabel(slug: string): string {
+  if (!slug || slug === "unknown") return "Unknown";
+  const canonical = firebaseSlugToProviderName(slug);
+  // getDisplayName falls back to capitalized provider name when the slug isn't
+  // a known builtin — that's acceptable polish for fringe vendors.
+  const displayName = getDisplayName(canonical);
+  // Prettify a few multi-segment slugs that aren't in provider-definitions.
+  if (displayName === canonical && canonical.includes("-")) {
+    return canonical
+      .split("-")
+      .map((part) => {
+        if (part === "ai") return "AI";
+        if (part.length <= 3) return part.toUpperCase();
+        return part.charAt(0).toUpperCase() + part.slice(1);
+      })
+      .join(" ");
+  }
+  return displayName;
+}
+
+/**
+ * Load recommended models from Firebase for the interactive picker.
+ * Use the async loader so cold-start runs fetch the live catalog instead of
+ * falling straight to the tiny bundled fallback.
+ */
+async function loadRecommendedModels(forceRefresh = false): Promise<ModelInfo[]> {
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/models");
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-
-    const data = await response.json();
-    const models = data.data;
-
-    // Cache result - ensure directory exists
-    mkdirSync(CLAUDISH_CACHE_DIR, { recursive: true });
-    writeFileSync(
-      ALL_MODELS_JSON_PATH,
-      JSON.stringify({
-        lastUpdated: new Date().toISOString(),
-        models,
-      }),
-      "utf-8"
-    );
-
-    console.log(`Cached ${models.length} models`);
-    return models;
-  } catch (error) {
-    console.error(`Failed to fetch models: ${error}`);
+    const doc = await getRecommendedModels({ forceRefresh });
+    return doc.models.map((model: RecommendedModelEntry) => ({
+      id: model.id,
+      name: model.name,
+      description: model.description,
+      provider: formatFirebaseProviderLabel(model.provider),
+      providerSlug: model.provider.toLowerCase(),
+      pricing: model.pricing,
+      context: model.context,
+      contextLength: parseContextString(model.context),
+      supportsTools: model.supportsTools,
+      supportsReasoning: model.supportsReasoning,
+      supportsVision: model.supportsVision,
+      source: formatFirebaseProviderLabel(model.provider),
+    }));
+  } catch {
     return [];
   }
 }
 
-/**
- * Convert raw OpenRouter model to ModelInfo
- */
-function toModelInfo(model: any): ModelInfo {
-  const provider = model.id.split("/")[0];
-  const contextLen = model.context_length || model.top_provider?.context_length || 0;
-  const promptPrice = parseFloat(model.pricing?.prompt || "0");
-  const completionPrice = parseFloat(model.pricing?.completion || "0");
-  const isFree = promptPrice === 0 && completionPrice === 0;
+/** Parse "196K" → 196000, "1M" → 1000000. */
+function parseContextString(ctx?: string): number {
+  if (!ctx || ctx === "N/A") return 0;
+  const upper = ctx.toUpperCase();
+  if (upper.endsWith("M")) return Number.parseFloat(upper) * 1_000_000;
+  if (upper.endsWith("K")) return Number.parseFloat(upper) * 1000;
+  const n = Number.parseInt(upper, 10);
+  return Number.isNaN(n) ? 0 : n;
+}
 
-  // Format pricing
-  let pricingStr = "N/A";
-  if (isFree) {
-    pricingStr = "FREE";
-  } else if (model.pricing) {
-    const avgPrice = (promptPrice + completionPrice) / 2;
-    if (avgPrice < 0.001) {
-      pricingStr = `$${(avgPrice * 1000000).toFixed(2)}/1M`;
-    } else {
-      pricingStr = `$${avgPrice.toFixed(4)}/1K`;
-    }
+interface PickerProvider {
+  slug: string;
+  label: string;
+  count: number;
+}
+
+function formatContextLength(ctx?: number): string {
+  if (!ctx || ctx <= 0) return "N/A";
+  if (ctx >= 1_000_000) return `${Math.round(ctx / 1_000_000)}M`;
+  return `${Math.round(ctx / 1000)}K`;
+}
+
+function formatAveragePricing(pricing?: ModelDoc["pricing"]): ModelInfo["pricing"] | undefined {
+  if (!pricing) return undefined;
+
+  const input = pricing.input;
+  const output = pricing.output;
+  const inputStr =
+    typeof input === "number" ? (input === 0 ? "FREE" : `$${input.toFixed(2)}`) : "N/A";
+  const outputStr =
+    typeof output === "number" ? (output === 0 ? "FREE" : `$${output.toFixed(2)}`) : "N/A";
+
+  if (typeof input !== "number" && typeof output !== "number") {
+    return {
+      input: inputStr,
+      output: outputStr,
+      average: "N/A",
+    };
   }
 
+  const avg = ((input || 0) + (output || 0)) / 2;
   return {
-    // Add openrouter@ prefix for explicit routing
-    id: `openrouter@${model.id}`,
-    name: model.name || model.id,
-    description: model.description || "",
-    provider: provider.charAt(0).toUpperCase() + provider.slice(1),
-    pricing: {
-      input: model.pricing?.prompt || "N/A",
-      output: model.pricing?.completion || "N/A",
-      average: pricingStr,
-    },
-    context: contextLen > 0 ? `${Math.round(contextLen / 1000)}K` : "N/A",
-    contextLength: contextLen,
-    supportsTools: (model.supported_parameters || []).includes("tools"),
-    supportsReasoning: (model.supported_parameters || []).includes("reasoning"),
-    supportsVision: (model.architecture?.input_modalities || []).includes("image"),
-    isFree,
-    source: "OpenRouter",
+    input: inputStr,
+    output: outputStr,
+    average: avg === 0 ? "FREE" : `$${avg.toFixed(2)}/1M`,
   };
 }
 
-/**
- * Fetch Zen Go plan models (glm-5, minimax-m2.5, kimi-k2.5).
- * Probes zen/go/v1/ to discover which models the key has go-plan access to,
- * then enriches with models.dev metadata.
- */
-async function fetchZenGoModels(): Promise<ModelInfo[]> {
-  const apiKey = process.env.OPENCODE_API_KEY;
-  if (!apiKey) return [];
+function modelDocToModelInfo(model: ModelDoc): ModelInfo {
+  const providerLabel = formatFirebaseProviderLabel(model.provider || "unknown");
+  const contextLength = model.contextWindow || 0;
 
-  const ZEN_GO_BASE = process.env.OPENCODE_BASE_URL
-    ? process.env.OPENCODE_BASE_URL.replace("/zen", "/zen/go")
-    : "https://opencode.ai/zen/go";
-
-  try {
-    // Fetch models.dev for metadata
-    const mdevResp = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!mdevResp.ok) return [];
-    const mdevData = await mdevResp.json();
-    const ocModels: Record<string, any> = mdevData?.opencode?.models ?? {};
-
-    // Probe candidate models against zen/go/v1/ to discover which ones actually work.
-    // Only probe models that appear in models.dev opencode catalog (so we have metadata).
-    // We check for actual success (choices in response) rather than inferring from error type,
-    // because different backends (Kimi, MiniMax) use non-standard error schemas that make
-    // the "not ModelError" heuristic unreliable.
-    const candidateIds = Object.keys(ocModels);
-    const fallbackIds = ["glm-5"]; // confirmed working as of investigation
-
-    // Probe each candidate in parallel — include only if we get a real choices response
-    const probeResults = await Promise.all(
-      candidateIds.map(async (modelId) => {
-        try {
-          const r = await fetch(`${ZEN_GO_BASE}/v1/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify({
-              model: modelId,
-              messages: [{ role: "user", content: "hi" }],
-              max_tokens: 1,
-            }),
-            signal: AbortSignal.timeout(8000),
-          });
-          if (!r.ok) return null;
-          const body = await r.json().catch(() => ({}));
-          // Only include if we got actual completion choices back
-          return Array.isArray(body?.choices) && body.choices.length > 0 ? modelId : null;
-        } catch {
-          return null;
-        }
-      })
-    );
-
-    // If probing fails entirely (network error, all timeouts), fall back to known list
-    const discoveredIds = probeResults.filter(Boolean) as string[];
-    const goModelIds = discoveredIds.length > 0 ? discoveredIds : fallbackIds;
-
-    return goModelIds
-      .map((id) => {
-        const m = ocModels[id];
-        if (!m) return null;
-        const inputModalities = m.modalities?.input ?? [];
-        return {
-          id: `zgo@${id}`,
-          name: m.name || id,
-          description: `OpenCode Zen Go plan model`,
-          provider: "Zen Go",
-          pricing: { input: "PLAN", output: "PLAN", average: "PLAN" },
-          context: m.limit?.context ? `${Math.round(m.limit.context / 1000)}K` : "128K",
-          contextLength: m.limit?.context || 128000,
-          supportsTools: m.tool_call === true,
-          supportsReasoning: m.reasoning || false,
-          supportsVision: inputModalities.includes("image") || inputModalities.includes("video"),
-          isFree: false,
-          source: "Zen" as const,
-        };
-      })
-      .filter(Boolean) as ModelInfo[];
-  } catch {
-    return [];
-  }
+  return {
+    id: model.modelId,
+    name: model.displayName || model.modelId,
+    description: model.description || `${providerLabel} model`,
+    provider: providerLabel,
+    providerSlug: model.provider,
+    releaseDate: model.releaseDate,
+    pricing: formatAveragePricing(model.pricing),
+    context: formatContextLength(contextLength),
+    contextLength,
+    supportsTools: model.capabilities?.tools,
+    supportsReasoning: model.capabilities?.thinking,
+    supportsVision: model.capabilities?.vision,
+    source: providerLabel,
+  };
 }
 
-/**
- * Fetch free models from OpenCode Zen.
- * Cross-references models.dev catalog (cost/capabilities) with the live Zen
- * /v1/models endpoint so we only surface models that are actually deployed.
- */
-async function fetchZenFreeModels(): Promise<ModelInfo[]> {
-  try {
-    const ZEN_BASE = process.env.OPENCODE_BASE_URL || "https://opencode.ai/zen";
-    const ZEN_API_KEY = process.env.OPENCODE_API_KEY || "public";
+function catalogModelToModelInfo(model: CatalogModel): ModelInfo {
+  // Catalog models from the slim cache don't carry the owner provider — fall
+  // back to the first aggregator's name so the picker still shows something
+  // useful in the column.
+  const ownerOrFirstAggregator = model.provider || model.aggregators?.[0]?.provider || "unknown";
+  const providerLabel = formatFirebaseProviderLabel(ownerOrFirstAggregator);
+  const contextLength = model.contextWindow || 0;
 
-    // Fetch models.dev catalog and live Zen model list in parallel
-    const [mdevResp, liveResp] = await Promise.all([
-      fetch("https://models.dev/api.json", { signal: AbortSignal.timeout(5000) }),
-      fetch(`${ZEN_BASE}/v1/models`, {
-        headers: { Authorization: `Bearer ${ZEN_API_KEY}` },
-        signal: AbortSignal.timeout(5000),
-      }),
-    ]);
+  return {
+    id: model.modelId,
+    name: model.displayName || model.modelId,
+    description: model.description || `${providerLabel} model`,
+    provider: providerLabel,
+    providerSlug: ownerOrFirstAggregator,
+    releaseDate: model.releaseDate,
+    pricing: formatAveragePricing(model.pricing),
+    context: formatContextLength(contextLength),
+    contextLength,
+    supportsTools: model.capabilities?.tools,
+    supportsReasoning: model.capabilities?.thinking,
+    supportsVision: model.capabilities?.vision,
+    source: providerLabel,
+    aggregators: model.aggregators,
+  };
+}
 
-    if (!mdevResp.ok) return [];
+function dedupeModels(models: ModelInfo[]): ModelInfo[] {
+  const seen = new Set<string>();
+  const deduped: ModelInfo[] = [];
+  for (const model of models) {
+    if (seen.has(model.id)) continue;
+    seen.add(model.id);
+    deduped.push(model);
+  }
+  return deduped;
+}
 
-    const mdevData = await mdevResp.json();
-    const opencode = mdevData.opencode;
-    if (!opencode?.models) return [];
+function extractVersionParts(modelId: string): number[] {
+  const tokens = modelId.toLowerCase().split(/[\/_-]+/);
+  let started = false;
+  const parts: number[] = [];
 
-    // Build set of model IDs actually deployed on Zen
-    const liveIds = new Set<string>();
-    if (liveResp.ok) {
-      const liveData = await liveResp.json();
-      for (const m of liveData.data ?? []) liveIds.add(m.id);
+  for (const token of tokens) {
+    const match = token.match(/\d+(?:\.\d+)*/);
+    if (!match) {
+      if (started) break;
+      continue;
     }
 
-    return Object.entries(opencode.models)
-      .filter(([id, m]: [string, any]) => {
-        const isFree = m.cost?.input === 0 && m.cost?.output === 0;
-        const supportsTools = m.tool_call === true;
-        // Only include models that are actually live on the Zen API
-        const isLive = liveIds.size === 0 || liveIds.has(id);
-        return isFree && supportsTools && isLive;
-      })
-      .map(([id, m]: [string, any]) => {
-        const inputModalities = m.modalities?.input || [];
-        const supportsVision =
-          inputModalities.includes("image") || inputModalities.includes("video");
-
-        return {
-          id: `zen@${id}`,
-          name: m.name || id,
-          description: `OpenCode Zen free model`,
-          provider: "Zen",
-          pricing: {
-            input: "FREE",
-            output: "FREE",
-            average: "FREE",
-          },
-          context: m.limit?.context ? `${Math.round(m.limit.context / 1000)}K` : "128K",
-          contextLength: m.limit?.context || 128000,
-          supportsTools: true,
-          supportsReasoning: m.reasoning || false,
-          supportsVision,
-          isFree: true,
-          source: "Zen" as const,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Get context window for xAI model (not returned by API, hardcoded from docs)
- */
-function getXAIContextWindow(modelId: string): { context: string; contextLength: number } {
-  const id = modelId.toLowerCase();
-  if (id.includes("grok-4.1-fast") || id.includes("grok-4-1-fast")) {
-    return { context: "2M", contextLength: 2000000 };
-  }
-  if (id.includes("grok-4-fast")) {
-    return { context: "2M", contextLength: 2000000 };
-  }
-  if (id.includes("grok-code-fast")) {
-    return { context: "256K", contextLength: 256000 };
-  }
-  if (id.includes("grok-4")) {
-    return { context: "256K", contextLength: 256000 };
-  }
-  if (id.includes("grok-3")) {
-    return { context: "131K", contextLength: 131072 };
-  }
-  if (id.includes("grok-2")) {
-    return { context: "131K", contextLength: 131072 };
-  }
-  return { context: "131K", contextLength: 131072 }; // Default for older models
-}
-
-/**
- * Fetch models from xAI using /v1/language-models endpoint
- * This endpoint returns pricing info (but not context_length)
- */
-async function fetchXAIModels(): Promise<ModelInfo[]> {
-  const apiKey = process.env.XAI_API_KEY;
-  if (!apiKey) {
-    return [];
-  }
-
-  try {
-    const response = await fetch("https://api.x.ai/v1/language-models", {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    if (!data.models || !Array.isArray(data.models)) {
-      return [];
-    }
-
-    return data.models
-      .filter((model: any) => !model.id.includes("image") && !model.id.includes("imagine")) // Skip image models
-      .map((model: any) => {
-        // Pricing from API: prompt_text_token_price is in nano-dollars (10^-9) per token
-        // Convert to $/1M tokens: price * 1M / 10^9 = price / 1000
-        const inputPricePerM = (model.prompt_text_token_price || 0) / 1000;
-        const outputPricePerM = (model.completion_text_token_price || 0) / 1000;
-        const avgPrice = (inputPricePerM + outputPricePerM) / 2;
-
-        const { context, contextLength } = getXAIContextWindow(model.id);
-        const supportsVision = (model.input_modalities || []).includes("image");
-        const supportsReasoning = model.id.includes("reasoning");
-
-        return {
-          id: `xai@${model.id}`,
-          name: model.id,
-          description: `xAI ${supportsReasoning ? "reasoning " : ""}model`,
-          provider: "xAI",
-          pricing: {
-            input: `$${inputPricePerM.toFixed(2)}`,
-            output: `$${outputPricePerM.toFixed(2)}`,
-            average: `$${avgPrice.toFixed(2)}/1M`,
-          },
-          context,
-          contextLength,
-          supportsTools: true,
-          supportsReasoning,
-          supportsVision,
-          isFree: false,
-          source: "xAI" as const,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Get pricing for Gemini models
- * Hardcoded based on https://ai.google.dev/gemini-api/docs/pricing
- */
-function getGeminiPricing(modelId: string): { input: string; output: string; average: string } {
-  const id = modelId.toLowerCase();
-
-  // Gemini 3.1 Pro Preview / Gemini 3 Pro Preview
-  if (id.includes("gemini-3.1-pro") || id.includes("gemini-3-pro")) {
-    return { input: "$2.00", output: "$12.00", average: "$7.00/1M" };
-  }
-  // Gemini 3 Flash Preview
-  if (id.includes("gemini-3-flash")) {
-    return { input: "$0.50", output: "$3.00", average: "$1.75/1M" };
-  }
-  // Gemini 2.5 Pro
-  if (id.includes("gemini-2.5-pro")) {
-    return { input: "$1.25", output: "$10.00", average: "$5.63/1M" };
-  }
-  // Gemini 2.5 Flash-Lite
-  if (id.includes("gemini-2.5-flash-lite")) {
-    return { input: "$0.10", output: "$0.40", average: "$0.25/1M" };
-  }
-  // Gemini 2.5 Flash
-  if (id.includes("gemini-2.5-flash")) {
-    return { input: "$0.30", output: "$2.50", average: "$1.40/1M" };
-  }
-  // Gemini 2.0 Pro Experimental / 2.0 Pro
-  if (id.includes("gemini-2.0-pro")) {
-    return { input: "$1.25", output: "$5.00", average: "$3.13/1M" };
-  }
-  // Gemini 2.0 Flash-Lite
-  if (id.includes("gemini-2.0-flash-lite")) {
-    return { input: "$0.075", output: "$0.30", average: "$0.19/1M" };
-  }
-  // Gemini 2.0 Flash
-  if (id.includes("gemini-2.0-flash")) {
-    return { input: "$0.10", output: "$0.40", average: "$0.25/1M" };
-  }
-  // Gemini 1.5 Pro
-  if (id.includes("gemini-1.5-pro")) {
-    return { input: "$1.25", output: "$5.00", average: "$3.13/1M" };
-  }
-  // Gemini 1.5 Flash-8b
-  if (id.includes("gemini-1.5-flash-8b")) {
-    return { input: "$0.0375", output: "$0.15", average: "$0.09/1M" };
-  }
-  // Gemini 1.5 Flash
-  if (id.includes("gemini-1.5-flash")) {
-    return { input: "$0.075", output: "$0.30", average: "$0.19/1M" };
-  }
-
-  // Default to N/A instead of showing wrong prices
-  return { input: "N/A", output: "N/A", average: "N/A" };
-}
-
-/**
- * Fetch models from Google Gemini
- */
-async function fetchGeminiModels(): Promise<ModelInfo[]> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return [];
-  }
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
-      {
-        signal: AbortSignal.timeout(5000),
+    if (!started) {
+      started = true;
+      for (const part of match[0].split(".")) {
+        parts.push(Number.parseInt(part, 10));
       }
-    );
 
-    if (!response.ok) {
-      return [];
+      if (!/^\d+(?:\.\d+)*$/.test(token)) {
+        break;
+      }
+
+      continue;
     }
 
-    const data = await response.json();
-    if (!data.models || !Array.isArray(data.models)) {
-      return [];
+    if (!/^\d{1,2}(?:\.\d+)?$/.test(token)) {
+      break;
     }
 
-    // Filter for models that support generateContent
-    return data.models
-      .filter((model: any) => {
-        const methods = model.supportedGenerationMethods || [];
-        return methods.includes("generateContent");
-      })
-      .map((model: any) => {
-        // Extract model name from "models/gemini-..." format
-        const modelName = model.name.replace("models/", "");
-        return {
-          id: `google@${modelName}`,
-          name: model.displayName || modelName,
-          description: model.description || `Google Gemini model`,
-          provider: "Gemini",
-          pricing: getGeminiPricing(modelName),
-          context: "128K",
-          contextLength: 128000,
-          supportsTools: true,
-          supportsReasoning: false,
-          supportsVision: true,
-          isFree: false,
-          source: "Gemini" as const,
-        };
-      });
-  } catch {
-    return [];
+    for (const part of token.split(".")) {
+      parts.push(Number.parseInt(part, 10));
+    }
   }
+
+  return parts;
+}
+
+function compareVersionPartsDesc(a: number[], b: number[]): number {
+  const maxLength = Math.max(a.length, b.length);
+  for (let i = 0; i < maxLength; i++) {
+    const aPart = a[i] ?? -1;
+    const bPart = b[i] ?? -1;
+    if (aPart !== bPart) {
+      return bPart - aPart;
+    }
+  }
+  return 0;
 }
 
 /**
- * Fetch models from OpenAI using models.dev API for accurate context windows and pricing
+ * Compare two records by `releaseDate` (desc), then by version-parts in id
+ * (desc), then by id (asc). Records without a `releaseDate` sort BEFORE
+ * dated records — they default to epoch 0. Used by every list/picker that
+ * shows models so the newest is always at the top.
+ *
+ * Exported so cli.ts can apply the same ordering to ModelDoc-shaped lists
+ * (`--models`, `--models-top`, etc.) without duplicating the logic.
  */
-async function fetchOpenAIModels(): Promise<ModelInfo[]> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return [];
+export function compareByReleaseDateDesc(
+  a: { releaseDate?: string; id?: string; modelId?: string },
+  b: { releaseDate?: string; id?: string; modelId?: string }
+): number {
+  const aReleaseRaw = a.releaseDate ? Date.parse(a.releaseDate) : 0;
+  const bReleaseRaw = b.releaseDate ? Date.parse(b.releaseDate) : 0;
+  const aRelease = Number.isNaN(aReleaseRaw) ? 0 : aReleaseRaw;
+  const bRelease = Number.isNaN(bReleaseRaw) ? 0 : bReleaseRaw;
+  if (aRelease !== bRelease) {
+    return bRelease - aRelease;
   }
 
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const openaiData = data.openai;
-    if (!openaiData?.models) return [];
-
-    // Filter for chat models (GPT, o1, o3, chatgpt)
-    return Object.entries(openaiData.models)
-      .filter(([id, _]: [string, any]) => {
-        const lowerId = id.toLowerCase();
-        return (
-          lowerId.startsWith("gpt-") ||
-          lowerId.startsWith("o1-") ||
-          lowerId.startsWith("o3-") ||
-          lowerId.startsWith("o4-") ||
-          lowerId.startsWith("chatgpt-")
-        );
-      })
-      .map(([id, m]: [string, any]) => {
-        // Calculate average price from input/output costs
-        const inputCost = m.cost?.input || 2;
-        const outputCost = m.cost?.output || 8;
-        const avgCost = (inputCost + outputCost) / 2;
-
-        // Get context window from models.dev data
-        const contextLength = m.limit?.context || 128000;
-        const contextStr =
-          contextLength >= 1000000
-            ? `${Math.round(contextLength / 1000000)}M`
-            : `${Math.round(contextLength / 1000)}K`;
-
-        // Check vision support from modalities
-        const inputModalities = m.modalities?.input || [];
-        const supportsVision =
-          inputModalities.includes("image") || inputModalities.includes("video");
-
-        return {
-          id: `oai@${id}`,
-          name: m.name || id,
-          description: `OpenAI model`,
-          provider: "OpenAI",
-          pricing: {
-            input: `$${inputCost.toFixed(2)}`,
-            output: `$${outputCost.toFixed(2)}`,
-            average: `$${avgCost.toFixed(2)}/1M`,
-          },
-          context: contextStr,
-          contextLength,
-          supportsTools: m.tool_call === true,
-          supportsReasoning: m.reasoning === true,
-          supportsVision,
-          isFree: false,
-          source: "OpenAI" as const,
-        };
-      });
-  } catch {
-    return [];
+  const aId = a.id ?? a.modelId ?? "";
+  const bId = b.id ?? b.modelId ?? "";
+  const versionCompare = compareVersionPartsDesc(
+    extractVersionParts(aId),
+    extractVersionParts(bId)
+  );
+  if (versionCompare !== 0) {
+    return versionCompare;
   }
+  return aId.localeCompare(bId);
+}
+
+function sortModelsNewestFirst(models: ModelInfo[]): ModelInfo[] {
+  return [...models].sort(compareByReleaseDateDesc);
 }
 
 /**
- * Fetch GLM Coding Plan models from models.dev
- */
-async function fetchGLMCodingModels(): Promise<ModelInfo[]> {
-  const apiKey = process.env.GLM_CODING_API_KEY;
-  if (!apiKey) {
-    return [];
-  }
-
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const codingPlan = data["zai-coding-plan"];
-    if (!codingPlan?.models) return [];
-
-    return Object.entries(codingPlan.models)
-      .filter(([_, m]: [string, any]) => m.tool_call === true)
-      .map(([id, m]: [string, any]) => {
-        const inputModalities = m.modalities?.input || [];
-        const supportsVision =
-          inputModalities.includes("image") || inputModalities.includes("video");
-        const contextLength = m.limit?.context || 131072;
-
-        return {
-          id: `gc@${id}`,
-          name: m.name || id,
-          description: `GLM Coding Plan (subscription)`,
-          provider: "GLM Coding",
-          pricing: {
-            input: "SUB",
-            output: "SUB",
-            average: "SUB",
-          },
-          context:
-            contextLength >= 1000000
-              ? `${Math.round(contextLength / 1000000)}M`
-              : `${Math.round(contextLength / 1000)}K`,
-          contextLength,
-          supportsTools: true,
-          supportsReasoning: m.reasoning || false,
-          supportsVision,
-          isFree: false,
-          source: "GLM Coding" as const,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Fetch GLM/Zhipu direct API models from models.dev
- * Uses the zai-coding-plan data (same models, different API endpoint)
- * No API key needed to browse - models.dev is a public catalog
- */
-async function fetchGLMDirectModels(): Promise<ModelInfo[]> {
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const codingPlan = data["zai-coding-plan"];
-    if (!codingPlan?.models) return [];
-
-    return Object.entries(codingPlan.models)
-      .filter(([_, m]: [string, any]) => m.tool_call === true)
-      .map(([id, m]: [string, any]) => {
-        const inputModalities = m.modalities?.input || [];
-        const supportsVision =
-          inputModalities.includes("image") || inputModalities.includes("video");
-        const contextLength = m.limit?.context || 131072;
-        const inputCost = m.cost?.input || 0;
-        const outputCost = m.cost?.output || 0;
-        const isFree = inputCost === 0 && outputCost === 0;
-
-        return {
-          id: `glm@${id}`,
-          name: m.name || id,
-          description: `GLM/Zhipu direct API`,
-          provider: "GLM",
-          pricing: {
-            input: isFree ? "FREE" : `$${inputCost.toFixed(2)}`,
-            output: isFree ? "FREE" : `$${outputCost.toFixed(2)}`,
-            average: isFree ? "FREE" : `$${((inputCost + outputCost) / 2).toFixed(2)}/1M`,
-          },
-          context:
-            contextLength >= 1000000
-              ? `${Math.round(contextLength / 1000000)}M`
-              : `${Math.round(contextLength / 1000)}K`,
-          contextLength,
-          supportsTools: true,
-          supportsReasoning: m.reasoning || false,
-          supportsVision,
-          isFree,
-          source: "GLM" as const,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Fetch OllamaCloud models from models.dev
- * Cloud-hosted models accessible with OLLAMA_API_KEY
- * No API key needed to browse - models.dev is a public catalog
- */
-async function fetchOllamaCloudModels(): Promise<ModelInfo[]> {
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const ollamaCloud = data["ollama-cloud"];
-    if (!ollamaCloud?.models) return [];
-
-    return Object.entries(ollamaCloud.models)
-      .filter(([_, m]: [string, any]) => m.tool_call === true)
-      .map(([id, m]: [string, any]) => {
-        const inputModalities = m.modalities?.input || [];
-        const supportsVision =
-          inputModalities.includes("image") || inputModalities.includes("video");
-        const contextLength = m.limit?.context || 131072;
-
-        return {
-          id: `oc@${id}`,
-          name: m.name || id,
-          description: `OllamaCloud`,
-          provider: "OllamaCloud",
-          pricing: {
-            input: "N/A",
-            output: "N/A",
-            average: "N/A",
-          },
-          context:
-            contextLength >= 1000000
-              ? `${Math.round(contextLength / 1000000)}M`
-              : `${Math.round(contextLength / 1000)}K`,
-          contextLength,
-          supportsTools: true,
-          supportsReasoning: m.reasoning || false,
-          supportsVision,
-          source: "OllamaCloud" as const,
-        };
-      });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Check if cache needs refresh for free models (more frequent updates)
- */
-function shouldRefreshForFreeModels(): boolean {
-  if (!existsSync(ALL_MODELS_JSON_PATH)) {
-    return true;
-  }
-  try {
-    const cacheData = JSON.parse(readFileSync(ALL_MODELS_JSON_PATH, "utf-8"));
-    const lastUpdated = new Date(cacheData.lastUpdated);
-    const now = new Date();
-    const ageInHours = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60);
-    return ageInHours > FREE_MODELS_CACHE_MAX_AGE_HOURS;
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Get free models from OpenRouter API + Zen
- * Uses 3-hour cache refresh for free models since they change frequently
+ * Get free models. Free model discovery used to come from OpenCode Zen
+ * (via models.dev), which has been removed. Free models now live in the
+ * Firebase recommended catalog; this stub returns [] so `selectModel` can
+ * surface the "no free models available" UX when `--free` is used.
  */
 async function getFreeModels(): Promise<ModelInfo[]> {
-  // Fetch OpenRouter models and Zen models in parallel
-  const forceUpdate = shouldRefreshForFreeModels();
-  const [allModels, zenModels] = await Promise.all([
-    fetchAllModels(forceUpdate),
-    fetchZenFreeModels(),
-  ]);
-
-  // Filter OpenRouter for FREE models with :free suffix and TOOL SUPPORT
-  const openRouterFreeModels = allModels.filter((model) => {
-    // Must have :free suffix (these are the actual free tier models)
-    if (!model.id?.endsWith(":free")) return false;
-
-    // Must support tool calling (required by Claude Code)
-    const supportsTools = (model.supported_parameters || []).includes("tools");
-    if (!supportsTools) return false;
-
-    return true;
-  });
-
-  // Sort by context window (largest first)
-  openRouterFreeModels.sort((a, b) => {
-    const contextA = a.context_length || a.top_provider?.context_length || 0;
-    const contextB = b.context_length || b.top_provider?.context_length || 0;
-    return contextB - contextA;
-  });
-
-  // Convert to ModelInfo (adds openrouter@ prefix for explicit routing)
-  const openRouterModels = openRouterFreeModels.slice(0, 20).map(toModelInfo);
-
-  // Combine: Zen models first (most reliable), then OpenRouter
-  const combined = [...zenModels, ...openRouterModels];
-
-  // Sort: Zen first, then by context window
-  combined.sort((a, b) => {
-    if (a.source === "Zen" && b.source !== "Zen") return -1;
-    if (a.source !== "Zen" && b.source === "Zen") return 1;
-    return (b.contextLength || 0) - (a.contextLength || 0);
-  });
-
-  return combined;
-}
-
-/**
- * Get all models for search
- * Fetches from all available providers in parallel
- */
-async function getAllModelsForSearch(forceUpdate = false): Promise<ModelInfo[]> {
-  // Check for LiteLLM configuration
-  const litellmBaseUrl = process.env.LITELLM_BASE_URL;
-  const litellmApiKey = process.env.LITELLM_API_KEY;
-
-  // Build named fetch entries — each entry maps to a ProviderDefinition by name.
-  // Only fetch from providers that are available (have API keys / credentials configured).
-  // OpenRouter is always fetched (it's the fallback aggregator).
-  const allEntries: Array<{
-    name: string;
-    provider?: string; // ProviderDefinition.name — if set, availability is checked
-    promise: () => Promise<ModelInfo[]>;
-  }> = [
-    {
-      name: "OpenRouter",
-      promise: () => fetchAllModels(forceUpdate).then((models) => models.map(toModelInfo)),
-    },
-    { name: "xAI", provider: "xai", promise: () => fetchXAIModels() },
-    { name: "Gemini", provider: "google", promise: () => fetchGeminiModels() },
-    { name: "OpenAI", provider: "openai", promise: () => fetchOpenAIModels() },
-    { name: "GLM", provider: "glm", promise: () => fetchGLMDirectModels() },
-    { name: "GLM Coding", provider: "glm-coding", promise: () => fetchGLMCodingModels() },
-    { name: "OllamaCloud", provider: "ollamacloud", promise: () => fetchOllamaCloudModels() },
-    { name: "Zen", provider: "opencode-zen", promise: () => fetchZenFreeModels() },
-    { name: "Zen Go", provider: "opencode-zen-go", promise: () => fetchZenGoModels() },
-    // Subscription/direct-API providers without catalog APIs — use known models
-    { name: "MiniMax", provider: "minimax", promise: () => Promise.resolve(getKnownModels("minimax")) },
-    { name: "MiniMax Coding", provider: "minimax-coding", promise: () => Promise.resolve(getKnownModels("minimax-coding")) },
-    { name: "Kimi", provider: "kimi", promise: () => Promise.resolve(getKnownModels("kimi")) },
-    { name: "Kimi Coding", provider: "kimi-coding", promise: () => Promise.resolve(getKnownModels("kimi-coding")) },
-    { name: "Z.AI", provider: "zai", promise: () => Promise.resolve(getKnownModels("zai")) },
-  ];
-
-  if (litellmBaseUrl && litellmApiKey) {
-    allEntries.push({
-      name: "LiteLLM",
-      provider: "litellm",
-      promise: () => fetchLiteLLMModels(litellmBaseUrl, litellmApiKey, forceUpdate),
-    });
-  }
-
-  // Filter to only available providers, then launch fetches in parallel
-  const fetchEntries = allEntries
-    .filter((e) => {
-      if (!e.provider) return true; // No provider mapping — let the fetcher decide
-      const def = getProviderByName(e.provider);
-      return def ? isProviderAvailable(def) : true;
-    })
-    .map((e) => ({ name: e.name, promise: e.promise() }));
-
-  // Use allSettled so one failing provider can't break the whole list
-  const settled = await Promise.allSettled(fetchEntries.map((e) => e.promise));
-
-  const fetchResults: Record<string, ModelInfo[]> = {};
-  for (let i = 0; i < settled.length; i++) {
-    const result = settled[i];
-    fetchResults[fetchEntries[i].name] = result.status === "fulfilled" ? result.value : [];
-  }
-
-  // Helper: get results for a provider (empty array if filtered out or failed)
-  const r = (name: string) => fetchResults[name] || [];
-
-  // Combine results: Zen first (free), then OllamaCloud, then direct providers,
-  // then subscription providers, then LiteLLM, then OpenRouter
-  const allModels = [
-    ...r("Zen"),
-    ...r("Zen Go"),
-    ...r("OllamaCloud"),
-    ...r("xAI"),
-    ...r("Gemini"),
-    ...r("OpenAI"),
-    ...r("GLM"),
-    ...r("GLM Coding"),
-    ...r("MiniMax"),
-    ...r("MiniMax Coding"),
-    ...r("Kimi"),
-    ...r("Kimi Coding"),
-    ...r("Z.AI"),
-    ...r("LiteLLM"),
-    ...r("OpenRouter"),
-  ];
-
-  return allModels;
+  return [];
 }
 
 /**
@@ -940,8 +394,11 @@ function formatModelChoice(model: ModelInfo, showSource = false): string {
   const capsStr = caps ? ` [${caps}]` : "";
   const priceStr = model.pricing?.average || "N/A";
   const ctxStr = model.context || "N/A";
+  // Show release date as a short year-month suffix when present so the
+  // newest-first sort is visible to the user. Slim catalog dates are
+  // ISO date strings (`2026-05-07`); take just the YYYY-MM prefix.
+  const dateStr = model.releaseDate ? `, ${model.releaseDate.slice(0, 7)}` : "";
 
-  // Show source for free models list (OpenRouter vs Zen)
   if (showSource && model.source) {
     const sourceTagMap: Record<string, string> = {
       Zen: "Zen",
@@ -949,6 +406,7 @@ function formatModelChoice(model: ModelInfo, showSource = false): string {
       xAI: "xAI",
       Gemini: "Gem",
       OpenAI: "OAI",
+      "OpenAI Codex": "CX",
       GLM: "GLM",
       "GLM Coding": "GC",
       MiniMax: "MM",
@@ -960,57 +418,83 @@ function formatModelChoice(model: ModelInfo, showSource = false): string {
       LiteLLM: "LL",
     };
     const sourceTag = sourceTagMap[model.source] || model.source;
-    return `${sourceTag} ${model.id} (${priceStr}, ${ctxStr}${capsStr})`;
+    return `${sourceTag} ${model.id} (${priceStr}, ${ctxStr}${capsStr}${dateStr})`;
   }
 
-  return `${model.id} (${model.provider}, ${priceStr}, ${ctxStr}${capsStr})`;
+  return `${model.id} (${model.provider}, ${priceStr}, ${ctxStr}${capsStr}${dateStr})`;
 }
 
 /**
- * Provider filter aliases for @prefix search syntax
- * Maps user-typed aliases to the ModelInfo.source value
+ * Format a per-provider picker row as the EXACT callable spec for the selected
+ * provider, e.g. `zen@gpt-5` or `or@openai/gpt-5`. The spec shown is precisely
+ * what the user could type as `--model`, using the provider's own externalId
+ * (vendor-prefixed where that provider requires it).
+ */
+function formatModelChoiceAsSpec(model: ModelInfo, spec: string, priceStr: string): string {
+  const caps = [
+    model.supportsTools ? "T" : "",
+    model.supportsReasoning ? "R" : "",
+    model.supportsVision ? "V" : "",
+  ]
+    .filter(Boolean)
+    .join("");
+  const capsStr = caps ? ` [${caps}]` : "";
+  const ctxStr = model.context || "N/A";
+  const dateStr = model.releaseDate ? `, ${model.releaseDate.slice(0, 7)}` : "";
+  return `${spec} (${priceStr}, ${ctxStr}${capsStr}${dateStr})`;
+}
+
+/**
+ * Provider filter aliases for @prefix search syntax.
+ * These map to actual configured runtime providers, not Firebase model vendors.
  */
 const PROVIDER_FILTER_ALIASES: Record<string, string> = {
-  // Full names
-  zen: "Zen",
-  openrouter: "OpenRouter",
-  or: "OpenRouter",
-  xai: "xAI",
-  gemini: "Gemini",
-  gem: "Gemini",
-  google: "Gemini",
-  openai: "OpenAI",
-  oai: "OpenAI",
-  glm: "GLM",
-  "glm-coding": "GLM Coding",
-  gc: "GLM Coding",
-  minimax: "MiniMax",
-  mm: "MiniMax",
-  mmc: "MiniMax Coding",
-  "minimax-coding": "MiniMax Coding",
-  kimi: "Kimi",
-  moon: "Kimi",
-  moonshot: "Kimi",
-  kc: "Kimi Coding",
-  "kimi-coding": "Kimi Coding",
-  zai: "Z.AI",
-  ollamacloud: "OllamaCloud",
-  oc: "OllamaCloud",
-  litellm: "LiteLLM",
-  ll: "LiteLLM",
+  openrouter: "openrouter",
+  or: "openrouter",
+  google: "google",
+  gemini: "google",
+  gem: "google",
+  openai: "openai",
+  oai: "openai",
+  codex: "openai-codex",
+  cx: "openai-codex",
+  "x-ai": "x-ai",
+  xai: "x-ai",
+  grok: "x-ai",
+  minimax: "minimax",
+  mm: "minimax",
+  "minimax-coding": "minimax-coding",
+  mmc: "minimax-coding",
+  kimi: "kimi",
+  moon: "kimi",
+  moonshot: "kimi",
+  "kimi-coding": "kimi-coding",
+  kc: "kimi-coding",
+  glm: "glm",
+  "glm-coding": "glm-coding",
+  gc: "glm-coding",
+  "z-ai": "z-ai",
+  zai: "z-ai",
+  zen: "zen",
+  ollamacloud: "ollamacloud",
+  oc: "ollamacloud",
+  litellm: "litellm",
+  ll: "litellm",
+  deepseek: "deepseek",
+  sakana: "sakana",
+  fugu: "sakana",
+  "sakana-subscription": "sakana-subscription",
+  sc: "sakana-subscription",
 };
 
 /**
  * Parse search term for @provider filter prefix
  * Returns { provider: source string or null, searchTerm: remaining text }
- *
- * Examples:
- *   "@xai"        → { provider: "xAI", searchTerm: "" }
- *   "@xai grok"   → { provider: "xAI", searchTerm: "grok" }
- *   "@ll gemini"  → { provider: "LiteLLM", searchTerm: "gemini" }
- *   "grok"        → { provider: null, searchTerm: "grok" }
  */
-function parseProviderFilter(term: string): { provider: string | null; searchTerm: string } {
+function parseProviderFilter(
+  term: string,
+  providers: PickerProvider[] = []
+): { provider: string | null; searchTerm: string } {
   if (!term.startsWith("@")) {
     return { provider: null, searchTerm: term };
   }
@@ -1033,7 +517,15 @@ function parseProviderFilter(term: string): { provider: string | null; searchTer
     return { provider: source, searchTerm: rest };
   }
 
-  // Partial match: find aliases that start with the typed prefix
+  const exactMatch = providers.find(
+    (provider) =>
+      provider.slug === prefix.toLowerCase() ||
+      provider.label.toLowerCase() === prefix.toLowerCase()
+  );
+  if (exactMatch) {
+    return { provider: exactMatch.slug, searchTerm: rest };
+  }
+
   const partialMatch = Object.entries(PROVIDER_FILTER_ALIASES).find(([alias]) =>
     alias.startsWith(prefix.toLowerCase())
   );
@@ -1041,42 +533,16 @@ function parseProviderFilter(term: string): { provider: string | null; searchTer
     return { provider: partialMatch[1], searchTerm: rest };
   }
 
-  // No match — treat the whole thing as a regular search term
-  return { provider: null, searchTerm: term };
-}
-
-/**
- * Fuzzy match score
- */
-function fuzzyMatch(text: string, query: string): number {
-  const lowerText = text.toLowerCase();
-  const lowerQuery = query.toLowerCase();
-
-  // Exact match
-  if (lowerText === lowerQuery) return 1;
-
-  // Contains match
-  if (lowerText.includes(lowerQuery)) return 0.8;
-
-  // Separator-normalized match: treat spaces, hyphens, dots, underscores as equivalent
-  // This lets "glm 5" match "glm-5", "gpt4o" match "gpt-4o", etc.
-  const normSep = (s: string) => s.replace(/[\s\-_.]/g, "");
-  const tn = normSep(lowerText);
-  const qn = normSep(lowerQuery);
-  if (tn === qn) return 0.95;
-  if (tn.includes(qn)) return 0.75;
-
-  // Fuzzy character match
-  let queryIdx = 0;
-  let score = 0;
-  for (let i = 0; i < lowerText.length && queryIdx < lowerQuery.length; i++) {
-    if (lowerText[i] === lowerQuery[queryIdx]) {
-      score++;
-      queryIdx++;
-    }
+  const partialProvider = providers.find(
+    (provider) =>
+      provider.slug.startsWith(prefix.toLowerCase()) ||
+      provider.label.toLowerCase().startsWith(prefix.toLowerCase())
+  );
+  if (partialProvider) {
+    return { provider: partialProvider.slug, searchTerm: rest };
   }
 
-  return queryIdx === lowerQuery.length ? (score / lowerQuery.length) * 0.6 : 0;
+  return { provider: null, searchTerm: term };
 }
 
 export interface ModelSelectorOptions {
@@ -1087,12 +553,45 @@ export interface ModelSelectorOptions {
 }
 
 /**
+ * Resolve the picker's model list for a given provider/search-term combination.
+ * Pulled out of `selectModel` to keep that function below the cognitive-complexity
+ * limit; the three branches map directly to the picker's three flows.
+ */
+async function fetchPickerModels(
+  providerSlug: string | null,
+  searchTerm: string,
+  defaultModels: ModelInfo[],
+  catalog: CatalogClient
+): Promise<ModelInfo[]> {
+  if (providerSlug) {
+    const firebaseSlug = pickerProviderToFirebaseSlug[providerSlug];
+    if (!firebaseSlug) return [];
+    const vendorModels = await catalog.modelsByVendor(firebaseSlug);
+    const infos = sortModelsNewestFirst(dedupeModels(vendorModels.map(catalogModelToModelInfo)));
+    if (!searchTerm) return infos;
+    const needle = searchTerm.toLowerCase();
+    return infos.filter((m) => m.id.toLowerCase().includes(needle));
+  }
+
+  if (searchTerm) {
+    const found = await catalog.searchModels(searchTerm, 100);
+    return sortModelsNewestFirst(dedupeModels(found.map(catalogModelToModelInfo)));
+  }
+
+  return defaultModels;
+}
+
+/**
  * Select a model interactively with fuzzy search
  */
 export async function selectModel(options: ModelSelectorOptions = {}): Promise<string> {
   const { freeOnly = false, recommended = true, message, forceUpdate = false } = options;
+  const catalog = createCatalogClient();
 
   let models: ModelInfo[];
+  let recommendedModels: ModelInfo[] = [];
+  let pickerProviders: PickerProvider[] = [];
+  const remoteQueryCache = new Map<string, Promise<ModelInfo[]>>();
 
   if (freeOnly) {
     models = await getFreeModels();
@@ -1100,137 +599,132 @@ export async function selectModel(options: ModelSelectorOptions = {}): Promise<s
       throw new Error("No free models available");
     }
   } else {
-    // Fetch all models from all providers (Zen, xAI, Gemini, OpenAI, OpenRouter)
-    const [allModels, recommendedModels] = await Promise.all([
-      getAllModelsForSearch(forceUpdate),
-      Promise.resolve(recommended ? loadRecommendedModels() : []),
+    const [top100Result, recommendedResult] = await Promise.allSettled([
+      getTop100Models(),
+      recommended ? loadRecommendedModels(forceUpdate) : Promise.resolve([]),
     ]);
 
-    // Build prioritized list: Zen (free) -> Recommended -> All others
-    const seenIds = new Set<string>();
-    models = [];
+    const topModels =
+      top100Result.status === "fulfilled"
+        ? sortModelsNewestFirst(dedupeModels(top100Result.value.models.map(modelDocToModelInfo)))
+        : [];
+    recommendedModels = recommendedResult.status === "fulfilled" ? recommendedResult.value : [];
 
-    // 1. Add Zen models first (they're free)
-    for (const m of allModels.filter((m) => m.source === "Zen")) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        models.push(m);
-      }
-    }
+    models = topModels.length > 0 ? topModels : recommendedModels;
 
-    // 2. Add recommended models
-    for (const m of recommendedModels) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        models.push(m);
-      }
-    }
-
-    // 3. Add direct API models (xAI, Gemini, OpenAI, LiteLLM) - user has keys for these
-    for (const m of allModels.filter(
-      (m) => m.source && m.source !== "Zen" && m.source !== "OpenRouter"
-    )) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        models.push(m);
-      }
-    }
-
-    // 4. Add remaining OpenRouter models
-    for (const m of allModels.filter((m) => m.source === "OpenRouter")) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        models.push(m);
-      }
-    }
+    pickerProviders = toPickerProviders(await getInteractiveProviderChoices());
   }
 
-  // Build provider filter choices from actually loaded models
-  const providerCounts = new Map<string, number>();
-  for (const m of models) {
-    if (m.source) {
-      providerCounts.set(m.source, (providerCounts.get(m.source) || 0) + 1);
+  const loadRemoteModels = async (
+    providerSlug: string | null,
+    searchTerm: string
+  ): Promise<ModelInfo[]> => {
+    const cacheKey = `${providerSlug || "__all__"}::${searchTerm}`;
+    const cached = remoteQueryCache.get(cacheKey);
+    if (cached) {
+      return cached;
     }
-  }
 
-  // Provider selection step (skip if freeOnly or custom message — those are special flows)
-  let filteredModels = models;
-  if (!freeOnly && !message && providerCounts.size > 1) {
-    const providerChoices = [
-      { name: `All providers (${models.length} models)`, value: "__all__" },
-      ...Array.from(providerCounts.entries())
-        .sort((a, b) => b[1] - a[1]) // Sort by model count descending
-        .map(([source, count]) => ({
-          name: `${source} (${count})`,
-          value: source,
-        })),
-    ];
+    const request = (async () => {
+      if (freeOnly) return [];
+      try {
+        return await fetchPickerModels(providerSlug, searchTerm, models, catalog);
+      } catch {
+        return [];
+      }
+    })();
 
-    const selectedProvider = await select({
-      message: "Filter by provider:",
-      choices: providerChoices,
-    });
+    remoteQueryCache.set(cacheKey, request);
+    return request;
+  };
 
-    if (selectedProvider !== "__all__") {
-      filteredModels = models.filter((m) => m.source === selectedProvider);
+  const ac = new AbortController();
+  const onData = (data: Buffer) => {
+    if (data.length === 1 && data[0] === 0x1b) ac.abort();
+  };
+  process.stdin.on("data", onData);
+  const cleanupKeypress = () => process.stdin.removeListener("data", onData);
+
+  try {
+    if (!freeOnly && !message && pickerProviders.length > 1) {
+      const interactiveProviderChoices = await getInteractiveProviderChoices();
+      const providerChoices = [
+        {
+          name: "All providers",
+          value: "__all__",
+          description: "Search across all configured providers",
+        },
+        ...interactiveProviderChoices,
+      ];
+
+      const selectedProvider = await select(
+        {
+          message: "Select provider:",
+          choices: providerChoices,
+        },
+        { signal: ac.signal }
+      );
+
+      if (selectedProvider === "custom") {
+        const customModel = await input({
+          message: "Enter model (e.g., provider@model):",
+          validate: (v) => (v.trim() ? true : "Model cannot be empty"),
+        });
+        return customModel.trim();
+      }
+
+      if (selectedProvider !== "__all__") {
+        return await selectModelFromProvider(
+          selectedProvider,
+          "interactive session",
+          recommendedModels,
+          forceUpdate,
+          catalog
+        );
+      }
     }
+
+    const promptMessage =
+      message || (freeOnly ? "Select a FREE model:" : "Select a model (live search):");
+
+    const selected = await search<string>(
+      {
+        message: promptMessage,
+        pageSize: 20,
+        source: async (term) => {
+          const normalizedTerm = term?.trim() || "";
+          const { provider: filterProvider, searchTerm } = parseProviderFilter(
+            normalizedTerm,
+            pickerProviders
+          );
+          const effectiveProvider = filterProvider;
+          const remoteModels = await loadRemoteModels(effectiveProvider, searchTerm);
+
+          return remoteModels.slice(0, 100).map((model) => ({
+            name: formatModelChoice(model, true),
+            value: effectiveProvider
+              ? buildExplicitModelSpec(effectiveProvider, model.id)
+              : model.id,
+            description: model.description?.slice(0, 160),
+          }));
+        },
+      },
+      { signal: ac.signal }
+    );
+
+    return selected;
+  } catch (err: unknown) {
+    if (
+      ac.signal.aborted ||
+      (err && typeof err === "object" && "name" in err && err.name === "AbortError")
+    ) {
+      console.log("");
+      process.exit(0);
+    }
+    throw err;
+  } finally {
+    cleanupKeypress();
   }
-
-  const promptMessage =
-    message || (freeOnly ? "Select a FREE model:" : "Select a model (type to search):");
-
-  const selected = await search<string>({
-    message: promptMessage,
-    pageSize: 20, // Show more models in the list
-    source: async (term) => {
-      if (!term) {
-        // Show all/top models when no search term (up to 30)
-        return filteredModels.slice(0, 30).map((m) => ({
-          name: formatModelChoice(m, true), // Always show source
-          value: m.id,
-          description: m.description?.slice(0, 80),
-        }));
-      }
-
-      // Also support @provider prefix as power-user shortcut
-      const { provider: filterProvider, searchTerm } = parseProviderFilter(term);
-
-      let pool = filteredModels;
-      if (filterProvider) {
-        pool = models.filter((m) => m.source === filterProvider);
-      }
-
-      if (!searchTerm) {
-        return pool.slice(0, 30).map((m) => ({
-          name: formatModelChoice(m, true),
-          value: m.id,
-          description: m.description?.slice(0, 80),
-        }));
-      }
-
-      // Fuzzy search within the (possibly filtered) pool
-      const results = pool
-        .map((m) => ({
-          model: m,
-          score: Math.max(
-            fuzzyMatch(m.id, searchTerm),
-            fuzzyMatch(m.name, searchTerm),
-            fuzzyMatch(m.provider, searchTerm) * 0.5
-          ),
-        }))
-        .filter((r) => r.score > 0.1)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 30);
-
-      return results.map((r) => ({
-        name: formatModelChoice(r.model, true), // Always show source
-        value: r.model.id,
-        description: r.model.description?.slice(0, 80),
-      }));
-    },
-  });
-
-  return selected;
 }
 
 /**
@@ -1250,21 +744,76 @@ const ALL_PROVIDER_CHOICES: Array<{
     value: "skip",
     description: "Use native Claude model for this tier",
   },
-  { name: "OpenRouter", value: "openrouter", description: "580+ models via unified API", provider: "openrouter" },
-  { name: "OpenCode Zen", value: "zen", description: "Free models, no API key needed", provider: "opencode-zen" },
+  {
+    name: "OpenRouter",
+    value: "openrouter",
+    description: "580+ models via unified API",
+    provider: "openrouter",
+  },
+  {
+    name: "OpenCode Zen",
+    value: "zen",
+    description: "Free models, no API key needed",
+    provider: "opencode-zen",
+  },
   { name: "Google Gemini", value: "google", description: "Direct API", provider: "google" },
   { name: "OpenAI", value: "openai", description: "Direct API", provider: "openai" },
-  { name: "xAI / Grok", value: "xai", description: "Direct API", provider: "xai" },
+  {
+    name: "OpenAI Codex",
+    value: "openai-codex",
+    description: "ChatGPT Plus/Pro subscription (Responses API)",
+    provider: "openai-codex",
+  },
+  { name: "xAI / Grok", value: "x-ai", description: "Direct API", provider: "x-ai" },
+  { name: "DeepSeek", value: "deepseek", description: "Direct API", provider: "deepseek" },
+  { name: "Sakana Fugu", value: "sakana", description: "Direct API", provider: "sakana" },
+  {
+    name: "Sakana Fugu Subscription",
+    value: "sakana-subscription",
+    description: "Subscription plan",
+    provider: "sakana-subscription",
+  },
   { name: "MiniMax", value: "minimax", description: "Direct API", provider: "minimax" },
-  { name: "MiniMax Coding", value: "minimax-coding", description: "Coding subscription", provider: "minimax-coding" },
+  {
+    name: "MiniMax Coding",
+    value: "minimax-coding",
+    description: "Coding subscription",
+    provider: "minimax-coding",
+  },
   { name: "Kimi / Moonshot", value: "kimi", description: "Direct API", provider: "kimi" },
-  { name: "Kimi Coding", value: "kimi-coding", description: "Coding subscription", provider: "kimi-coding" },
+  {
+    name: "Kimi Coding",
+    value: "kimi-coding",
+    description: "Coding subscription",
+    provider: "kimi-coding",
+  },
   { name: "GLM / Zhipu", value: "glm", description: "Direct API", provider: "glm" },
-  { name: "GLM Coding Plan", value: "glm-coding", description: "Coding subscription", provider: "glm-coding" },
-  { name: "Z.AI", value: "zai", description: "Direct API", provider: "zai" },
-  { name: "OllamaCloud", value: "ollamacloud", description: "Cloud models", provider: "ollamacloud" },
-  { name: "Ollama (local)", value: "ollama", description: "Local Ollama instance", provider: "ollama" },
-  { name: "LM Studio (local)", value: "lmstudio", description: "Local LM Studio instance", provider: "lmstudio" },
+  {
+    name: "GLM Coding Plan",
+    value: "glm-coding",
+    description: "Coding subscription",
+    provider: "glm-coding",
+  },
+  { name: "Z.AI", value: "z-ai", description: "Direct API", provider: "z-ai" },
+  {
+    name: "OllamaCloud",
+    value: "ollamacloud",
+    description: "Cloud models",
+    provider: "ollamacloud",
+  },
+  { name: "LiteLLM", value: "litellm", description: "Configured proxy", provider: "litellm" },
+  {
+    name: "Ollama (local)",
+    value: "ollama",
+    description: "Local Ollama instance",
+    provider: "ollama",
+  },
+  {
+    name: "LM Studio (local)",
+    value: "lmstudio",
+    description: "Local LM Studio instance",
+    provider: "lmstudio",
+  },
   {
     name: "Enter custom model",
     value: "custom",
@@ -1274,31 +823,51 @@ const ALL_PROVIDER_CHOICES: Array<{
 
 /**
  * Get provider choices filtered by provider availability.
- * Uses isProviderAvailable() from ProviderDefinition — each provider validates
- * itself (API keys, OAuth credentials, local service, public fallback).
+ *
+ * Availability is resolved ON DEMAND through the credential authority — the
+ * single source of truth. Because the authority resolves env → config →
+ * oauth-file → 1Password (lazy SDK) per provider, op:// glob-backed providers
+ * show up here WITHOUT any pre-hydration step: there is no longer a "before/after
+ * hydration" window that hid them. Resolution is concurrent (each call funnels
+ * through the SDK serialization queue internally).
  */
-function getProviderChoices() {
-  return ALL_PROVIDER_CHOICES.filter((choice) => {
-    if (!choice.provider) return true; // skip, custom — always shown
-    const def = getProviderByName(choice.provider);
-    return def ? isProviderAvailable(def) : true;
-  });
+async function getProviderChoices() {
+  const checks = await Promise.all(
+    ALL_PROVIDER_CHOICES.map(async (choice) => {
+      if (!choice.provider) return true; // skip, custom — always shown
+      // The authority knows every catalog provider; isAvailable resolves the
+      // full env/config/oauth/op:// readiness for that provider name.
+      return credentials.isAvailable(choice.provider);
+    })
+  );
+  return ALL_PROVIDER_CHOICES.filter((_, i) => checks[i]);
 }
 
 /**
- * Model ID prefix for each provider
+ * Model ID prefix for each provider. This is the prefix that gets prepended to
+ * the user-selected model name to produce the final `provider@model` spec
+ * handed back to claudish — a separate concern from the Firebase slug map
+ * above.
  */
 const PROVIDER_MODEL_PREFIX: Record<string, string> = {
   google: "google@",
+  // Gemini Code Assist (OAuth) maps to the google owner catalog, so the picker
+  // renders model rows for it — it needs its own prefix or rows would emit a
+  // bare id that doesn't route to the Code Assist gateway.
+  "gemini-codeassist": "go@",
   openai: "oai@",
-  xai: "xai@",
+  "openai-codex": "cx@",
+  "x-ai": "x-ai@",
+  deepseek: "ds@",
+  sakana: "sakana@",
+  "sakana-subscription": "sc@",
   minimax: "mm@",
   kimi: "kimi@",
   "minimax-coding": "mmc@",
   "kimi-coding": "kc@",
   glm: "glm@",
   "glm-coding": "gc@",
-  zai: "zai@",
+  "z-ai": "z-ai@",
   ollamacloud: "oc@",
   ollama: "ollama@",
   lmstudio: "lmstudio@",
@@ -1306,308 +875,286 @@ const PROVIDER_MODEL_PREFIX: Record<string, string> = {
   openrouter: "openrouter@",
 };
 
-/**
- * Map provider value to ModelInfo source field for filtering fetched models
- */
-const PROVIDER_SOURCE_FILTER: Record<string, string> = {
-  openrouter: "OpenRouter",
-  google: "Gemini",
-  openai: "OpenAI",
-  xai: "xAI",
-  glm: "GLM",
-  "glm-coding": "GLM Coding",
-  minimax: "MiniMax",
-  "minimax-coding": "MiniMax Coding",
-  kimi: "Kimi",
-  "kimi-coding": "Kimi Coding",
-  zai: "Z.AI",
-  ollamacloud: "OllamaCloud",
-  zen: "Zen",
-};
+async function getInteractiveProviderChoices() {
+  return (await getProviderChoices()).filter((choice) => choice.value !== "skip");
+}
 
-/**
- * Well-known models per provider (fallback when API fetch returns no results)
- */
-function getKnownModels(provider: string): ModelInfo[] {
-  const known: Record<
-    string,
-    Array<{ id: string; name: string; context?: string; description?: string }>
-  > = {
-    google: [
-      { id: "google@gemini-2.5-pro", name: "Gemini 2.5 Pro", context: "1M" },
-      { id: "google@gemini-2.5-flash", name: "Gemini 2.5 Flash", context: "1M" },
-      { id: "google@gemini-2.0-flash", name: "Gemini 2.0 Flash", context: "1M" },
-    ],
-    openai: [
-      {
-        id: "oai@gpt-5.3-codex",
-        name: "GPT-5.3 Codex",
-        context: "400K",
-        description: "Latest coding model",
-      },
-      {
-        id: "oai@gpt-5.2-codex",
-        name: "GPT-5.2 Codex",
-        context: "400K",
-        description: "Coding model",
-      },
-      {
-        id: "oai@gpt-5.1-codex-mini",
-        name: "GPT-5.1 Codex Mini",
-        context: "400K",
-        description: "Fast coding model",
-      },
-      { id: "oai@o3", name: "o3", context: "200K", description: "Reasoning model" },
-      { id: "oai@o4-mini", name: "o4-mini", context: "200K", description: "Fast reasoning model" },
-      { id: "oai@gpt-4.1", name: "GPT-4.1", context: "1M", description: "Large context model" },
-    ],
-    xai: [
-      { id: "xai@grok-4", name: "Grok 4", context: "256K" },
-      { id: "xai@grok-4-fast", name: "Grok 4 Fast", context: "2M" },
-      {
-        id: "xai@grok-code-fast-1",
-        name: "Grok Code Fast 1",
-        context: "256K",
-        description: "Optimized for coding",
-      },
-    ],
-    minimax: [
-      {
-        id: "mm@minimax-m2.1",
-        name: "MiniMax M2.1",
-        context: "196K",
-        description: "Lightweight coding model",
-      },
-    ],
-    "minimax-coding": [
-      {
-        id: "mmc@minimax-m2.5",
-        name: "MiniMax M2.5",
-        context: "196K",
-        description: "MiniMax Coding subscription model",
-      },
-      {
-        id: "mmc@minimax-m2.1",
-        name: "MiniMax M2.1",
-        context: "196K",
-        description: "MiniMax Coding subscription model",
-      },
-    ],
-    kimi: [
-      { id: "kimi@kimi-k2-thinking-turbo", name: "Kimi K2 Thinking Turbo", context: "128K" },
-      { id: "kimi@moonshot-v1-128k", name: "Moonshot V1 128K", context: "128K" },
-    ],
-    "kimi-coding": [
-      {
-        id: "kc@kimi-for-coding",
-        name: "Kimi for Coding",
-        context: "128K",
-        description: "Kimi Coding subscription model",
-      },
-    ],
-    glm: [
-      {
-        id: "glm@glm-5",
-        name: "GLM-5",
-        context: "200K",
-        description: "Latest GLM model with reasoning",
-      },
-      {
-        id: "glm@glm-4.7",
-        name: "GLM-4.7",
-        context: "200K",
-        description: "GLM 4.7 with reasoning",
-      },
-      {
-        id: "glm@glm-4.7-flash",
-        name: "GLM-4.7 Flash",
-        context: "200K",
-        description: "Fast GLM 4.7",
-      },
-      { id: "glm@glm-4.6", name: "GLM-4.6", context: "200K" },
-      { id: "glm@glm-4.5-flash", name: "GLM-4.5 Flash", context: "128K" },
-    ],
-    zai: [{ id: "zai@glm-4.7", name: "GLM 4.7 (Z.AI)", context: "128K" }],
-    ollamacloud: [
-      { id: "oc@glm-5", name: "GLM-5", context: "203K", description: "GLM-5 on OllamaCloud" },
-      {
-        id: "oc@deepseek-v3.2",
-        name: "DeepSeek V3.2",
-        context: "164K",
-        description: "DeepSeek V3.2 on OllamaCloud",
-      },
-      {
-        id: "oc@gemini-3-pro-preview",
-        name: "Gemini 3 Pro Preview",
-        context: "1M",
-        description: "Gemini 3 Pro on OllamaCloud",
-      },
-      {
-        id: "oc@kimi-k2.5",
-        name: "Kimi K2.5",
-        context: "262K",
-        description: "Kimi K2.5 on OllamaCloud",
-      },
-      {
-        id: "oc@qwen3-coder-next",
-        name: "Qwen3 Coder Next",
-        context: "262K",
-        description: "Qwen3 Coder on OllamaCloud",
-      },
-      {
-        id: "oc@minimax-m2.1",
-        name: "MiniMax M2.1",
-        context: "205K",
-        description: "MiniMax M2.1 on OllamaCloud",
-      },
-    ],
-  };
-
-  // Map provider key → source tag for display in selector
-  const sourceMap: Record<string, ModelInfo["source"]> = {
-    minimax: "MiniMax",
-    "minimax-coding": "MiniMax Coding",
-    kimi: "Kimi",
-    "kimi-coding": "Kimi Coding",
-    zai: "Z.AI",
-    glm: "GLM",
-    "glm-coding": "GLM Coding",
-    ollamacloud: "OllamaCloud",
-    google: "Gemini",
-    openai: "OpenAI",
-    xai: "xAI",
-  };
-
-  const providerDisplay = provider.charAt(0).toUpperCase() + provider.slice(1);
-  return (known[provider] || []).map((m) => ({
-    id: m.id,
-    name: m.name,
-    description: m.description || `${providerDisplay} model`,
-    provider: providerDisplay,
-    context: m.context,
-    supportsTools: true,
-    source: sourceMap[provider],
+function toPickerProviders(choices: Array<{ name: string; value: string }>): PickerProvider[] {
+  return choices.map((choice) => ({
+    slug: choice.value,
+    label: choice.name,
+    count: 0,
   }));
 }
 
 /**
- * Filter models by provider using source tag or ID prefix
+ * Build the final model spec returned to claudish, e.g. "zen@gpt-5".
+ * Pure function — exported for unit tests.
  */
-function filterModelsByProvider(allModels: ModelInfo[], provider: string): ModelInfo[] {
-  const source = PROVIDER_SOURCE_FILTER[provider];
-  if (source) {
-    return allModels.filter((m) => m.source === source);
-  }
-
+export function buildExplicitModelSpec(provider: string, modelId: string): string {
   const prefix = PROVIDER_MODEL_PREFIX[provider];
-  if (prefix) {
-    return allModels.filter((m) => m.id.startsWith(prefix));
+  if (!prefix) {
+    return modelId;
   }
-
-  return [];
+  return modelId.startsWith(prefix) ? modelId : `${prefix}${modelId}`;
 }
 
 /**
- * Select a model from a specific provider with filterable search
+ * The external/vendor id a model is called by under the SELECTED provider.
+ *
+ * Aggregators carry a per-provider `externalId` in `aggregators[]` — e.g.
+ * gpt-5 is `gpt-5` under OpenAI but `openai/gpt-5` under OpenRouter. We render
+ * each picker row as the exact spec the user could type for the chosen
+ * provider, so we pick the externalId whose `provider` matches the selected
+ * provider's Firebase slug, falling back to the bare model id when there's no
+ * aggregator entry (owner-path providers, or a model that lists no aggregator
+ * for this provider — its bare id is already the callable id).
+ *
+ * Exported for unit tests.
+ */
+export function resolveProviderExternalId(provider: string, model: ModelInfo): string {
+  const match = resolveProviderAggregatorEntry(provider, model);
+  if (match?.externalId) return match.externalId;
+  return model.id;
+}
+
+/**
+ * The aggregators[] entry that serves this model under the SELECTED provider
+ * (matched by the provider's Firebase slug), or undefined when none matches.
+ * Shared by externalId resolution and per-aggregator price resolution.
+ */
+function resolveProviderAggregatorEntry(
+  provider: string,
+  model: ModelInfo
+): AggregatorEntry | undefined {
+  const firebaseSlug = pickerProviderToFirebaseSlug[provider];
+  if (!firebaseSlug || !model.aggregators) return undefined;
+  return model.aggregators.find((a) => a.provider.toLowerCase() === firebaseSlug.toLowerCase());
+}
+
+/**
+ * Display price for a picker row under the SELECTED provider.
+ *
+ * Prefers the TRUE per-aggregator rate (the matched aggregators[] entry's
+ * `pricing`, the gateway's actual rate) over the owner/model-level price — an
+ * aggregator like OpenRouter/OpenCode Zen can charge differently from the model
+ * owner. Falls back to the model-level price (owner providers already carry it)
+ * and finally "N/A". Exported for unit tests.
+ */
+export function resolveProviderDisplayPrice(provider: string, model: ModelInfo): string {
+  const entry = resolveProviderAggregatorEntry(provider, model);
+  const entryPrice = formatAveragePricing(entry?.pricing);
+  if (entryPrice?.average) return entryPrice.average;
+  return model.pricing?.average || "N/A";
+}
+
+/**
+ * Resolve the human-readable provider name used in picker prompt copy.
+ */
+function getPickerDisplayName(providerValue: string): string {
+  const choice = ALL_PROVIDER_CHOICES.find((c) => c.value === providerValue);
+  if (choice) return choice.name;
+  // Fall back to provider-definitions for runtime providers / custom endpoints.
+  return getDisplayName(providerValue);
+}
+
+/**
+ * Load models for a specific picker provider value via the CatalogClient.
+ */
+async function loadModelsForPickerProvider(
+  providerValue: string,
+  catalog: CatalogClient
+): Promise<ModelInfo[]> {
+  const firebaseSlug = pickerProviderToFirebaseSlug[providerValue];
+  if (!firebaseSlug) return [];
+
+  try {
+    const vendorModels = await catalog.modelsByVendor(firebaseSlug);
+    return sortModelsNewestFirst(dedupeModels(vendorModels.map(catalogModelToModelInfo)));
+  } catch {
+    return [];
+  }
+}
+
+async function searchModelsForPickerProvider(
+  providerValue: string,
+  searchTerm: string,
+  catalog: CatalogClient
+): Promise<ModelInfo[]> {
+  const all = await loadModelsForPickerProvider(providerValue, catalog);
+  if (!searchTerm) return all;
+  const needle = searchTerm.toLowerCase();
+  return all.filter((m) => m.id.toLowerCase().includes(needle));
+}
+
+/**
+ * Render a filterable picker over a STATIC in-memory model list (no catalog
+ * client) and return the built model spec. Used for providers whose model list
+ * comes from a local API rather than Firebase (e.g. Ollama's /api/tags).
+ *
+ * Returns `null` when the user picks the "Enter custom model ID" escape hatch,
+ * so the caller can fall through to its free-text prompt.
+ */
+async function pickModelFromList(
+  provider: string,
+  displayName: string,
+  tierName: string,
+  models: ModelInfo[]
+): Promise<string | null> {
+  const CUSTOM_VALUE = "__custom_model__";
+
+  const selected = await search<string>({
+    message:
+      tierName === "interactive session"
+        ? `Select ${displayName} model (type to filter):`
+        : `Select model for ${tierName} (type to filter):`,
+    pageSize: 15,
+    source: async (term) => {
+      const needle = term?.toLowerCase() ?? "";
+      const filtered = needle
+        ? models.filter((m) => m.id.toLowerCase().includes(needle))
+        : models.slice(0, 25);
+
+      const choices = filtered.map((m) => {
+        const externalId = resolveProviderExternalId(provider, m);
+        const spec = buildExplicitModelSpec(provider, externalId);
+        const priceStr = resolveProviderDisplayPrice(provider, m);
+        return {
+          name: formatModelChoiceAsSpec(m, spec, priceStr),
+          value: spec,
+          description: m.description?.slice(0, 80),
+        };
+      });
+
+      choices.push({
+        name: ">> Enter custom model ID",
+        value: CUSTOM_VALUE,
+        description: `Type a custom ${displayName} model name`,
+      });
+
+      return choices;
+    },
+  });
+
+  return selected === CUSTOM_VALUE ? null : selected;
+}
+
+/**
+ * Select a model from a specific provider with filterable search.
+ * Rely on Firebase for model data via CatalogClient — no per-provider branching.
  */
 async function selectModelFromProvider(
   provider: string,
   tierName: string,
-  allModels: ModelInfo[],
-  recommendedModels: ModelInfo[]
+  recommendedModels: ModelInfo[],
+  _forceUpdate: boolean,
+  catalog: CatalogClient
 ): Promise<string> {
-  const LOCAL_INPUT_PROVIDERS = new Set(["ollama", "lmstudio"]);
   const prefix = PROVIDER_MODEL_PREFIX[provider] || `${provider}@`;
+  const displayName = getPickerDisplayName(provider);
 
-  // Local providers: just ask for model name
-  if (LOCAL_INPUT_PROVIDERS.has(provider)) {
+  // Single-model subscription providers (e.g. Kimi Coding) serve exactly one
+  // model. Skip the model prompt entirely and auto-select it — showing the
+  // owner's full multi-model catalog and letting the user pick a model the
+  // endpoint can't serve is both confusing and broken.
+  const def = getProviderByName(provider);
+  if (def?.fixedModel) {
+    return buildExplicitModelSpec(provider, def.fixedModel);
+  }
+
+  // Ollama (local): Firebase has no catalog, but the daemon lists installed
+  // models at /api/tags. Show that list (filterable, with a custom-entry escape
+  // hatch) instead of forcing the user to type a model name from memory. Falls
+  // through to free-text below when the daemon is unreachable or has no models.
+  if (provider === "ollama") {
+    const ollamaModels = await fetchOllamaModels({ enrichCapabilities: false });
+    const chatModels: ModelInfo[] = ollamaModels.map((m) => ({
+      id: m.name, // bare name, e.g. "llama3.2:3b" — prefix added by buildExplicitModelSpec
+      name: m.name,
+      description: m.description,
+      provider: displayName,
+      supportsTools: m.supportsTools,
+      isFree: true,
+      source: displayName,
+    }));
+    if (chatModels.length > 0) {
+      const picked = await pickModelFromList(provider, displayName, tierName, chatModels);
+      if (picked) return picked;
+      // picked === null → user chose the custom-entry hatch; fall through.
+    }
+    // Unreachable daemon / no models / custom entry → free-text below.
+  }
+
+  // Local / user-deployed providers: Firebase has no catalog, free-text only.
+  // No prefix advertising — buildExplicitModelSpec adds it silently.
+  if (isUserDeployedProvider(provider)) {
     const modelName = await input({
-      message: `Enter ${provider} model name for ${tierName}:`,
+      message:
+        tierName === "interactive session"
+          ? `Enter ${displayName} model name:`
+          : `Enter ${displayName} model name for ${tierName}:`,
       validate: (v) => (v.trim() ? true : "Model name cannot be empty"),
     });
     return `${prefix}${modelName.trim()}`;
   }
 
-  // Get fetched models for this provider
-  let providerModels = filterModelsByProvider(allModels, provider);
+  const providerModels = await loadModelsForPickerProvider(provider, catalog);
 
-  // For OpenRouter, prioritize recommended models
-  if (provider === "openrouter") {
-    const seenIds = new Set<string>();
-    const merged: ModelInfo[] = [];
-    for (const m of recommendedModels) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        merged.push(m);
-      }
-    }
-    for (const m of providerModels) {
-      if (!seenIds.has(m.id)) {
-        seenIds.add(m.id);
-        merged.push(m);
-      }
-    }
-    providerModels = merged;
-  }
-
-  // Add known fallback models if not already present
-  const knownModels = getKnownModels(provider);
-  if (knownModels.length > 0) {
-    const seenIds = new Set(providerModels.map((m) => m.id));
-    for (const m of knownModels) {
-      if (!seenIds.has(m.id)) {
-        providerModels.unshift(m);
-      }
-    }
-  }
-
-  // No models at all: fall back to text input
+  // No catalog data: graceful fall-through to text input (e.g. ollamacloud
+  // when Firebase ingest hasn't covered it yet).
   if (providerModels.length === 0) {
     const modelName = await input({
-      message: `Enter ${provider} model name for ${tierName} (prefix ${prefix} will be added):`,
+      message:
+        tierName === "interactive session"
+          ? `Enter ${displayName} model name:`
+          : `Enter ${displayName} model name for ${tierName}:`,
       validate: (v) => (v.trim() ? true : "Model name cannot be empty"),
     });
     return `${prefix}${modelName.trim()}`;
   }
 
-  // Show filterable search with custom entry option
+  // Filterable list with a custom-entry escape hatch.
   const CUSTOM_VALUE = "__custom_model__";
 
   const selected = await search<string>({
-    message: `Select model for ${tierName} (type to filter):`,
+    message:
+      tierName === "interactive session"
+        ? `Select ${displayName} model (type to filter):`
+        : `Select model for ${tierName} (type to filter):`,
     pageSize: 15,
     source: async (term) => {
       let filtered: ModelInfo[];
 
       if (term) {
-        filtered = providerModels
-          .map((m) => ({
-            model: m,
-            score: Math.max(
-              fuzzyMatch(m.id, term),
-              fuzzyMatch(m.name, term),
-              fuzzyMatch(m.provider, term) * 0.5
-            ),
-          }))
-          .filter((r) => r.score > 0.1)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 20)
-          .map((r) => r.model);
+        try {
+          filtered = await searchModelsForPickerProvider(provider, term, catalog);
+        } catch {
+          filtered = [];
+        }
       } else {
         filtered = providerModels.slice(0, 25);
       }
 
-      const choices = filtered.map((m) => ({
-        name: formatModelChoice(m, true),
-        value: m.id,
-        description: m.description?.slice(0, 80),
-      }));
+      const choices = filtered.map((m) => {
+        // Show + return the exact callable spec for the SELECTED provider,
+        // using that provider's own externalId (vendor-prefixed where needed,
+        // e.g. `or@openai/gpt-5`; bare for owner/aggregator providers that
+        // accept bare ids, e.g. `zen@gpt-5`).
+        const externalId = resolveProviderExternalId(provider, m);
+        const spec = buildExplicitModelSpec(provider, externalId);
+        const priceStr = resolveProviderDisplayPrice(provider, m);
+        return {
+          name: formatModelChoiceAsSpec(m, spec, priceStr),
+          value: spec,
+          description: m.description?.slice(0, 80),
+        };
+      });
 
-      // Always add custom option at the end
+      // Always show the custom-entry escape hatch.
       choices.push({
         name: ">> Enter custom model ID",
         value: CUSTOM_VALUE,
-        description: `Type a custom ${provider} model name`,
+        description: `Type a custom ${displayName} model name`,
       });
 
       return choices;
@@ -1616,13 +1163,16 @@ async function selectModelFromProvider(
 
   if (selected === CUSTOM_VALUE) {
     const modelName = await input({
-      message: `Enter model name (will be prefixed with ${prefix}):`,
+      message: `Enter ${displayName} model name:`,
       validate: (v) => (v.trim() ? true : "Model name cannot be empty"),
     });
     return `${prefix}${modelName.trim()}`;
   }
 
-  return selected;
+  // recommendedModels currently unused at this stage (kept on the public flow
+  // for future "highlight recommended models" UI); avoid an unused warning.
+  void recommendedModels;
+  return buildExplicitModelSpec(provider, selected);
 }
 
 /**
@@ -1636,10 +1186,8 @@ export async function selectModelsForProfile(): Promise<{
   subagent?: string;
 }> {
   console.log("\nLoading available models...");
-  const [fetchedModels, recommendedModels] = await Promise.all([
-    getAllModelsForSearch(),
-    Promise.resolve(loadRecommendedModels()),
-  ]);
+  const catalog = createCatalogClient();
+  const recommendedModels = await loadRecommendedModels();
 
   const tiers = [
     { key: "opus" as const, name: "Opus", description: "Most capable, used for complex reasoning" },
@@ -1659,7 +1207,7 @@ export async function selectModelsForProfile(): Promise<{
     // Step 1: Select provider
     const provider = await select({
       message: `Select provider for ${tier.name} tier (${tier.description}):`,
-      choices: getProviderChoices(),
+      choices: await getProviderChoices(),
       default: lastProvider,
     });
 
@@ -1683,8 +1231,9 @@ export async function selectModelsForProfile(): Promise<{
     result[tier.key] = await selectModelFromProvider(
       provider,
       tier.name,
-      fetchedModels,
-      recommendedModels
+      recommendedModels,
+      false,
+      catalog
     );
   }
 

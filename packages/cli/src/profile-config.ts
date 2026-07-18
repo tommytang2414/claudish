@@ -11,7 +11,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, parse } from "node:path";
 
 // Config directory and file paths
 const CONFIG_DIR = join(homedir(), ".claudish");
@@ -121,10 +121,60 @@ export interface ClaudishProfileConfig {
   apiKeys?: Record<string, string>;
   /** Custom provider endpoints (env var name → URL) */
   endpoints?: Record<string, string>;
+  /**
+   * 1Password imports. Each entry is a glob (`op://.../*` or
+   * `op://.../<section>/<fieldGlob>`) that expands to MANY env vars named by
+   * field label, OR a single `op://vault/item/[section]/field` reference named
+   * by its trailing field label. Resolved at startup (explicit opt-in → a
+   * failure hard-fails). Env vars already set always win.
+   */
+  onepassword?: string[];
+  /**
+   * The 1Password account URL (e.g. `my-team.1password.com`) to use for SDK
+   * DesktopAuth when no OP_SERVICE_ACCOUNT_TOKEN / OP_ACCOUNT is set. Saved by
+   * the interactive multi-account picker, or set manually. Resolves below
+   * OP_ACCOUNT (env) but above auto-detection.
+   */
+  onepasswordAccount?: string;
+  /**
+   * 1Password Environment IDs to load at startup (SDK beta API). Each entry's
+   * variables are hydrated into process.env (overwrite, mirroring `--op-env`).
+   * Persisted form of the `--op-env <id>` flag. Resolved below `--op-env` but
+   * above `onepassword[]` single refs/globs. A failure hard-fails (explicit
+   * opt-in, like all 1Password sources).
+   */
+  onepasswordEnvironments?: string[];
+  /** Built-in local providers explicitly enabled in global config. */
+  localProviders?: string[];
   /** ISO timestamp when user confirmed auto-approve behavior. Absent = never confirmed. */
   autoApproveConfirmedAt?: string;
-  /** Diagnostic output mode: auto (default), pty, tmux, logfile, off */
-  diagMode?: "auto" | "pty" | "tmux" | "logfile" | "off";
+  /** Diagnostic output mode: auto (default), logfile, off */
+  diagMode?: "auto" | "logfile" | "off";
+
+  /**
+   * Always enable claudish's own debug logging (equivalent to passing
+   * `-d` / `--debug-claudish` on every run). Writes a full debug log to
+   * `logs/claudish_*.log` and bumps the log level to `debug`.
+   * Precedence: `-d` / `--no-debug-claudish` flag > CLAUDISH_DEBUG env > this field.
+   */
+  debug?: boolean;
+
+  /**
+   * Default provider for bare model names. One of the builtin names
+   * (openrouter, litellm, openai, anthropic, google) or a key from `customEndpoints`.
+   * Precedence: --default-provider flag > CLAUDISH_DEFAULT_PROVIDER env > this field.
+   * Phase 2 wires this into the routing fallback chain.
+   */
+  defaultProvider?: string;
+
+  /**
+   * Named custom endpoints. Each entry is either a "simple" config
+   * (URL + format + key) or a "complex" config (full provider profile).
+   * NOTE: This is distinct from the legacy `endpoints?: Record<string, string>` field
+   * which is just an env-var → URL map for builtin providers.
+   * Validation of entries happens at the consumption site (Phase 3) via Zod, not here.
+   */
+  customEndpoints?: Record<string, unknown>;
 }
 
 /**
@@ -194,8 +244,29 @@ export function loadConfig(): ClaudishProfileConfig {
     if (config.endpoints !== undefined) {
       merged.endpoints = config.endpoints;
     }
+    if (config.onepassword !== undefined) {
+      merged.onepassword = config.onepassword;
+    }
+    if (config.onepasswordAccount !== undefined) {
+      merged.onepasswordAccount = config.onepasswordAccount;
+    }
+    if (config.onepasswordEnvironments !== undefined) {
+      merged.onepasswordEnvironments = config.onepasswordEnvironments;
+    }
+    if (config.localProviders !== undefined) {
+      merged.localProviders = Array.from(new Set(config.localProviders)).sort();
+    }
     if (config.autoApproveConfirmedAt !== undefined) {
       merged.autoApproveConfirmedAt = config.autoApproveConfirmedAt;
+    }
+    if (config.defaultProvider !== undefined) {
+      merged.defaultProvider = config.defaultProvider;
+    }
+    if (config.debug !== undefined) {
+      merged.debug = config.debug;
+    }
+    if (config.customEndpoints !== undefined) {
+      merged.customEndpoints = config.customEndpoints;
     }
     return merged;
   } catch (error) {
@@ -229,9 +300,39 @@ export function getConfigPath(): string {
 // ─── Local Config ────────────────────────────────────────
 
 /**
- * Get path to local config file (.claudish.json in CWD)
+ * Get path to local config file (.claudish.json).
+ *
+ * Walks up from cwd to find an existing .claudish.json so users can run
+ * `claudish` from any subdirectory of their project. Walk-up stops at:
+ *   - $HOME (don't escape into the user's home dir)
+ *   - The git repo root (presence of `.git`) — bounds project scope
+ *   - The filesystem root
+ *
+ * If no .claudish.json is found in the walk-up chain, returns the path at
+ * cwd so first-time saves create the file at the user's working directory
+ * (preserves prior "create at cwd" semantics for fresh projects).
+ *
+ * Behavior change vs. v7.x: previously cwd-only. This unifies how every
+ * local-config consumer (Profiles, Routing, custom endpoints) discovers
+ * the project file. Documented in app-tsx-split PR.
  */
 export function getLocalConfigPath(): string {
+  const home = homedir();
+  let dir = process.cwd();
+  const root = parse(dir).root;
+
+  while (dir !== root && dir !== home) {
+    const candidate = join(dir, LOCAL_CONFIG_FILENAME);
+    if (existsSync(candidate)) return candidate;
+    if (existsSync(join(dir, ".git"))) {
+      // At git root; if .claudish.json doesn't exist here, stop walking and
+      // return this path so first-time saves create the file at the git root
+      // (the natural project boundary), not at cwd or somewhere above the repo.
+      return candidate;
+    }
+    dir = dirname(dir);
+  }
+  // No project boundary found — fall back to cwd.
   return join(process.cwd(), LOCAL_CONFIG_FILENAME);
 }
 
@@ -267,16 +368,17 @@ export function loadLocalConfig(): ClaudishProfileConfig | null {
     const content = readFileSync(localPath, "utf-8");
     const config = JSON.parse(content) as ClaudishProfileConfig;
 
-    const local: ClaudishProfileConfig = {
+    // Preserve ALL keys present in the file. A read-modify-write cycle
+    // (loadLocalConfig → mutate one field → saveLocalConfig) must never drop
+    // other settings the user has in `.claudish.json` (e.g. onepasswordAccount,
+    // defaultProvider, diagMode). We only backfill the structural fields that
+    // downstream code assumes are always present.
+    return {
+      ...config,
       version: config.version || DEFAULT_CONFIG.version,
-      defaultProfile: config.defaultProfile || "",
-      profiles: config.profiles || {},
+      defaultProfile: config.defaultProfile ?? "",
+      profiles: config.profiles ?? {},
     };
-    // Preserve custom routing rules if present
-    if (config.routing !== undefined) {
-      local.routing = config.routing;
-    }
-    return local;
   } catch (error) {
     console.error(`Warning: Failed to load local config: ${error}`);
     return null;
@@ -284,10 +386,25 @@ export function loadLocalConfig(): ClaudishProfileConfig | null {
 }
 
 /**
- * Save local configuration to .claudish.json in CWD
+ * Save local configuration to .claudish.json. Prunes empty containers so
+ * deleting the last project rule doesn't leave a stub `{"routing": {}}`
+ * file behind. If the entire local config carries no meaningful state
+ * (no profiles, no routing), the file is unlinked instead of written.
  */
 export function saveLocalConfig(config: ClaudishProfileConfig): void {
-  writeFileSync(getLocalConfigPath(), JSON.stringify(config, null, 2), "utf-8");
+  // Drop an EMPTY routing object so the on-disk file stays tidy (an empty
+  // `{"routing": {}}` carries no rules). This is cosmetic, not data loss.
+  const toWrite: ClaudishProfileConfig = { ...config };
+  if (toWrite.routing !== undefined && Object.keys(toWrite.routing).length === 0) {
+    delete toWrite.routing;
+  }
+
+  // Always write what we're given. We deliberately do NOT delete the file when
+  // profiles/routing are empty: `.claudish.json` may legitimately hold other
+  // settings (onepasswordAccount, defaultProvider, diagMode, …). Deleting it on
+  // a profile/routing change would silently wipe those — destructive. Mirror
+  // the global saveConfig(): persist the config as-is.
+  writeFileSync(getLocalConfigPath(), JSON.stringify(toWrite, null, 2), "utf-8");
 }
 
 // ─── Scope-Aware Operations ─────────────────────────────
@@ -362,7 +479,7 @@ export function getProfile(name: string, scope?: ProfileScope): Profile | undefi
 export function getDefaultProfile(scope?: ProfileScope): Profile {
   if (scope === "local") {
     const local = loadLocalConfig();
-    if (local && local.defaultProfile && local.profiles[local.defaultProfile]) {
+    if (local?.defaultProfile && local.profiles[local.defaultProfile]) {
       return local.profiles[local.defaultProfile];
     }
     // Local config exists but no valid default — return empty
@@ -380,7 +497,7 @@ export function getDefaultProfile(scope?: ProfileScope): Profile {
 
   // No scope: local-first resolution
   const local = loadLocalConfig();
-  if (local && local.defaultProfile) {
+  if (local?.defaultProfile) {
     // Resolve the name local-first, then global
     const profile = getProfile(local.defaultProfile);
     if (profile) return profile;
@@ -626,4 +743,43 @@ export function removeEndpoint(name: string): void {
     delete config.endpoints[name];
     saveConfig(config);
   }
+}
+
+// ─── Local Provider Helpers ─────────────────────────────────
+
+/**
+ * Check whether a built-in local provider is explicitly enabled in
+ * ~/.claudish/config.json.
+ */
+export function isLocalProviderEnabled(
+  providerName: string,
+  config: { localProviders?: string[] } = loadConfig()
+): boolean {
+  return (config.localProviders ?? []).includes(providerName);
+}
+
+/**
+ * Enable a built-in local provider in ~/.claudish/config.json.
+ */
+export function enableLocalProvider(providerName: string): void {
+  const config = loadConfig();
+  const providers = new Set(config.localProviders ?? []);
+  providers.add(providerName);
+  config.localProviders = Array.from(providers).sort();
+  saveConfig(config);
+}
+
+/**
+ * Disable a built-in local provider in ~/.claudish/config.json.
+ */
+export function disableLocalProvider(providerName: string): void {
+  const config = loadConfig();
+  const providers = new Set(config.localProviders ?? []);
+  providers.delete(providerName);
+  if (providers.size > 0) {
+    config.localProviders = Array.from(providers).sort();
+  } else {
+    delete config.localProviders;
+  }
+  saveConfig(config);
 }

@@ -11,14 +11,40 @@
  * This format handles Codex models only. All other OpenAI models use OpenAIAPIFormat.
  */
 
-import { BaseAPIFormat, type AdapterResult, matchesModelFamily } from "./base-api-format.js";
+import { log } from "../logger.js";
 import type { StreamFormat } from "../providers/transport/types.js";
+import {
+  type AdapterResult,
+  BaseAPIFormat,
+  type EffortLevel,
+  matchesModelFamily,
+} from "./base-api-format.js";
+import { reasoningForCall } from "./reasoning-cache.js";
+
+/**
+ * Normalize model name for ChatGPT backend API.
+ *
+ * The ChatGPT backend accepts most model names directly. This function only
+ * strips provider prefixes to avoid passing "cx@gpt-5" or "openai/gpt-5" style
+ * names to the API.
+ *
+ * @param modelId - Original model name (e.g., "gpt-4.5", "cx@gpt-4.5", "openai/gpt-5-codex")
+ * @returns Normalized model name for the ChatGPT backend
+ */
+export function normalizeCodexModel(modelId: string | undefined): string {
+  if (!modelId) return "gpt-5.2";
+
+  // Strip provider prefix if present (e.g., "cx@gpt-4.5" → "gpt-4.5", "openai/gpt-5-codex" → "gpt-5-codex")
+  const strippedModel = modelId.includes("@")
+    ? modelId.split("@").pop()!
+    : modelId.includes("/")
+      ? modelId.split("/").pop()!
+      : modelId;
+
+  return strippedModel.trim();
+}
 
 export class CodexAPIFormat extends BaseAPIFormat {
-  constructor(modelId: string) {
-    super(modelId);
-  }
-
   processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
@@ -28,7 +54,16 @@ export class CodexAPIFormat extends BaseAPIFormat {
   }
 
   shouldHandle(modelId: string): boolean {
-    return matchesModelFamily(modelId, "codex");
+    // Two valid Codex naming patterns:
+    //  - prefix:  "codex", "codex-mini", "openai/codex-foo"
+    //  - suffix:  "gpt-5-codex", "gpt-5.2-codex", "openai/gpt-5-codex"
+    // The suffix form is what the openai-codex provider's nativeModelPatterns
+    // matches (/codex$/i), so the format adapter must agree — otherwise the
+    // request gets routed to the Codex /v1/responses endpoint but shaped as
+    // a Chat Completions body, which the server 400s.
+    if (matchesModelFamily(modelId, "codex")) return true;
+    const lower = modelId.toLowerCase();
+    return /(^|\/)[a-z0-9.+-]*-codex$/.test(lower);
   }
 
   getName(): string {
@@ -39,18 +74,38 @@ export class CodexAPIFormat extends BaseAPIFormat {
     return "openai-responses-sse";
   }
 
-  override getContextWindow(): number {
-    // Codex models: use a safe default
-    return 200_000;
-  }
-
   override buildPayload(claudeRequest: any, messages: any[], tools: any[]): any {
     const convertedMessages = this.convertMessagesToResponsesAPI(messages);
+    const replayedReasoning = convertedMessages.filter((i: any) => i.type === "reasoning").length;
+    if (replayedReasoning > 0) {
+      log(`[CodexAPIFormat] replaying ${replayedReasoning} cached reasoning item(s)`);
+    }
+    const normalizedModel = normalizeCodexModel(this.modelId);
+
+    // Strip IDs from message items (stateless mode doesn't support server-side state)
+    const strippedMessages = convertedMessages.map((item: any) => {
+      const { id, ...rest } = item;
+      return rest;
+    });
+
+    // BUG FIX: this used to hardcode reasoning.effort = "medium", ignoring
+    // Claude Code's effort signal entirely. Now read it and clamp per the
+    // Codex (Responses API) model gates; default stays "medium" when absent.
+    const effort = this.resolveCodexEffort(claudeRequest);
 
     const payload: any = {
-      model: this.modelId,
-      input: convertedMessages,
+      model: normalizedModel,
+      input: strippedMessages,
       stream: true,
+      store: false,
+      include: ["reasoning.encrypted_content"],
+      reasoning: {
+        effort,
+        summary: "auto",
+      },
+      text: {
+        verbosity: "medium",
+      },
     };
 
     if (claudeRequest.system) {
@@ -58,7 +113,8 @@ export class CodexAPIFormat extends BaseAPIFormat {
     }
 
     if (claudeRequest.max_tokens) {
-      payload.max_output_tokens = Math.max(16, claudeRequest.max_tokens);
+      // Codex API doesn't support max_tokens - use default
+      // payload.max_tokens = Math.max(16, claudeRequest.max_tokens);
     }
 
     if (tools.length > 0) {
@@ -79,6 +135,66 @@ export class CodexAPIFormat extends BaseAPIFormat {
   }
 
   // ─── Private helpers ───────────────────────────────────────────────
+
+  /**
+   * Resolve Claude Code's effort signal to a Codex Responses-API
+   * `reasoning.effort` value. Codex models accept the OpenAI set
+   * `none | low | medium | high | xhigh` but NOT `minimal` (codex drops it)
+   * and `max` doesn't exist (ceiling is xhigh). `xhigh` is documented only on
+   * gpt-5.1-codex-max. `none` is valid on the gpt-5.1-codex family.
+   *
+   * Default is "medium" when Claude Code sends no effort signal (the historical
+   * Codex default — preserved so behavior is unchanged for non-effort requests).
+   */
+  private resolveCodexEffort(claudeRequest: any): string {
+    const level = this.resolveEffortLevel(claudeRequest);
+    if (!level) return "medium"; // historical default
+
+    const value = this.clampCodexEffort(level);
+    log(`[CodexAPIFormat] reasoning.effort -> ${value} (from ${level}) for ${this.modelId}`);
+    return value;
+  }
+
+  /** gpt-5.1-codex-max (and later codex-max), plus the gpt-5.6 family —
+   *  the models accepting xhigh on the Responses API. */
+  private acceptsXhigh(): boolean {
+    const m = this.modelId.toLowerCase();
+    return /codex.*max/.test(m) || /gpt-5\.6/.test(m);
+  }
+
+  /** gpt-5.6 family — first OpenAI models with a native `max` effort
+   *  (catalog-confirmed: efforts=[max,xhigh,high,medium,low,none]). */
+  private acceptsMax(): boolean {
+    return /gpt-5\.6/.test(this.modelId.toLowerCase());
+  }
+
+  /** gpt-5.1+ codex family and the gpt-5.6 family — accept `none`. */
+  private isCodex51Plus(): boolean {
+    const m = this.modelId.toLowerCase();
+    return /gpt-5\.[1-9].*codex/.test(m) || /gpt-5\.6/.test(m);
+  }
+
+  private clampCodexEffort(level: EffortLevel): string {
+    switch (level) {
+      case "none":
+        // `none` valid on the gpt-5.1-codex family; older codex → low.
+        return this.isCodex51Plus() ? "none" : "low";
+      case "minimal":
+        return "low"; // codex drops `minimal`
+      case "low":
+      case "medium":
+      case "high":
+        return level;
+      case "xhigh":
+        return this.acceptsXhigh() ? "xhigh" : "high";
+      case "max":
+        // gpt-5.6 takes native max; older codex has no max → xhigh/high.
+        if (this.acceptsMax()) return "max";
+        return this.acceptsXhigh() ? "xhigh" : "high";
+      default:
+        return "medium";
+    }
+  }
 
   /**
    * Convert Chat Completions format messages to Responses API format.
@@ -113,6 +229,14 @@ export class CodexAPIFormat extends BaseAPIFormat {
         }
         for (const toolCall of msg.tool_calls) {
           if (toolCall.type === "function") {
+            // Replay the reasoning that produced this call, immediately before
+            // it — OpenAI's guidance is to pass reasoning items back alongside
+            // function outputs so the model continues its chain of thought
+            // instead of re-deriving it (see reasoning-cache.ts for the measured
+            // ~6x reduction in reasoning tokens).
+            const reasoning = reasoningForCall(toolCall.id);
+            if (reasoning?.length) result.push(...reasoning);
+
             result.push({
               type: "function_call",
               call_id: toolCall.id,

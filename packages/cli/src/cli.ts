@@ -1,32 +1,66 @@
-import { ENV } from "./config.js";
-import type { ClaudishConfig } from "./types.js";
-import { loadModelInfo, getAvailableModels, fetchLiteLLMModels } from "./model-loader.js";
 import {
-  readFileSync,
-  writeFileSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
-  copyFileSync,
+  readFileSync,
   readdirSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { fuzzyScore } from "./utils.js";
-import { getModelMapping, loadConfig } from "./profile-config.js";
-import { parseModelSpec } from "./providers/model-parser.js";
-import { getFallbackChain, warmZenModelCache, warmZenGoModelCache } from "./providers/auto-route.js";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { ENV } from "./config.js";
+import { buildLegacyHint, resolveDefaultProvider } from "./default-provider.js";
 import {
+  FIREBASE_SLUG_TO_PROVIDER_NAME,
+  type ModelDoc,
+  type RecommendedModelGroup,
+  collectRoutingPrefixes,
+  computeQuickPicks,
+  getAvailableModels,
+  getModelsByProvider,
+  getProviderList,
+  getRecommendedModels,
+  getTop100Models,
+  groupRecommendedModels,
+  loadModelInfo,
+  normalizePricingDisplay,
+  searchModels,
+} from "./model-loader.js";
+import { compareByReleaseDateDesc } from "./model-selector.js";
+import {
+  type ModelResult as PrintableModelResult,
+  printProbeResults,
+} from "./probe/probe-results-printer.js";
+import type {
+  ProbeAppState,
+  ProbeLinkState,
+  ProbeModelResult,
+  ProbeStepState,
+} from "./probe/probe-tui-app.js";
+import { startProbeTui } from "./probe/probe-tui-runtime.js";
+import {
+  getModelMapping,
+  isLocalProviderEnabled,
+  loadConfig,
+  loadLocalConfig,
+} from "./profile-config.js";
+import { API_KEY_MAP } from "./providers/api-key-map.js";
+import { type KeyProvenance, resolveApiKeyProvenance } from "./providers/api-key-provenance.js";
+import type { FallbackRoute } from "./providers/auto-route.js";
+import { parseModelSpec } from "./providers/model-parser.js";
+import { fetchOllamaModels } from "./providers/ollama-discovery.js";
+import { type ProbeResult, describeProbeState } from "./providers/probe-live.js";
+import { pinProbeModelSpec, probeProviderRoute } from "./providers/probe-runner.js";
+import { BUILTIN_PROVIDERS, getProviderByName } from "./providers/provider-definitions.js";
+import {
+  buildRoutingChain,
   loadRoutingRules,
   matchRoutingRule,
-  buildRoutingChain,
 } from "./providers/routing-rules.js";
-import {
-  resolveApiKeyProvenance,
-  formatProvenanceProbe,
-  type KeyProvenance,
-} from "./providers/api-key-provenance.js";
+import type { ClaudishConfig } from "./types.js";
+import { VERSION } from "./version.js";
 // Re-export from centralized provider-resolver for backwards compatibility
 export {
   resolveModelProvider,
@@ -40,17 +74,8 @@ export {
   type ProviderResolution,
 } from "./providers/provider-resolver.js";
 
-// Read version from package.json (with fallback for compiled binaries)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
-let VERSION = "6.4.5"; // Fallback version for compiled binaries
-try {
-  const packageJson = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf-8"));
-  VERSION = packageJson.version;
-} catch {
-  // Running as compiled binary - use fallback version
-}
 
 /**
  * Get current version
@@ -60,20 +85,24 @@ export function getVersion(): string {
 }
 
 /**
- * Clear all model caches (OpenRouter, LiteLLM, pricing)
- * Called when --force-update flag is used
+ * Clear writable claudish caches (pricing, LiteLLM, recommended models).
+ * Called when --models-refresh flag is used.
+ *
+ * NOTE: We intentionally do NOT delete `all-models.json` — that file is the
+ * OpenRouter catalog resolver's slim-catalog cache, sourced from Firebase.
+ * Deleting it would force a cold re-warm on every --models-refresh call.
  */
 function clearAllModelCaches(): void {
   const cacheDir = join(homedir(), ".claudish");
   if (!existsSync(cacheDir)) return;
 
-  const cachePatterns = ["all-models.json", "pricing-cache.json"];
+  const cachePatterns = ["pricing-cache.json", "recommended-models-cache.json"];
   let cleared = 0;
 
   try {
     const files = readdirSync(cacheDir);
     for (const file of files) {
-      if (cachePatterns.includes(file) || file.startsWith("litellm-models-")) {
+      if (cachePatterns.includes(file)) {
         unlinkSync(join(cacheDir, file));
         cleared++;
       }
@@ -87,10 +116,53 @@ function clearAllModelCaches(): void {
 }
 
 /**
+ * Parse the --advisor flag value.
+ * Format: "model1,model2,model3:collector"
+ *   - Split on last ":" → advisors | collector
+ *   - No ":" → default collector = "haiku"
+ *   - Trailing ":" → no collector (raw concat)
+ *   - Single advisor → no collector (passthrough)
+ */
+export function parseAdvisorFlag(value: string): {
+  models: string[];
+  collector: string | null;
+} {
+  const colonIdx = value.lastIndexOf(":");
+  let advisorPart: string;
+  let collectorPart: string | undefined;
+
+  if (colonIdx >= 0) {
+    advisorPart = value.slice(0, colonIdx);
+    collectorPart = value.slice(colonIdx + 1).trim();
+  } else {
+    advisorPart = value;
+    collectorPart = undefined;
+  }
+
+  const models = advisorPart
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  let collector: string | null;
+  if (models.length <= 1) {
+    collector = null;
+  } else if (collectorPart === undefined) {
+    collector = "haiku";
+  } else if (collectorPart === "") {
+    collector = null;
+  } else {
+    collector = collectorPart;
+  }
+
+  return { models, collector };
+}
+
+/**
  * Parse CLI arguments and environment variables
  */
 export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
-  const config: Partial<ClaudishConfig> = {
+  const config: Partial<ClaudishConfig> & { claudeArgs: string[] } = {
     model: undefined, // Will prompt interactively if not provided
     autoApprove: true, // Auto-approve enabled by default (confirmed on first run)
     dangerous: false,
@@ -144,18 +216,39 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     config.summarizeTools = true;
   }
 
-  // Load diagMode from settings file (lowest priority — env/CLI override)
+  // Load diagMode + debug from settings file (lowest priority — env/CLI override)
   try {
     const fileConfig = loadConfig();
-    if (fileConfig.diagMode && ["auto", "pty", "tmux", "logfile", "off"].includes(fileConfig.diagMode)) {
+    if (fileConfig.diagMode && ["auto", "logfile", "off"].includes(fileConfig.diagMode)) {
       config.diagMode = fileConfig.diagMode;
+    }
+    // `"debug": true` in config.json makes every run behave like `-d`.
+    if (fileConfig.debug === true) {
+      config.debug = true;
     }
   } catch {}
 
   // Check for diagnostic mode env var (overrides settings file)
   const envDiagMode = process.env[ENV.CLAUDISH_DIAG_MODE]?.toLowerCase();
-  if (envDiagMode && ["auto", "pty", "tmux", "logfile", "off"].includes(envDiagMode)) {
+  if (envDiagMode && ["auto", "logfile", "off"].includes(envDiagMode)) {
     config.diagMode = envDiagMode as typeof config.diagMode;
+  }
+
+  // CLAUDISH_DEBUG env var (overrides settings file, still below the CLI flag).
+  // Accepts 1/true to enable, 0/false to force-disable (so a globally-set
+  // config.debug can be turned off for a single run via the environment).
+  const envDebug = process.env[ENV.CLAUDISH_DEBUG]?.toLowerCase();
+  if (envDebug === "1" || envDebug === "true") {
+    config.debug = true;
+  } else if (envDebug === "0" || envDebug === "false") {
+    config.debug = false;
+  }
+
+  // If debug was enabled via config/env (not the CLI flag, which handles this
+  // inline), default the log level to `debug` too — the `-d` flag does the same.
+  // `--log-level` later in the arg loop still overrides this.
+  if (config.debug && config.logLevel === "info") {
+    config.logLevel = "debug";
   }
 
   // Parse command line arguments
@@ -204,12 +297,23 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       config.dangerous = true;
     } else if (arg === "--interactive" || arg === "-i") {
       config.interactive = true;
-    } else if (arg === "--debug" || arg === "-d") {
+    } else if (arg === "--debug-claudish" || arg === "-d") {
       config.debug = true;
-      // Default to debug log level when --debug is enabled (can be overridden by --log-level)
+      // Default to debug log level when --debug-claudish is enabled (can be overridden by --log-level)
       if (config.logLevel === "info") {
         config.logLevel = "debug";
       }
+    } else if (arg === "--no-debug-claudish") {
+      // Escape hatch when debug is globally enabled (config.json / CLAUDISH_DEBUG):
+      // turn the debug file log off for this single run.
+      config.debug = false;
+    } else if (arg === "--log-debug") {
+      // Renamed in v7.13.0. Fail loudly rather than forwarding an unknown flag
+      // to `claude`, which would surface as a confusing error from the child.
+      console.error(
+        "--log-debug was renamed to --debug-claudish (it enables claudish's own debug log, not Claude Code's --debug)."
+      );
+      process.exit(1);
     } else if (arg === "--log-level") {
       const levelArg = args[++i];
       if (!levelArg || !["debug", "info", "minimal"].includes(levelArg)) {
@@ -221,14 +325,42 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       config.quiet = true;
     } else if (arg === "--verbose" || arg === "-v") {
       config.quiet = false;
+      // Also remember it so we can forward --verbose to the child `claude` in
+      // single-shot/print mode. Claude Code hard-errors on
+      // `--print --output-format stream-json` WITHOUT `--verbose`, so a
+      // machine consumer (e.g. madbench) that passes --verbose must have it
+      // reach `claude`, not just claudish. Forwarded post-parse (see below)
+      // once we know whether this is a single-shot session.
+      config._sawVerbose = true;
     } else if (arg === "--json") {
       config.jsonOutput = true;
     } else if (arg === "--monitor") {
+      config.monitor = true;
+    } else if (arg === "--advisor") {
+      const modelsArg = args[++i];
+      if (!modelsArg) {
+        console.error(
+          "--advisor requires a comma-separated list of models (e.g., 'gemini-3-pro,grok-3')"
+        );
+        process.exit(1);
+      }
+      const parsed = parseAdvisorFlag(modelsArg);
+      config.advisorModels = parsed.models;
+      config.advisorCollector = parsed.collector;
       config.monitor = true;
     } else if (arg === "--stdin") {
       config.stdin = true;
     } else if (arg === "--free") {
       config.freeOnly = true;
+    } else if (arg === "--models-refresh") {
+      // Force-refresh model caches. Consumed by the --models-top/--models
+      // branches below AND (after the launcher warm step lands) by
+      // warmCatalogIfNeeded() to bypass the TTL check.
+      config.forceUpdate = true;
+    } else if (arg === "--models-skip-update") {
+      // Skip the launcher catalog warm step entirely. No runtime effect yet —
+      // wired up by a later commit that introduces warmCatalogIfNeeded().
+      config.skipModelsUpdate = true;
     } else if (arg === "--profile") {
       const profileArg = args[++i];
       if (!profileArg) {
@@ -236,17 +368,50 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         process.exit(1);
       }
       config.profile = profileArg;
-    } else if (arg === "--cost-tracker") {
+    } else if (arg === "--default-provider") {
+      const dpArg = args[++i];
+      if (!dpArg) {
+        console.error("--default-provider requires a provider name");
+        process.exit(1);
+      }
+      config.defaultProvider = dpArg;
+    } else if (arg === "--op-env" || arg.startsWith("--op-env=")) {
+      // The actual 1Password Environment read happens early in index.ts
+      // (highest priority). Here we only consume the flag + its value so it
+      // isn't forwarded to Claude Code as a passthrough arg. Both forms
+      // (`--op-env <id>` and `--op-env=<id>`) are accepted, matching index.ts.
+      const v = arg.startsWith("--op-env=") ? arg.slice("--op-env=".length) : args[++i];
+      if (!v) {
+        console.error("--op-env requires a 1Password Environment ID");
+        process.exit(1);
+      }
+      config.opEnv = v;
+    } else if (arg === "--op" || arg.startsWith("--op=")) {
+      // The actual 1Password glob import happens early in index.ts
+      // (applyOpImport), which strips --op from process.argv before parseArgs
+      // runs. This defensive branch only fires if --op somehow reaches parseArgs
+      // (e.g. a future code path that doesn't go through applyOpImport): consume
+      // the flag + its value so it isn't forwarded to Claude Code as a
+      // passthrough arg. Both forms (`--op <glob>` and `--op=<glob>`) accepted,
+      // matching index.ts. NOTE: `--op-env` is handled above and `=== "--op"`
+      // won't match it, so there's no startsWith collision here.
+      const v = arg.startsWith("--op=") ? arg.slice("--op=".length) : args[++i];
+      if (!v) {
+        console.error("--op requires an op:// glob path");
+        process.exit(1);
+      }
+      config.opImport = v;
+    } else if (arg === "--cost-track") {
       // Enable cost tracking for this session
       config.costTracking = true;
       // In monitor mode, we'll track costs instead of proxying
       if (!config.monitor) {
         config.monitor = true; // Switch to monitor mode to track requests
       }
-    } else if (arg === "--audit-costs") {
+    } else if (arg === "--cost-audit") {
       // Special mode to just show cost analysis
       config.auditCosts = true;
-    } else if (arg === "--reset-costs") {
+    } else if (arg === "--cost-reset") {
       // Reset accumulated cost statistics
       config.resetCosts = true;
     } else if (arg === "--version") {
@@ -281,64 +446,130 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
         process.exit(1);
       }
       const hasJsonFlag = args.includes("--json");
-      await probeModelRouting(expandedModels, hasJsonFlag);
+      const noProbeFlag = args.includes("--no-probe");
+      let probeTimeoutMs = 40000;
+      const probeTimeoutIdx = args.indexOf("--probe-timeout");
+      if (probeTimeoutIdx !== -1 && probeTimeoutIdx + 1 < args.length) {
+        const raw = args[probeTimeoutIdx + 1];
+        const parsed = Number.parseInt(raw, 10);
+        if (!Number.isNaN(parsed) && parsed > 0) {
+          probeTimeoutMs = parsed * 1000;
+        }
+      }
+      await probeModelRouting(expandedModels, hasJsonFlag, {
+        live: !noProbeFlag,
+        timeoutMs: probeTimeoutMs,
+      });
       process.exit(0);
-    } else if (arg === "--top-models") {
-      // Show recommended/top models (curated list)
+    } else if (arg === "--models-top") {
+      // Show recommended/top models (curated Firebase catalog)
       const hasJsonFlag = args.includes("--json");
-      const forceUpdate = args.includes("--force-update");
+      // Read from cliConfig (set by the main argv loop). Fall back to args.includes
+      // so behavior is preserved when --models-refresh appears AFTER --models-top in argv.
+      const forceUpdate = config.forceUpdate || args.includes("--models-refresh");
 
       if (forceUpdate) clearAllModelCaches();
 
-      // Auto-update if cache is stale (>2 days) or if --force-update is specified
-      await checkAndUpdateModelsCache(forceUpdate);
-
-      if (hasJsonFlag) {
-        printAvailableModelsJSON();
-      } else {
-        printAvailableModels();
-      }
+      await printRecommendedModels(hasJsonFlag, forceUpdate);
       process.exit(0);
-    } else if (
-      arg === "--models" ||
-      arg === "--list-models" ||
-      arg === "-s" ||
-      arg === "--search"
-    ) {
+    } else if (arg === "--providers") {
+      // List every provider in the Firebase catalog + active-model count.
+      const hasJsonFlag = args.includes("--json");
+      try {
+        const providers = await getProviderList();
+        if (hasJsonFlag) {
+          console.log(JSON.stringify({ providers, total: providers.length }, null, 2));
+        } else {
+          console.log("\nProviders in Firebase catalog:\n");
+          console.log("  Slug                 Active models");
+          console.log(`  ${"─".repeat(40)}`);
+          for (const { slug, count } of providers) {
+            console.log(`  ${slug.padEnd(20)} ${String(count).padStart(5)}`);
+          }
+          console.log("\nUsage:  claudish --models --provider <slug>");
+          console.log("        claudish -s <query>                    (fuzzy search)\n");
+        }
+        process.exit(0);
+      } catch (err) {
+        console.error(
+          `Failed to fetch providers: ${err instanceof Error ? err.message : String(err)}`
+        );
+        process.exit(1);
+      }
+    } else if (arg === "--models" || arg === "-s" || arg === "--models-search") {
       // Check for optional search query (next arg that doesn't start with --)
       const nextArg = args[i + 1];
       const hasQuery = nextArg && !nextArg.startsWith("--");
       const query = hasQuery ? args[++i] : null;
 
       const hasJsonFlag = args.includes("--json");
-      const forceUpdate = args.includes("--force-update");
+      // Read from cliConfig (set by the main argv loop). Fall back to args.includes
+      // so behavior is preserved when --models-refresh appears AFTER --models in argv.
+      const forceUpdate = config.forceUpdate || args.includes("--models-refresh");
+
+      // Pick up --provider <slug> anywhere in the argv. We DON'T consume it
+      // from the loop — it's read-once here and harmless to let the outer
+      // passthrough swallow it later because we exit before that.
+      const providerIdx = args.indexOf("--provider");
+      const providerSlug =
+        providerIdx !== -1 && providerIdx + 1 < args.length ? args[providerIdx + 1] : null;
 
       if (forceUpdate) clearAllModelCaches();
 
+      if (query && providerSlug) {
+        // --provider is a filter for the catalog browser; searches are
+        // already Firebase-scoped and don't take a provider slug.
+        console.error(
+          "Use --provider together with --models (without a query) to filter the catalog."
+        );
+        console.error("For keyword search, drop --provider: claudish -s <query>");
+        process.exit(1);
+      }
+
       if (query) {
-        // Search mode: fuzzy search all models
-        await searchAndPrintModels(query, forceUpdate);
+        // Search mode: on-demand Firebase substring search
+        await searchAndPrintModels(query, hasJsonFlag);
+      } else if (providerSlug) {
+        // Provider filter: Firebase catalog trimmed to one provider
+        await printByProvider(providerSlug, hasJsonFlag);
       } else {
-        // List mode: show all models grouped by provider
-        await printAllModels(hasJsonFlag, forceUpdate);
+        // Default --models = top100 ranked Firebase catalog + local footer
+        await printTop100(hasJsonFlag);
       }
       process.exit(0);
     } else if (arg === "--summarize-tools") {
       // Summarize tool descriptions to reduce prompt size for local models
       config.summarizeTools = true;
-    } else if (arg === "--no-logs") {
+    } else if (arg === "--log-off") {
       // Disable always-on structural logging to ~/.claudish/logs/
       config.noLogs = true;
-    } else if (arg === "--diag-mode" && i + 1 < args.length) {
+    } else if (arg === "--log-diag" && i + 1 < args.length) {
       const mode = args[++i].toLowerCase();
-      if (["auto", "pty", "tmux", "logfile", "off"].includes(mode)) {
+      if (["auto", "logfile", "off"].includes(mode)) {
         config.diagMode = mode as typeof config.diagMode;
       }
+    } else if (arg === "--team" && i + 1 < args.length) {
+      const models = args[++i]
+        .split(",")
+        .map((m) => m.trim())
+        .filter(Boolean);
+      config.team = models;
+    } else if (arg === "--mode" && i + 1 < args.length) {
+      const mode = args[++i].toLowerCase();
+      if (["default", "interactive", "json"].includes(mode)) {
+        config.teamMode = mode as "default" | "interactive" | "json";
+      }
+    } else if (arg === "--keep") {
+      config.teamKeep = true;
+    } else if ((arg === "-f" || arg === "--file") && i + 1 < args.length) {
+      config.inputFile = args[++i];
     } else if (arg === "--") {
       // Explicit separator: everything after -- passes directly to Claude Code.
       // This handles edge cases where a value starts with '-' (e.g. a system prompt
       // that begins with a dash, or a flag value that looks like a flag).
-      config.claudeArgs.push(...args.slice(i + 1));
+      const rest = args.slice(i + 1);
+      config.claudeArgs.push(...rest);
+      if (rest.length > 0) config._hasPositionalPrompt = true;
       break;
     } else if (arg.startsWith("-")) {
       // Unknown flag: pass through to Claude Code with value consumed if present.
@@ -350,6 +581,15 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       //   --system-prompt "text"     → ['--system-prompt', 'text']
       //   --allowedTools Bash,Edit   → ['--allowedTools', 'Bash,Edit']
       config.claudeArgs.push(arg);
+      // A passthrough -p/--print flag means the user wants single-shot/print
+      // mode. Mark it so the interactive default below doesn't flip
+      // interactive=true and launch the picker — which would then forward a
+      // bare `-p` (no prompt) to the child `claude` and crash with
+      // "Input must be provided either through stdin or as a prompt argument
+      // when using --print".
+      if (arg === "-p" || arg === "--print") {
+        config._hasPrintFlag = true;
+      }
       if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
         config.claudeArgs.push(args[++i]);
       }
@@ -358,6 +598,7 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
       // Example: claudish --model grok "hello world"
       //          → claudeArgs = ['hello world']
       config.claudeArgs.push(arg);
+      config._hasPositionalPrompt = true;
     }
 
     i++;
@@ -366,8 +607,27 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
   // Determine if this will be interactive mode BEFORE API key check
   // If no prompt provided and not explicitly interactive, default to interactive mode
   // Exception: --stdin mode reads prompt from stdin, so don't default to interactive
-  if ((!config.claudeArgs || config.claudeArgs.length === 0) && !config.stdin) {
+  // A "prompt" is a positional arg that appears outside of flag-value pairs.
+  // Flags like "--session-id uuid --dangerously-skip-permissions" have no prompt,
+  // so they should be interactive too.
+  if (!config._hasPositionalPrompt && !config.stdin && !config._hasPrintFlag) {
     config.interactive = true;
+  }
+
+  // Forward --verbose to the child `claude` in single-shot mode. claudish
+  // consumes --verbose/-v as its own log-verbosity flag (above), so it never
+  // reaches `claude` on its own. But Claude Code HARD-ERRORS on
+  // `--print --output-format stream-json` unless `--verbose` is also present,
+  // so a machine consumer that passes --verbose expects it to reach `claude`.
+  // Only forward in non-interactive mode (interactive `claude` rejects
+  // --verbose), and dedupe against an explicit passthrough --verbose.
+  if (
+    config._sawVerbose &&
+    !config.interactive &&
+    !config.claudeArgs.includes("--verbose") &&
+    !config.claudeArgs.includes("-v")
+  ) {
+    config.claudeArgs.push("--verbose");
   }
 
   // Handle monitor mode setup
@@ -376,14 +636,14 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     // Uses Claude Code's native authentication (from `claude auth login`)
     //
     // Remove any placeholder API keys so Claude Code uses its stored credentials
-    if (process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY.includes("placeholder")) {
+    if (process.env.ANTHROPIC_API_KEY?.includes("placeholder")) {
       delete process.env.ANTHROPIC_API_KEY;
     }
 
     if (!config.quiet) {
       console.log("[claudish] Monitor mode enabled - proxying to real Anthropic API");
       console.log("[claudish] Using Claude Code's native authentication");
-      console.log("[claudish] Tip: Run with --debug to see request/response details");
+      console.log("[claudish] Tip: Run with --debug-claudish to see request/response details");
     }
   }
 
@@ -429,423 +689,108 @@ export async function parseArgs(args: string[]): Promise<ClaudishConfig> {
     }
   }
 
+  // Phase 1 (LiteLLM-demotion refactor): resolve the effective default provider
+  // and emit a one-shot stderr hint when legacy LITELLM auto-promotion kicks in.
+  // This currently has no routing effect — Phase 2 wires it into auto-route.
+  try {
+    const fileConfigForResolver = loadConfig();
+    const resolved = resolveDefaultProvider({
+      cliFlag: config.defaultProvider,
+      config: fileConfigForResolver,
+      env: process.env,
+    });
+    config.resolvedDefaultProvider = resolved;
+
+    if (resolved.legacyAutoPromoted && !config.quiet) {
+      const markerFile = join(homedir(), ".claudish", ".legacy-litellm-hint-shown");
+      if (!existsSync(markerFile)) {
+        const hint = buildLegacyHint(resolved);
+        if (hint) {
+          console.error(hint);
+        }
+        try {
+          // Touch the marker so we don't show it again. Best-effort — failure is OK.
+          mkdirSync(dirname(markerFile), { recursive: true });
+          writeFileSync(markerFile, new Date().toISOString(), "utf-8");
+        } catch {}
+      }
+    }
+  } catch {}
+
   return config as ClaudishConfig;
 }
 
-/**
- * Cache Management Constants
- */
-const CACHE_MAX_AGE_DAYS = 2;
-// Use ~/.claudish/ for writable cache (binaries can't write to __dirname)
-const CLAUDISH_CACHE_DIR = join(homedir(), ".claudish");
-const BUNDLED_MODELS_PATH = join(__dirname, "../recommended-models.json");
-const CACHED_MODELS_PATH = join(CLAUDISH_CACHE_DIR, "recommended-models.json");
-const ALL_MODELS_JSON_PATH = join(CLAUDISH_CACHE_DIR, "all-models.json");
+/** Format a ModelDoc numeric pricing block for display. */
+function formatModelDocPricing(pricing: ModelDoc["pricing"]): string {
+  if (!pricing) return "N/A";
+  const input = typeof pricing.input === "number" ? pricing.input : undefined;
+  const output = typeof pricing.output === "number" ? pricing.output : undefined;
+  if (input === undefined && output === undefined) return "N/A";
+  if ((input ?? 0) === 0 && (output ?? 0) === 0) return "FREE";
+  const avg = ((input ?? 0) + (output ?? 0)) / 2;
+  return `$${avg.toFixed(2)}/1M`;
+}
 
-/**
- * Fetch locally available Ollama models
- * Returns empty array if Ollama is not running
- */
-async function fetchOllamaModels(): Promise<any[]> {
-  const ollamaHost =
-    process.env.OLLAMA_HOST || process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+/** Format a ModelDoc contextWindow (tokens) for display. */
+function formatModelDocContext(ctx?: number): string {
+  if (!ctx || ctx <= 0) return "N/A";
+  if (ctx >= 1_000_000) return `${Math.round(ctx / 1_000_000)}M`;
+  return `${Math.round(ctx / 1000)}K`;
+}
 
-  try {
-    const response = await fetch(`${ollamaHost}/api/tags`, {
-      signal: AbortSignal.timeout(3000), // 3 second timeout
-    });
-
-    if (!response.ok) return [];
-
-    const data = (await response.json()) as { models?: any[] };
-    const models = data.models || [];
-
-    // Fetch capabilities for each model in parallel
-    const modelsWithCapabilities = await Promise.all(
-      models.map(async (m: any) => {
-        let capabilities: string[] = [];
-        try {
-          const showResponse = await fetch(`${ollamaHost}/api/show`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: m.name }),
-            signal: AbortSignal.timeout(2000),
-          });
-          if (showResponse.ok) {
-            const showData = (await showResponse.json()) as { capabilities?: string[] };
-            capabilities = showData.capabilities || [];
-          }
-        } catch {
-          // Ignore capability fetch errors
-        }
-
-        const supportsTools = capabilities.includes("tools");
-        const isEmbeddingModel =
-          capabilities.includes("embedding") || m.name.toLowerCase().includes("embed");
-        const sizeInfo = m.details?.parameter_size || "unknown size";
-        const toolsIndicator = supportsTools ? "✓ tools" : "✗ no tools";
-
-        return {
-          id: `ollama/${m.name}`,
-          name: m.name,
-          description: `Local Ollama model (${sizeInfo}, ${toolsIndicator})`,
-          provider: "ollama",
-          context_length: null, // Ollama doesn't expose this in /api/tags
-          pricing: { prompt: "0", completion: "0" }, // Free (local)
-          isLocal: true,
-          supportsTools,
-          isEmbeddingModel,
-          capabilities,
-          details: m.details,
-          size: m.size,
-        };
-      })
-    );
-
-    // Filter out embedding models - they can't be used for chat/completion
-    return modelsWithCapabilities.filter((m: any) => !m.isEmbeddingModel);
-  } catch (e) {
-    // Ollama not running or not reachable
-    return [];
-  }
+/** Short capability badges for a ModelDoc. */
+function formatModelDocCaps(caps?: ModelDoc["capabilities"]): string {
+  if (!caps) return "·";
+  const parts: string[] = [];
+  if (caps.tools) parts.push("T");
+  if (caps.thinking) parts.push("R");
+  if (caps.vision) parts.push("V");
+  return parts.length > 0 ? parts.join("") : "·";
 }
 
 /**
- * Search all available models and print results
+ * Search Firebase's model catalog and print results.
+ * No local full-catalog cache — every call hits the network.
  */
-async function searchAndPrintModels(query: string, forceUpdate: boolean): Promise<void> {
-  let models: any[] = [];
-
-  // Check cache for all models
-  if (!forceUpdate && existsSync(ALL_MODELS_JSON_PATH)) {
-    try {
-      const cacheData = JSON.parse(readFileSync(ALL_MODELS_JSON_PATH, "utf-8"));
-      const lastUpdated = new Date(cacheData.lastUpdated);
-      const now = new Date();
-      const ageInDays = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-
-      if (ageInDays <= CACHE_MAX_AGE_DAYS) {
-        models = cacheData.models;
-      }
-    } catch (e) {
-      // Ignore cache error
-    }
+async function searchAndPrintModels(query: string, jsonOutput: boolean): Promise<void> {
+  let results: ModelDoc[];
+  try {
+    console.error(`🔄 Searching Firebase catalog for "${query}"...`);
+    results = await searchModels(query, 50);
+  } catch (error) {
+    console.error(
+      `❌ Failed to reach Firebase model catalog: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    console.error("   Check your network connection.");
+    process.exit(1);
   }
-
-  // Fetch if no cache or stale
-  if (models.length === 0) {
-    console.error("🔄 Fetching all models from OpenRouter (this may take a moment)...");
-    try {
-      const response = await fetch("https://openrouter.ai/api/v1/models");
-      if (!response.ok) throw new Error(`API returned ${response.status}`);
-
-      const data = (await response.json()) as { data: any[] };
-      models = data.data;
-
-      // Cache result - ensure directory exists
-      mkdirSync(CLAUDISH_CACHE_DIR, { recursive: true });
-      writeFileSync(
-        ALL_MODELS_JSON_PATH,
-        JSON.stringify({
-          lastUpdated: new Date().toISOString(),
-          models,
-        }),
-        "utf-8"
-      );
-
-      console.error(`✅ Cached ${models.length} models`);
-    } catch (error) {
-      console.error(`❌ Failed to fetch models: ${error}`);
-      process.exit(1);
-    }
-  }
-
-  // Fetch local Ollama models and add to search
-  const ollamaModels = await fetchOllamaModels();
-  if (ollamaModels.length > 0) {
-    console.error(`🏠 Found ${ollamaModels.length} local Ollama models`);
-    models = [...ollamaModels, ...models];
-  }
-
-  // Fetch OpenAI direct models from models.dev if OPENAI_API_KEY is set
-  if (process.env.OPENAI_API_KEY) {
-    try {
-      const modelsDevResponse = await fetch("https://models.dev/api.json", {
-        signal: AbortSignal.timeout(5000),
-      });
-      if (modelsDevResponse.ok) {
-        const modelsDevData = await modelsDevResponse.json();
-        const openaiData = modelsDevData.openai;
-        if (openaiData?.models) {
-          const openaiModels = Object.entries(openaiData.models)
-            .filter(([id, _]: [string, any]) => {
-              const lowerId = id.toLowerCase();
-              return (
-                lowerId.startsWith("gpt-") ||
-                lowerId.startsWith("o1-") ||
-                lowerId.startsWith("o3-") ||
-                lowerId.startsWith("o4-") ||
-                lowerId.startsWith("chatgpt-")
-              );
-            })
-            .map(([id, m]: [string, any]) => {
-              const inputCost = m.cost?.input || 2;
-              const outputCost = m.cost?.output || 8;
-              const contextLen = m.limit?.context || 128000;
-              const inputModalities = m.modalities?.input || [];
-              return {
-                id: `oai/${id}`,
-                name: m.name || id,
-                description: `OpenAI direct model`,
-                context_length: contextLen,
-                pricing: {
-                  prompt: String(inputCost / 1000000),
-                  completion: String(outputCost / 1000000),
-                },
-                isOAIDirect: true,
-                supportsTools: m.tool_call === true,
-                supportsReasoning: m.reasoning === true,
-                supportsVision:
-                  inputModalities.includes("image") || inputModalities.includes("video"),
-              };
-            });
-          console.error(`🔑 Found ${openaiModels.length} OpenAI direct models`);
-          models = [...openaiModels, ...models];
-        }
-      }
-    } catch {
-      // Ignore models.dev fetch errors
-    }
-  }
-
-  // Fetch GLM Coding Plan models from models.dev if GLM_CODING_API_KEY is set
-  if (process.env.GLM_CODING_API_KEY) {
-    try {
-      const glmCodingModels = await fetchGLMCodingModels();
-      if (glmCodingModels.length > 0) {
-        console.error(`🔑 Found ${glmCodingModels.length} GLM Coding Plan models`);
-        models = [...glmCodingModels, ...models];
-      }
-    } catch {
-      // Ignore fetch errors
-    }
-  }
-
-  // Fetch LiteLLM models if configured
-  if (process.env.LITELLM_BASE_URL && process.env.LITELLM_API_KEY) {
-    try {
-      const litellmModels = await fetchLiteLLMModels(
-        process.env.LITELLM_BASE_URL,
-        process.env.LITELLM_API_KEY,
-        forceUpdate
-      );
-      if (litellmModels.length > 0) {
-        console.error(`🔗 Found ${litellmModels.length} LiteLLM models`);
-        models = [...litellmModels, ...models];
-      }
-    } catch {
-      // Ignore fetch errors
-    }
-  }
-
-  // Perform fuzzy search
-  const results = models
-    .map((model) => {
-      const nameScore = fuzzyScore(model.name || "", query);
-      const idScore = fuzzyScore(model.id || "", query);
-      const descScore = fuzzyScore(model.description || "", query) * 0.5; // Lower weight for description
-
-      return {
-        model,
-        score: Math.max(nameScore, idScore, descScore),
-      };
-    })
-    .filter((item) => item.score > 0.2) // Filter low relevance
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 20); // Top 20 results
 
   if (results.length === 0) {
-    console.log(`No models found matching "${query}"`);
+    if (jsonOutput) {
+      console.log(JSON.stringify({ query, count: 0, models: [] }, null, 2));
+    } else {
+      console.log(`No models found matching "${query}"`);
+    }
     return;
   }
 
-  // ANSI color codes
-  const RED = "\x1b[31m";
-  const GREEN = "\x1b[32m";
-  const RESET = "\x1b[0m";
-  const DIM = "\x1b[2m";
-
-  console.log(`\nFound ${results.length} matching models:\n`);
-  console.log("  Model                          Provider    Pricing     Context  Score");
-  console.log("  " + "─".repeat(80));
-
-  for (const { model, score } of results) {
-    // Format model ID with proper prefix for explicit routing
-    // Local models (ollama/) get ollama@ prefix, OpenRouter models get openrouter@ prefix
-    let fullModelId: string;
-    if (model.isLocal) {
-      // Convert ollama/model-name to ollama@model-name
-      fullModelId = model.id.replace("ollama/", "ollama@");
-    } else if (model.id.startsWith("zen/")) {
-      // Already has zen/ prefix, convert to zen@
-      fullModelId = model.id.replace("zen/", "zen@");
-    } else if (model.id.startsWith("oai/") || model.isOAIDirect) {
-      // OAI direct model - convert oai/model to oai@model
-      fullModelId = model.id.replace("oai/", "oai@");
-    } else if (model.source === "LiteLLM" || model.id.startsWith("litellm@")) {
-      // LiteLLM model - already has litellm@ prefix
-      fullModelId = model.id;
-    } else {
-      // OpenRouter model - add openrouter@ prefix
-      fullModelId = `openrouter@${model.id}`;
-    }
-    const modelId = fullModelId.length > 30 ? fullModelId.substring(0, 27) + "..." : fullModelId;
-    const modelIdPadded = modelId.padEnd(30);
-
-    // Determine provider from original ID
-    const providerName = model.id.split("/")[0];
-    const provider = providerName.length > 10 ? providerName.substring(0, 7) + "..." : providerName;
-    const providerPadded = provider.padEnd(10);
-
-    // Format pricing (handle special cases: local, negative = varies, 0 = free)
-    let pricing: string;
-    if (model.isLocal) {
-      pricing = "LOCAL";
-    } else {
-      const promptPrice = parseFloat(model.pricing?.prompt || "0") * 1000000;
-      const completionPrice = parseFloat(model.pricing?.completion || "0") * 1000000;
-      const avg = (promptPrice + completionPrice) / 2;
-      if (avg < 0) {
-        pricing = "varies"; // Auto-router or dynamic pricing
-      } else if (avg === 0) {
-        pricing = "FREE";
-      } else {
-        pricing = `$${avg.toFixed(2)}/1M`;
-      }
-    }
-    const pricingPadded = pricing.padEnd(10);
-
-    // Context
-    const contextLen = model.context_length || model.top_provider?.context_length || 0;
-    const context = contextLen > 0 ? `${Math.round(contextLen / 1000)}K` : "N/A";
-    const contextPadded = context.padEnd(7);
-
-    // Color code local models based on tool support
-    if (model.isLocal && model.supportsTools === false) {
-      console.log(
-        `  ${RED}${modelIdPadded} ${providerPadded} ${pricingPadded} ${contextPadded} ${(score * 100).toFixed(0)}% ✗ no tools${RESET}`
-      );
-    } else if (model.isLocal && model.supportsTools === true) {
-      console.log(
-        `  ${GREEN}${modelIdPadded}${RESET} ${providerPadded} ${pricingPadded} ${contextPadded} ${(score * 100).toFixed(0)}%`
-      );
-    } else {
-      console.log(
-        `  ${modelIdPadded} ${providerPadded} ${pricingPadded} ${contextPadded} ${(score * 100).toFixed(0)}%`
-      );
-    }
-  }
-  console.log("");
-  console.log(
-    `${DIM}Local models: ${RED}red${RESET}${DIM} = no tool support (incompatible), ${GREEN}green${RESET}${DIM} = compatible${RESET}`
-  );
-  console.log("");
-  console.log("Use OpenRouter model: claudish --model openrouter@<provider/model-id>");
-  console.log("OpenAI direct model:  claudish --model oai@<model-name>");
-  console.log("Local Ollama model:   claudish --model ollama@<model-name>");
-  console.log("OpenCode Zen model:   claudish --model zen@<model-id>");
-  console.log("LiteLLM proxy model:  claudish --model litellm@<model-group>");
-}
-
-/**
- * Print ALL available models from OpenRouter and local Ollama
- */
-async function printAllModels(jsonOutput: boolean, forceUpdate: boolean): Promise<void> {
-  let models: any[] = [];
-
-  // Fetch local Ollama models and OpenCode Zen models in parallel
-  const [ollamaModels, zenModels] = await Promise.all([fetchOllamaModels(), fetchZenModels()]);
-
-  // Check cache for all models
-  if (!forceUpdate && existsSync(ALL_MODELS_JSON_PATH)) {
-    try {
-      const cacheData = JSON.parse(readFileSync(ALL_MODELS_JSON_PATH, "utf-8"));
-      const lastUpdated = new Date(cacheData.lastUpdated);
-      const now = new Date();
-      const ageInDays = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-
-      if (ageInDays <= CACHE_MAX_AGE_DAYS) {
-        models = cacheData.models;
-        if (!jsonOutput) {
-          console.error(
-            `✓ Using cached models (last updated: ${cacheData.lastUpdated.split("T")[0]})`
-          );
-        }
-      }
-    } catch (e) {
-      // Ignore cache error
-    }
-  }
-
-  // Fetch if no cache or stale
-  if (models.length === 0) {
-    console.error("🔄 Fetching all models from OpenRouter...");
-    try {
-      const response = await fetch("https://openrouter.ai/api/v1/models");
-      if (!response.ok) throw new Error(`API returned ${response.status}`);
-
-      const data = (await response.json()) as { data: any[] };
-      models = data.data;
-
-      // Cache result - ensure directory exists
-      mkdirSync(CLAUDISH_CACHE_DIR, { recursive: true });
-      writeFileSync(
-        ALL_MODELS_JSON_PATH,
-        JSON.stringify({
-          lastUpdated: new Date().toISOString(),
-          models,
-        }),
-        "utf-8"
-      );
-
-      console.error(`✅ Cached ${models.length} models`);
-    } catch (error) {
-      console.error(`❌ Failed to fetch models: ${error}`);
-      process.exit(1);
-    }
-  }
-
-  // JSON output
   if (jsonOutput) {
-    const allModels = [...ollamaModels, ...zenModels, ...models];
     console.log(
       JSON.stringify(
         {
-          count: allModels.length,
-          localCount: ollamaModels.length,
-          zenCount: zenModels.length,
-          lastUpdated: new Date().toISOString().split("T")[0],
-          models: allModels.map((m) => {
-            // Add proper prefix for explicit routing
-            let id: string;
-            if (m.isLocal) {
-              id = m.id.replace("ollama/", "ollama@");
-            } else if (m.isZen || m.id.startsWith("zen/")) {
-              id = m.id.replace("zen/", "zen@");
-            } else if (m.source === "LiteLLM" || m.id.startsWith("litellm@")) {
-              id = m.id;
-            } else {
-              id = `openrouter@${m.id}`;
-            }
-            return {
-              id,
-              name: m.name,
-              context: m.context_length || m.top_provider?.context_length,
-              pricing: m.pricing,
-              isLocal: m.isLocal || false,
-              isZen: m.isZen || false,
-            };
-          }),
+          query,
+          count: results.length,
+          models: results.map((m) => ({
+            id: m.modelId,
+            provider: m.provider,
+            contextWindow: m.contextWindow,
+            pricing: m.pricing,
+            capabilities: m.capabilities,
+            aliases: m.aliases,
+            status: m.status,
+          })),
         },
         null,
         2
@@ -854,388 +799,287 @@ async function printAllModels(jsonOutput: boolean, forceUpdate: boolean): Promis
     return;
   }
 
-  // ANSI color codes
-  const RED = "\x1b[31m";
-  const GREEN = "\x1b[32m";
-  const RESET = "\x1b[0m";
-  const DIM = "\x1b[2m";
+  console.log(`\nFound ${results.length} matching models:\n`);
+  const sorted = [...results].sort(compareByReleaseDateDesc);
+  renderModelDocTable(sorted, /* showRank */ false);
+  console.log("");
+  console.log("Caps: T = tools  R = reasoning  V = vision");
+  console.log("");
+  console.log("Use any model by its ID: claudish --model <model-id>");
+  console.log("Provider shortcuts:      claudish --model or@<id> | google@<id> | oai@<id>");
+}
 
-  // Print local Ollama models first if available
-  if (ollamaModels.length > 0) {
-    const toolCapableCount = ollamaModels.filter((m: any) => m.supportsTools).length;
-    console.log(
-      `\n🏠 LOCAL OLLAMA MODELS (${ollamaModels.length} installed, ${toolCapableCount} with tool support):\n`
-    );
-    console.log("    Model                                     Size         Params    Tools");
-    console.log("  " + "─".repeat(76));
-
-    for (const model of ollamaModels) {
-      // Convert ollama/model-name to ollama@model-name for explicit routing
-      const fullId = model.id.replace("ollama/", "ollama@");
-      const modelId = fullId.length > 35 ? fullId.substring(0, 32) + "..." : fullId;
-      const modelIdPadded = modelId.padEnd(38);
-      const size = model.size ? `${(model.size / 1e9).toFixed(1)}GB` : "N/A";
-      const sizePadded = size.padEnd(12);
-      const params = model.details?.parameter_size || "N/A";
-      const paramsPadded = params.padEnd(8);
-
-      if (model.supportsTools) {
-        console.log(`    ${modelIdPadded} ${sizePadded} ${paramsPadded}  ${GREEN}✓${RESET}`);
-      } else {
-        console.log(`    ${RED}${modelIdPadded} ${sizePadded} ${paramsPadded}  ✗ no tools${RESET}`);
-      }
-    }
-    console.log("");
-    console.log(`  ${GREEN}✓${RESET} = Compatible with Claude Code (supports tool calling)`);
-    console.log(
-      `  ${RED}✗${RESET} = Not compatible ${DIM}(Claude Code requires tool support)${RESET}`
-    );
-    console.log("");
-    console.log("  Use: claudish --model ollama@<model-name>");
-    console.log("  Pull a compatible model: ollama pull llama3.2");
-  } else {
-    console.log("\n🏠 LOCAL OLLAMA: Not running or no models installed");
-    console.log("   Start Ollama: ollama serve");
-    console.log("   Pull a model: ollama pull llama3.2");
+/**
+ * Render a flat list of `ModelDoc`s as an indented ranked table using the
+ * existing `formatModelDoc*` helpers. Shared between `printTop100` and
+ * `printByProvider`.
+ */
+function renderModelDocTable(models: Array<ModelDoc & { rank?: number }>, showRank: boolean): void {
+  const header = showRank
+    ? "  #    Model                          Provider    Pricing     Context  Caps  Released"
+    : "       Model                          Provider    Pricing     Context  Caps  Released";
+  console.log(header);
+  console.log(`  ${"─".repeat(90)}`);
+  for (const m of models) {
+    const rankCell = showRank ? `${String(m.rank ?? "").padStart(3)}  ` : "     ";
+    const rawId = m.modelId;
+    const id = rawId.length > 30 ? `${rawId.substring(0, 27)}...` : rawId;
+    const idPadded = id.padEnd(30);
+    const prov = (m.provider || "").padEnd(10);
+    const price = formatModelDocPricing(m.pricing).padEnd(10);
+    const ctx = formatModelDocContext(m.contextWindow).padEnd(7);
+    const caps = formatModelDocCaps(m.capabilities).padEnd(5);
+    const released = m.releaseDate ?? "—";
+    console.log(`  ${rankCell}${idPadded} ${prov} ${price} ${ctx} ${caps} ${released}`);
   }
+}
 
-  // Print OpenCode Zen models (free ones don't need API key)
-  if (zenModels.length > 0) {
-    const freeCount = zenModels.filter((m: any) => m.isFree).length;
-    console.log(
-      `\n🔮 OPENCODE ZEN (${zenModels.length} models, ${freeCount} FREE - no API key needed):\n`
-    );
-    console.log("    Model                          Context    Pricing      Tools");
-    console.log("  " + "─".repeat(68));
+/**
+ * Probe local providers (Ollama daemon, LiteLLM proxy) and print a compact
+ * footer. Best-effort — silent on network errors, never throws.
+ */
+async function printLocalProvidersFooter(): Promise<void> {
+  console.log("\nLocal providers");
+  console.log(`  ${"─".repeat(70)}`);
 
-    // Sort: free models first, then by context size
-    const sortedModels = [...zenModels].sort((a, b) => {
-      if (a.isFree && !b.isFree) return -1;
-      if (!a.isFree && b.isFree) return 1;
-      return (b.context_length || 0) - (a.context_length || 0);
-    });
-
-    for (const model of sortedModels) {
-      // Convert zen/model-id to zen@model-id for explicit routing
-      const fullId = model.id.replace("zen/", "zen@");
-      const modelId = fullId.length > 30 ? fullId.substring(0, 27) + "..." : fullId;
-      const modelIdPadded = modelId.padEnd(32);
-      const contextLen = model.context_length || 0;
-      const context = contextLen > 0 ? `${Math.round(contextLen / 1000)}K` : "N/A";
-      const contextPadded = context.padEnd(10);
-      const pricing = model.isFree
-        ? `${GREEN}FREE${RESET}`
-        : `$${(parseFloat(model.pricing?.prompt || "0") + parseFloat(model.pricing?.completion || "0")).toFixed(1)}/M`;
-      const pricingPadded = model.isFree ? "FREE        " : pricing.padEnd(12);
-      const tools = model.supportsTools ? `${GREEN}✓${RESET}` : `${RED}✗${RESET}`;
-
-      console.log(`    ${modelIdPadded} ${contextPadded} ${pricingPadded} ${tools}`);
+  // Ollama probe
+  let ollamaLine = "  Ollama:    not running";
+  try {
+    const ollamaModels = await fetchOllamaModels();
+    if (ollamaModels.length > 0) {
+      const toolCount = ollamaModels.filter((m: any) => m.supportsTools).length;
+      ollamaLine = `  Ollama:    ${ollamaModels.length} models installed (${toolCount} with tools) — use: claudish --model ollama@<name>`;
     }
-    console.log("");
-    console.log(`  ${DIM}FREE models work without API key!${RESET}`);
-    console.log("  Use: claudish --model zen@<model-id>");
+  } catch {
+    // Leave the default "not running" line.
   }
+  console.log(ollamaLine);
 
-  // Print LiteLLM models if configured
+  // LiteLLM probe — claudish no longer fetches LiteLLM's catalog (Firebase-only
+  // catalog rule). Just show whether the env vars are set; users can list
+  // models on their own LiteLLM instance.
+  let litellmLine = "  LiteLLM:   not configured (set LITELLM_BASE_URL + LITELLM_API_KEY)";
   if (process.env.LITELLM_BASE_URL && process.env.LITELLM_API_KEY) {
-    try {
-      const litellmModels = await fetchLiteLLMModels(
-        process.env.LITELLM_BASE_URL,
-        process.env.LITELLM_API_KEY,
-        forceUpdate
-      );
-      if (litellmModels.length > 0) {
-        console.log(`\n🔗 LITELLM PROXY (${litellmModels.length} model groups):\n`);
-        console.log("    Model                          Context    Pricing      Tools");
-        console.log("  " + "─".repeat(68));
-
-        for (const model of litellmModels) {
-          const modelId = model.id.length > 30 ? model.id.substring(0, 27) + "..." : model.id;
-          const modelIdPadded = modelId.padEnd(32);
-          const contextPadded = (model.context || "N/A").padEnd(10);
-          const pricingStr = model.isFree
-            ? `${GREEN}FREE${RESET}`
-            : model.pricing?.average || "N/A";
-          const pricingPadded = model.isFree ? "FREE        " : pricingStr.padEnd(12);
-          const tools = model.supportsTools ? `${GREEN}✓${RESET}` : `${RED}✗${RESET}`;
-
-          console.log(`    ${modelIdPadded} ${contextPadded} ${pricingPadded} ${tools}`);
-        }
-        console.log("");
-        console.log("  Use: claudish --model litellm@<model-group>");
-      }
-    } catch {
-      // Ignore fetch errors
-    }
+    litellmLine = "  LiteLLM:   configured — use: claudish --model litellm@<group>";
   }
-
-  // Group by provider
-  const byProvider = new Map<string, any[]>();
-  for (const model of models) {
-    const provider = model.id.split("/")[0];
-    if (!byProvider.has(provider)) {
-      byProvider.set(provider, []);
-    }
-    byProvider.get(provider)!.push(model);
-  }
-
-  // Sort providers alphabetically
-  const sortedProviders = [...byProvider.keys()].sort();
-
-  console.log(`\n☁️  OPENROUTER MODELS (${models.length} total):\n`);
-
-  for (const provider of sortedProviders) {
-    const providerModels = byProvider.get(provider)!;
-    console.log(`\n  ${provider.toUpperCase()} (${providerModels.length} models)`);
-    console.log("  " + "─".repeat(70));
-
-    for (const model of providerModels) {
-      // Format model ID with openrouter@ prefix for explicit routing
-      const fullId = `openrouter@${model.id}`;
-      const modelId = fullId.length > 40 ? fullId.substring(0, 37) + "..." : fullId;
-      const modelIdPadded = modelId.padEnd(42);
-
-      // Format pricing (handle special cases: negative = varies, 0 = free)
-      const promptPrice = parseFloat(model.pricing?.prompt || "0") * 1000000;
-      const completionPrice = parseFloat(model.pricing?.completion || "0") * 1000000;
-      const avg = (promptPrice + completionPrice) / 2;
-      let pricing: string;
-      if (avg < 0) {
-        pricing = "varies"; // Auto-router or dynamic pricing
-      } else if (avg === 0) {
-        pricing = "FREE";
-      } else {
-        pricing = `$${avg.toFixed(2)}/1M`;
-      }
-      const pricingPadded = pricing.padEnd(12);
-
-      // Context
-      const contextLen = model.context_length || model.top_provider?.context_length || 0;
-      const context = contextLen > 0 ? `${Math.round(contextLen / 1000)}K` : "N/A";
-      const contextPadded = context.padEnd(8);
-
-      console.log(`    ${modelIdPadded} ${pricingPadded} ${contextPadded}`);
-    }
-  }
-
-  console.log("\n");
-  console.log("Use OpenRouter model:  claudish --model openrouter@<provider/model-id>");
-  console.log(
-    "  Example:             claudish --model openrouter@google/gemini-2.0-flash-exp:free"
-  );
-  console.log("Local Ollama model:    claudish --model ollama@<model-name>");
-  console.log("OpenCode Zen model:    claudish --model zen@<model-id>");
-  console.log("LiteLLM proxy model:   claudish --model litellm@<model-group>");
-  console.log("Search:                claudish --search <query>");
-  console.log("Top models:            claudish --top-models");
+  console.log(litellmLine);
 }
 
 /**
- * Check if models cache is stale (older than CACHE_MAX_AGE_DAYS)
+ * Print the top-100 Firebase-ranked catalog plus a local-providers footer.
+ * Replaces the legacy `printAllModels` which mixed Ollama + LiteLLM + the
+ * curated recommended list in one wall of text.
  */
-function isCacheStale(): boolean {
-  // Check writable cache first, then bundled fallback
-  const cachePath = existsSync(CACHED_MODELS_PATH) ? CACHED_MODELS_PATH : BUNDLED_MODELS_PATH;
-  if (!existsSync(cachePath)) {
-    return true; // No cache file = stale
-  }
-
+async function printTop100(jsonOutput: boolean): Promise<void> {
+  let response: Awaited<ReturnType<typeof getTop100Models>>;
   try {
-    const jsonContent = readFileSync(cachePath, "utf-8");
-    const data = JSON.parse(jsonContent);
-
-    if (!data.lastUpdated) {
-      return true; // No timestamp = stale
-    }
-
-    const lastUpdated = new Date(data.lastUpdated);
-    const now = new Date();
-    const ageInDays = (now.getTime() - lastUpdated.getTime()) / (1000 * 60 * 60 * 24);
-
-    return ageInDays > CACHE_MAX_AGE_DAYS;
-  } catch (error) {
-    // If we can't read/parse, consider it stale
-    return true;
-  }
-}
-
-/**
- * Fetch models from OpenRouter and update recommended-models.json
- *
- * Dynamically fetches the top weekly programming models from OpenRouter's API:
- * GET /api/v1/models?category=programming&order=top-weekly
- *
- * **Filtering rules:**
- * 1. Skip Anthropic models (redundant — Claudish already proxies to Claude)
- * 2. Skip OpenRouter meta-routing models (e.g. hunter-alpha, healer-alpha)
- * 3. Take only ONE model per provider (the highest-ranked one)
- */
-async function updateModelsFromOpenRouter(): Promise<void> {
-  console.error("🔄 Updating model recommendations from OpenRouter...");
-
-  try {
-    // Fetch top weekly programming models directly from the API
-    const apiResponse = await fetch(
-      "https://openrouter.ai/api/v1/models?category=programming&order=top-weekly"
-    );
-    if (!apiResponse.ok) {
-      throw new Error(`OpenRouter API returned ${apiResponse.status}`);
-    }
-
-    const openrouterData = (await apiResponse.json()) as { data: any[] };
-    const topModels = openrouterData.data;
-
-    // Build recommendations list from the API's ranking order
-    const recommendations: any[] = [];
-    const providers = new Set<string>();
-
-    for (const model of topModels) {
-      const modelId = model.id; // e.g. "openai/gpt-5.4"
-      const provider = modelId.split("/")[0];
-
-      // Filter 1: Skip Anthropic models (not needed in Claudish)
-      if (provider === "anthropic") {
-        continue;
-      }
-
-      // Filter 2: Skip OpenRouter meta-routing models
-      if (provider === "openrouter") {
-        continue;
-      }
-
-      // Filter 3: Only ONE model per provider (take the first/top-ranked)
-      if (providers.has(provider)) {
-        continue;
-      }
-
-      const name = model.name || modelId;
-      const description = model.description || `${name} model`;
-      const architecture = model.architecture || {};
-      const topProvider = model.top_provider || {};
-      const supportedParams = model.supported_parameters || [];
-
-      // Calculate pricing (handle both per-token and per-million formats)
-      const promptPrice = parseFloat(model.pricing?.prompt || "0");
-      const completionPrice = parseFloat(model.pricing?.completion || "0");
-
-      const inputPrice = promptPrice > 0 ? `$${(promptPrice * 1000000).toFixed(2)}/1M` : "FREE";
-      const outputPrice =
-        completionPrice > 0 ? `$${(completionPrice * 1000000).toFixed(2)}/1M` : "FREE";
-      const avgPrice =
-        promptPrice > 0 || completionPrice > 0
-          ? `$${(((promptPrice + completionPrice) / 2) * 1000000).toFixed(2)}/1M`
-          : "FREE";
-
-      // Determine category based on description and capabilities
-      let category = "programming"; // default since we're filtering programming models
-      const lowerDesc = description.toLowerCase() + " " + name.toLowerCase();
-
-      if (
-        lowerDesc.includes("vision") ||
-        lowerDesc.includes("vl-") ||
-        lowerDesc.includes("multimodal")
-      ) {
-        category = "vision";
-      } else if (lowerDesc.includes("reason")) {
-        category = "reasoning";
-      }
-
-      // Bare model name (strip vendor prefix, strip :free suffix)
-      const bareId = modelId
-        .split("/")
-        .pop()!
-        .replace(/:free$/, "");
-
-      recommendations.push({
-        id: bareId,
-        openrouterId: modelId,
-        name,
-        description,
-        provider: provider.charAt(0).toUpperCase() + provider.slice(1),
-        category,
-        priority: recommendations.length + 1,
-        pricing: {
-          input: inputPrice,
-          output: outputPrice,
-          average: avgPrice,
-        },
-        context: topProvider.context_length
-          ? `${Math.floor(topProvider.context_length / 1000)}K`
-          : "N/A",
-        maxOutputTokens: topProvider.max_completion_tokens || null,
-        modality: architecture.modality || "text->text",
-        supportsTools: supportedParams.includes("tools") || supportedParams.includes("tool_choice"),
-        supportsReasoning:
-          supportedParams.includes("reasoning") || supportedParams.includes("include_reasoning"),
-        supportsVision:
-          (architecture.input_modalities || []).includes("image") ||
-          (architecture.input_modalities || []).includes("video"),
-        isModerated: topProvider.is_moderated || false,
-        recommended: true,
-      });
-
-      providers.add(provider);
-    }
-
-    // Read existing version if available
-    let version = "1.2.0"; // default
-    const existingPath = existsSync(CACHED_MODELS_PATH) ? CACHED_MODELS_PATH : BUNDLED_MODELS_PATH;
-    if (existsSync(existingPath)) {
-      try {
-        const existing = JSON.parse(readFileSync(existingPath, "utf-8"));
-        version = existing.version || version;
-      } catch {
-        // Use default version
-      }
-    }
-
-    // Create new JSON structure
-    const updatedData = {
-      version,
-      lastUpdated: new Date().toISOString().split("T")[0], // YYYY-MM-DD format
-      source: "https://openrouter.ai/models?categories=programming&fmt=cards&order=top-weekly",
-      models: recommendations,
-    };
-
-    // Write to writable cache dir (not bundled path, which may be read-only)
-    mkdirSync(CLAUDISH_CACHE_DIR, { recursive: true });
-    writeFileSync(CACHED_MODELS_PATH, JSON.stringify(updatedData, null, 2), "utf-8");
-
-    console.error(
-      `✅ Updated ${recommendations.length} models (last updated: ${updatedData.lastUpdated})`
-    );
+    response = await getTop100Models();
   } catch (error) {
     console.error(
-      `❌ Failed to update models: ${error instanceof Error ? error.message : String(error)}`
+      `❌ Failed to load top-100 models from Firebase: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
-    console.error("   Using cached models (if available)");
+    console.error("   Check your network connection.");
+    process.exit(1);
   }
-}
 
-/**
- * Check cache staleness and update if needed
- */
-async function checkAndUpdateModelsCache(forceUpdate: boolean = false): Promise<void> {
-  if (forceUpdate) {
-    console.error("🔄 Force update requested...");
-    await updateModelsFromOpenRouter();
+  if (jsonOutput) {
+    console.log(JSON.stringify(response, null, 2));
     return;
   }
 
-  if (isCacheStale()) {
-    console.error("⚠️  Model cache is stale (>2 days old), updating...");
-    await updateModelsFromOpenRouter();
+  console.log(
+    `\nTop ${response.total} models from Firebase (pool: ${response.poolSize} eligible)\n`
+  );
+
+  if (response.models.length === 0) {
+    console.log("  No eligible models in the catalog.");
   } else {
-    // Cache is fresh, show timestamp in stderr (won't affect JSON output)
-    try {
-      const cachePath = existsSync(CACHED_MODELS_PATH) ? CACHED_MODELS_PATH : BUNDLED_MODELS_PATH;
-      const data = JSON.parse(readFileSync(cachePath, "utf-8"));
-      console.error(`✓ Using cached models (last updated: ${data.lastUpdated})`);
-    } catch {
-      // Silently fallthrough if can't read
+    const sorted = [...response.models].sort(compareByReleaseDateDesc);
+    renderModelDocTable(sorted, /* showRank */ true);
+    console.log("");
+    console.log("  Caps: T = tools  R = reasoning  V = vision");
+  }
+
+  await printLocalProvidersFooter();
+
+  console.log("");
+  console.log("Filter by provider: claudish --models --provider <slug>");
+  console.log("                    (e.g. opencode-zen, anthropic, openai, google, x-ai)");
+  console.log("All providers:      claudish --providers");
+  console.log("Search by keyword:  claudish -s <query>");
+  console.log("Top recommended:    claudish --models-top");
+  console.log("");
+}
+
+/**
+ * Print the Firebase catalog filtered to a single provider slug. No local
+ * footer — this view is explicitly scoped by the user and cross-cutting
+ * probes would be noise.
+ */
+async function printByProvider(providerSlug: string, jsonOutput: boolean): Promise<void> {
+  let models: ModelDoc[];
+  try {
+    models = await getModelsByProvider(providerSlug, 200);
+  } catch (error) {
+    console.error(
+      `❌ Failed to load provider catalog from Firebase: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    console.error("   Check your network connection.");
+    process.exit(1);
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify({ provider: providerSlug, count: models.length, models }, null, 2));
+    return;
+  }
+
+  if (models.length === 0) {
+    console.log(
+      `\nNo active models found for provider "${providerSlug}". Try \`claudish -s <query>\` to search the full catalog.\n`
+    );
+    return;
+  }
+
+  console.log(`\nProvider: ${providerSlug} (${models.length} active models)\n`);
+  const sorted = [...models].sort(compareByReleaseDateDesc);
+  renderModelDocTable(sorted, /* showRank */ false);
+  console.log("");
+  console.log("  Caps: T = tools  R = reasoning  V = vision");
+  console.log("");
+  console.log("Use any model:      claudish --model <model-id>");
+  console.log("Provider shortcuts: claudish --model or@<id> | google@<id> | oai@<id>");
+  console.log("");
+}
+
+/**
+ * Print the Firebase-backed recommended models list (used by --models-top).
+ */
+async function printRecommendedModels(jsonOutput: boolean, forceUpdate: boolean): Promise<void> {
+  let doc: Awaited<ReturnType<typeof getRecommendedModels>>;
+  try {
+    doc = await getRecommendedModels({ forceRefresh: forceUpdate });
+  } catch (error) {
+    console.error(
+      `❌ Failed to load recommended models: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+    process.exit(1);
+  }
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(doc, null, 2));
+    return;
+  }
+
+  const lastUpdated = doc.lastUpdated || "unknown";
+  const { flagship, fast } = groupRecommendedModels(doc.models);
+
+  // Build a native-prefix lookup: Firebase slug → shortcuts[0] from provider defs.
+  const providerByName = new Map(BUILTIN_PROVIDERS.map((p) => [p.name, p] as const));
+  const getNativePrefix = (firebaseSlug: string): string | null => {
+    const canonical = FIREBASE_SLUG_TO_PROVIDER_NAME[firebaseSlug];
+    if (!canonical) return null;
+    const def = providerByName.get(canonical);
+    if (!def || !def.shortcuts || def.shortcuts.length === 0) return null;
+    return def.shortcuts[0];
+  };
+
+  const renderGroup = (group: RecommendedModelGroup): void => {
+    const m = group.primary;
+    const rawId = m.id;
+    const modelId = rawId.length > 28 ? `${rawId.substring(0, 25)}...` : rawId;
+    const modelIdPadded = modelId.padEnd(28);
+
+    const pricing = normalizePricingDisplay(m.pricing?.average);
+    const pricingPadded = pricing.padEnd(10);
+
+    const context = m.context || "N/A";
+    const contextPadded = context.padEnd(6);
+
+    // Capability glyphs — omit (not blank) when false so the caps column
+    // naturally narrows for models without reasoning/vision.
+    const caps: string[] = [];
+    if (m.supportsTools) caps.push("🔧");
+    if (m.supportsReasoning) caps.push("🧠");
+    if (m.supportsVision) caps.push("👁️");
+    const capabilities = caps.join(" ");
+
+    console.log(`  ${modelIdPadded} ${pricingPadded} ${contextPadded} ${capabilities}`);
+
+    const prefixes = collectRoutingPrefixes(group, getNativePrefix);
+    if (prefixes.length > 0) {
+      const viaLine = prefixes.map((p) => `${p}@`).join(" · ");
+      console.log(`      via: ${viaLine}`);
+    }
+  };
+
+  console.log(`\nRecommended Models (last updated: ${lastUpdated}):\n`);
+
+  if (flagship.length > 0) {
+    console.log("Flagship models");
+    console.log(`  ${"─".repeat(70)}`);
+    for (let i = 0; i < flagship.length; i++) {
+      renderGroup(flagship[i]);
+      if (i < flagship.length - 1) console.log("");
     }
   }
+
+  if (fast.length > 0) {
+    if (flagship.length > 0) console.log("");
+    console.log("Fast variants");
+    console.log(`  ${"─".repeat(70)}`);
+    for (let i = 0; i < fast.length; i++) {
+      renderGroup(fast[i]);
+      if (i < fast.length - 1) console.log("");
+    }
+  }
+
+  console.log("");
+  console.log("  Capabilities: 🔧 Tools  🧠 Reasoning  👁️  Vision");
+
+  // Quick picks — compute over the deduped primaries across both buckets.
+  const primaries = [...flagship, ...fast].map((g) => g.primary);
+  const picks = computeQuickPicks(primaries);
+  const pickLines: string[] = [];
+  if (picks.budget)
+    pickLines.push(
+      `    Budget       → ${picks.budget.id} (${normalizePricingDisplay(
+        picks.budget.pricing?.average
+      )})`
+    );
+  if (picks.largeContext)
+    pickLines.push(
+      `    Large ctx    → ${picks.largeContext.id} (${picks.largeContext.context || "N/A"})`
+    );
+  if (picks.mostCapable) pickLines.push(`    Most capable → ${picks.mostCapable.id}`);
+  if (picks.visionCoding) pickLines.push(`    Vision+code  → ${picks.visionCoding.id}`);
+  if (picks.agentic) pickLines.push(`    Agentic      → ${picks.agentic.id}`);
+
+  if (pickLines.length > 0) {
+    console.log("");
+    console.log("  Quick picks:");
+    for (const line of pickLines) console.log(line);
+  }
+
+  console.log("");
+  console.log("  Set default:  export CLAUDISH_MODEL=<model>");
+  console.log("                 or:  claudish --model <model> ...");
+  console.log("");
+  console.log("  For more: claudish --models                     (browse full catalog)");
+  console.log("            claudish --providers                   (list all providers + counts)");
+  console.log("            claudish -s <query>                    (search by keyword)");
+  console.log("            claudish --models-top --models-refresh (refresh from Firebase)");
+  console.log("");
 }
+
+// Legacy OpenRouter catalog updater was removed when claudish switched to
+// Firebase for model information. The --models-top and --models commands
+// now go directly through `getRecommendedModels()` in model-loader.ts.
 
 /**
  * Print version information
@@ -1247,31 +1091,18 @@ function printVersion(): void {
 /**
  * Probe model routing — show the fallback chain for each model.
  * Warm caches first, then display a table of how each model would be routed.
+ *
+ * Two paths:
+ * - JSON path (--json): runs existing batch logic unchanged, prints JSON to stdout
+ * - TUI path (interactive): live-updating progress bars via OpenTUI React on stderr
  */
-async function probeModelRouting(models: string[], jsonOutput: boolean): Promise<void> {
-  // ANSI color codes
-  const GREEN = "\x1b[32m";
-  const RED = "\x1b[31m";
-  const YELLOW = "\x1b[33m";
-  const CYAN = "\x1b[36m";
-  const DIM = "\x1b[2m";
-  const BOLD = "\x1b[1m";
-  const RESET = "\x1b[0m";
-  const BG_DIM = "\x1b[48;5;236m";
-
-  // Pre-warm caches in parallel
-  console.error(`${DIM}Warming provider caches...${RESET}`);
-  await Promise.allSettled([
-    warmZenModelCache(),
-    warmZenGoModelCache(),
-    // LiteLLM cache is disk-based and already populated by proxy start; just ensure it's loaded
-  ]);
-
-  // Load routing rules (from config files)
-  const routingRules = loadRoutingRules();
-
-  // Collect probe results
-  interface ProbeResult {
+async function probeModelRouting(
+  models: string[],
+  jsonOutput: boolean,
+  options: { live: boolean; timeoutMs: number } = { live: true, timeoutMs: 40000 }
+): Promise<void> {
+  // Shared types for both paths
+  interface ChainProbe {
     model: string;
     nativeProvider: string;
     isExplicit: boolean;
@@ -1283,7 +1114,10 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
       modelSpec: string;
       hasCredentials: boolean;
       credentialHint?: string;
+      provenance?: KeyProvenance;
+      probe?: ProbeResult;
     }>;
+    directProbe?: ProbeResult;
     wiring?: {
       formatAdapter: string;
       declaredStreamFormat: string;
@@ -1295,78 +1129,123 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
     };
   }
 
-  const results: ProbeResult[] = [];
+  type LiveProxy = { url: string; shutdown: () => Promise<void> };
 
-  const API_KEY_MAP: Record<string, { envVar: string; aliases?: string[] }> = {
-    litellm: { envVar: "LITELLM_API_KEY" },
-    openrouter: { envVar: "OPENROUTER_API_KEY" },
-    google: { envVar: "GEMINI_API_KEY" },
-    openai: { envVar: "OPENAI_API_KEY" },
-    minimax: { envVar: "MINIMAX_API_KEY" },
-    "minimax-coding": { envVar: "MINIMAX_CODING_API_KEY" },
-    kimi: { envVar: "MOONSHOT_API_KEY", aliases: ["KIMI_API_KEY"] },
-    "kimi-coding": { envVar: "KIMI_CODING_API_KEY" },
-    glm: { envVar: "ZHIPU_API_KEY", aliases: ["GLM_API_KEY"] },
-    "glm-coding": { envVar: "GLM_CODING_API_KEY", aliases: ["ZAI_CODING_API_KEY"] },
-    zai: { envVar: "ZAI_API_KEY" },
-    ollamacloud: { envVar: "OLLAMA_API_KEY" },
-    "opencode-zen": { envVar: "OPENCODE_API_KEY" },
-    "opencode-zen-go": { envVar: "OPENCODE_API_KEY" },
-    "gemini-codeassist": { envVar: "GEMINI_API_KEY" },
-    vertex: { envVar: "VERTEX_API_KEY", aliases: ["VERTEX_PROJECT"] },
-    poe: { envVar: "POE_API_KEY" },
-  };
+  // Snapshot user-defined routing keys so we can label matches as
+  // "custom-rules" vs "auto-chain" (default rules) in --probe output.
+  // Defaults are merged INSIDE loadRoutingRules() but are not returned
+  // from loadConfig/loadLocalConfig directly — those reads see only user
+  // overrides, which is exactly the discriminator we need here.
+  const userRoutingKeys = new Set<string>([
+    ...Object.keys(loadConfig().routing ?? {}),
+    ...Object.keys(loadLocalConfig()?.routing ?? {}),
+  ]);
 
-  for (const modelInput of models) {
+  /** Build chain + credential data for a single model (shared by both paths) */
+  function buildModelChain(modelInput: string) {
     const parsed = parseModelSpec(modelInput);
     const chain = (() => {
-      // Explicit provider — no fallback chain, goes direct
       if (parsed.isExplicitProvider) {
         return {
-          routes: [] as ReturnType<typeof getFallbackChain>,
+          routes: [] as FallbackRoute[],
           source: "direct" as const,
           matchedPattern: undefined,
         };
       }
-      // Check custom routing rules first
-      if (routingRules) {
-        const matched = matchRoutingRule(parsed.model, routingRules);
-        if (matched) {
-          const matchedPattern = Object.keys(routingRules).find((k) => {
-            if (k === parsed.model) return true;
-            if (k.includes("*")) {
-              const star = k.indexOf("*");
-              const prefix = k.slice(0, star);
-              const suffix = k.slice(star + 1);
-              return parsed.model.startsWith(prefix) && parsed.model.endsWith(suffix);
-            }
-            return false;
-          });
-          return {
-            routes: buildRoutingChain(matched, parsed.model),
-            source: "custom-rules" as const,
-            matchedPattern,
-          };
-        }
+      // Native-anthropic passthrough: a bare name with no vendor "/" and no
+      // provider "@" (e.g. "internal") resolves to native-anthropic — the
+      // default Claude Code route. The real proxy returns nativeHandler for
+      // this (proxy-server.ts) BEFORE the routing engine runs, so the probe
+      // must mirror that here rather than letting matchRoutingRule send it to
+      // the "*" catch-all → openrouter (which produced the wrong "no live
+      // route"). We pin the default Opus model so the probe sends a real
+      // request through the passthrough like any other link.
+      // NOTE: mirrors the upstream proxy precedence; a later routing worktree
+      // may fold this into a shared helper.
+      if (parsed.provider === "native-anthropic") {
+        // The probe hits the Anthropic API directly, so this must be a real
+        // API-valid model id — NOT Claude Code's internal alias (`claude-opus-4-8`
+        // is the CLI's tier name and the API rejects it with "not a valid model
+        // ID"). `claude-opus-4-1` is the current Opus alias the API accepts
+        // (verified against api.anthropic.com). Honor an explicit override.
+        const opusModel =
+          process.env[ENV.CLAUDISH_MODEL_OPUS] ||
+          process.env[ENV.ANTHROPIC_DEFAULT_OPUS_MODEL] ||
+          "claude-opus-4-1";
+        // IMPORTANT: pin a BARE model name (no `provider@`). The proxy resolves
+        // the native passthrough via `isNative` = no "/" AND no "@" — pinning
+        // `native-anthropic@...` would set hasExplicitProvider=true and DEFEAT
+        // the native branch (the request would 400 / fall to OpenRouter). So
+        // pinProbeModelSpec must keep this bare; the proxy then returns the
+        // nativeHandler (default Claude Code / Opus).
+        return {
+          routes: [
+            {
+              provider: "native-anthropic",
+              modelSpec: opusModel,
+              displayName: "Claude Code (Opus)",
+            },
+          ] as FallbackRoute[],
+          source: "auto-chain" as const,
+          matchedPattern: undefined,
+        };
+      }
+      // Routing rules now always include DEFAULT_ROUTING_RULES merged with
+      // user overrides — see loadRoutingRules() in providers/routing-rules.ts.
+      const routingRules = loadRoutingRules();
+      const matched = matchRoutingRule(parsed.model, routingRules);
+      if (matched) {
+        const matchedPattern = Object.keys(routingRules).find((k) => {
+          if (k === parsed.model) return true;
+          if (k.includes("*")) {
+            const star = k.indexOf("*");
+            const prefix = k.slice(0, star);
+            const suffix = k.slice(star + 1);
+            return parsed.model.startsWith(prefix) && parsed.model.endsWith(suffix);
+          }
+          return false;
+        });
+        // Distinguish user overrides from shipped defaults so --probe can show
+        // "custom-rules" vs "auto-chain" exactly as before.
+        const isUserKey = !!matchedPattern && userRoutingKeys.has(matchedPattern);
+        return {
+          routes: buildRoutingChain(matched, parsed.model),
+          source: isUserKey ? ("custom-rules" as const) : ("auto-chain" as const),
+          matchedPattern,
+        };
       }
       return {
-        routes: getFallbackChain(parsed.model, parsed.provider),
+        routes: [] as FallbackRoute[],
         source: "auto-chain" as const,
         matchedPattern: undefined,
       };
     })();
 
-    // Check credentials for each route
     const chainDetails = chain.routes.map((route) => {
       const keyInfo = API_KEY_MAP[route.provider];
+      const providerDef = getProviderByName(route.provider);
       let hasCredentials = false;
       let credentialHint: string | undefined;
       let provenance: KeyProvenance | undefined;
 
-      if (!keyInfo) {
-        hasCredentials = true; // Unknown provider — assume OK
+      if (route.provider === "native-anthropic") {
+        // The probe hits the Anthropic API DIRECTLY (api.anthropic.com) via the
+        // passthrough, so it needs a real ANTHROPIC_API_KEY. Without one we
+        // can't probe — surface that as a clean key-missing row (no request,
+        // no 400) telling the user what to set.
+        hasCredentials = !!process.env.ANTHROPIC_API_KEY;
+        if (!hasCredentials) {
+          credentialHint = "ANTHROPIC_API_KEY (required to probe Claude Code)";
+        }
+      } else if (providerDef?.isLocal) {
+        hasCredentials = isLocalProviderEnabled(route.provider);
+        if (!hasCredentials) {
+          credentialHint = "enable local provider in global config";
+        }
+      } else if (!keyInfo) {
+        hasCredentials = true;
       } else if (!keyInfo.envVar) {
-        hasCredentials = true; // No key needed (free/OAuth)
+        hasCredentials = true;
       } else {
         provenance = resolveApiKeyProvenance(keyInfo.envVar, keyInfo.aliases);
         hasCredentials = !!provenance.effectiveValue;
@@ -1385,578 +1264,868 @@ async function probeModelRouting(models: string[], jsonOutput: boolean): Promise
         hasCredentials,
         credentialHint,
         provenance,
+        probe: undefined as ProbeResult | undefined,
       };
     });
 
-    // Compute adapter wiring for the first-ready provider
-    let wiring: ProbeResult["wiring"] = undefined;
-    const firstReadyRoute = chainDetails.find((c) => c.hasCredentials);
-    if (firstReadyRoute) {
-      const providerName = firstReadyRoute.provider;
-
-      // Resolve model name from the model spec (strip provider prefix if present)
-      const { resolveRemoteProvider } = await import("./providers/remote-provider-registry.js");
-      const resolvedSpec = resolveRemoteProvider(firstReadyRoute.modelSpec);
-      const modelName = resolvedSpec?.modelName || parsed.model;
-
-      // Determine format adapter from provider name (mirrors provider-profiles.ts)
-      let formatAdapterName = "OpenAIAPIFormat";
-      let declaredStreamFormat = "openai-sse";
-
-      const anthropicCompatProviders = ["minimax", "minimax-coding", "kimi", "kimi-coding", "zai"];
-      const isMinimaxModel = modelName.toLowerCase().includes("minimax");
-
-      if (anthropicCompatProviders.includes(providerName)) {
-        formatAdapterName = "AnthropicAPIFormat";
-        declaredStreamFormat = "anthropic-sse";
-      } else if (
-        (providerName === "opencode-zen" || providerName === "opencode-zen-go") &&
-        isMinimaxModel
-      ) {
-        formatAdapterName = "AnthropicAPIFormat";
-        declaredStreamFormat = "anthropic-sse";
-      } else if (providerName === "gemini" || providerName === "gemini-codeassist") {
-        formatAdapterName = "GeminiAPIFormat";
-        declaredStreamFormat = "gemini-sse";
-      } else if (providerName === "ollamacloud") {
-        formatAdapterName = "OllamaAPIFormat";
-        declaredStreamFormat = "openai-sse";
-      } else if (providerName === "litellm") {
-        formatAdapterName = "LiteLLMAPIFormat";
-        declaredStreamFormat = "openai-sse";
-      } else {
-        // openai, glm, glm-coding, opencode-zen (non-minimax), opencode-zen-go (non-minimax)
-        formatAdapterName = "OpenAIAPIFormat";
-        declaredStreamFormat = "openai-sse";
-      }
-
-      // Get model dialect via DialectManager
-      const { DialectManager } = await import("./adapters/dialect-manager.js");
-      const adapterManager = new DialectManager(modelName);
-      const modelTranslator = adapterManager.getAdapter();
-      const modelTranslatorName = modelTranslator.getName();
-
-      // Transport overrides (aggregators that normalize responses to openai-sse)
-      const TRANSPORT_OVERRIDES: Record<string, string> = {
-        litellm: "openai-sse",
-        openrouter: "openai-sse",
-      };
-      const transportOverride = TRANSPORT_OVERRIDES[providerName] || null;
-
-      // Effective stream format: transport override wins, then model translator format (if not default),
-      // then the format adapter's declared format
-      const modelTranslatorFormat =
-        modelTranslatorName !== "DefaultAPIFormat" ? modelTranslator.getStreamFormat() : null;
-      const effectiveStreamFormat =
-        transportOverride || modelTranslatorFormat || declaredStreamFormat;
-
-      wiring = {
-        formatAdapter: formatAdapterName,
-        declaredStreamFormat,
-        modelTranslator: modelTranslatorName,
-        contextWindow: modelTranslator.getContextWindow(),
-        supportsVision: modelTranslator.supportsVision(),
-        transportOverride,
-        effectiveStreamFormat,
-      };
-    }
-
-    results.push({
-      model: modelInput,
-      nativeProvider: parsed.provider,
-      isExplicit: parsed.isExplicitProvider,
-      routingSource: chain.source,
-      matchedPattern: chain.matchedPattern,
-      chain: chainDetails,
-      wiring,
-    });
+    return { parsed, chain, chainDetails };
   }
 
-  // JSON output
+  /**
+   * Routing-why one-liner shown on the right of each model header in the
+   * Details tab. Kept as a SINGLE function so a later routing worktree can swap
+   * the derivation in one place (the current buildModelChain has known bugs that
+   * a future worktree will reconcile — this only consumes its output).
+   */
+  function buildRoutingExplanation(
+    parsed: ReturnType<typeof parseModelSpec>,
+    chain: ReturnType<typeof buildModelChain>["chain"]
+  ): string {
+    if (parsed.provider === "native-anthropic") {
+      return "native passthrough · default Claude Code (Opus)";
+    }
+    if (chain.source === "direct") {
+      return `explicit · ${parsed.provider} (direct)`;
+    }
+    if (chain.source === "custom-rules" && chain.matchedPattern) {
+      return `custom-rules · matched \`${chain.matchedPattern}\``;
+    }
+    if (chain.source === "auto-chain") {
+      if (chain.matchedPattern && chain.matchedPattern !== "*") {
+        return `auto-chain · default rule \`${chain.matchedPattern}\``;
+      }
+      return "auto-chain · catch-all → openrouter";
+    }
+    return chain.source;
+  }
+
+  /**
+   * Build the provider-comparison links the Details tab renders. For EXPLICIT /
+   * direct models buildModelChain returns an empty chain (the probe lives in
+   * directProbe), so we synthesize a single link carrying that probe — the model
+   * still renders one row and the live-count derives from the SAME array as the
+   * rows. The model id is the RESOLVED bare id (parsed.model), never the raw
+   * provider@-prefixed input, so we never render `provider@provider@model`.
+   */
+  function buildResultLinks(
+    parsed: ReturnType<typeof parseModelSpec>,
+    chainDetails: ReturnType<typeof buildModelChain>["chainDetails"],
+    directProbe: ProbeResult | undefined
+  ): ProbeModelResult["links"] {
+    if (chainDetails.length === 0) {
+      // Explicit/direct model — one synthetic link from the native provider.
+      const directProviderDef = getProviderByName(parsed.provider);
+      const directKeyInfo = API_KEY_MAP[parsed.provider];
+      const directHasCreds = directProviderDef?.isLocal
+        ? isLocalProviderEnabled(parsed.provider)
+        : directKeyInfo?.envVar
+          ? !!process.env[directKeyInfo.envVar] ||
+            (directKeyInfo.aliases?.some((a) => !!process.env[a]) ?? false)
+          : true;
+      return [
+        {
+          provider: parsed.provider,
+          displayName: directProviderDef?.displayName ?? parsed.provider,
+          modelId: parsed.model,
+          hasCredentials: directHasCreds,
+          credentialHint:
+            directProviderDef?.isLocal && !directHasCreds
+              ? "enable local provider in global config"
+              : directKeyInfo?.envVar,
+          probe: directProbe,
+        },
+      ];
+    }
+    return chainDetails.map((c) => ({
+      provider: c.provider,
+      displayName: c.displayName,
+      // Strip any redundant provider@ prefix so the row shows displayName + the
+      // resolved id only (e.g. "qwen/qwen3-coder", not "openrouter@qwen/…").
+      modelId: c.modelSpec.includes("@")
+        ? c.modelSpec.slice(c.modelSpec.indexOf("@") + 1)
+        : c.modelSpec,
+      hasCredentials: c.hasCredentials,
+      credentialHint: c.credentialHint,
+      probe: c.probe,
+    }));
+  }
+
+  /** Compute wiring for the first-ready provider in a chain */
+  async function computeWiring(
+    chainDetails: ReturnType<typeof buildModelChain>["chainDetails"],
+    parsedModel: string
+  ): Promise<ChainProbe["wiring"]> {
+    const firstReadyRoute = chainDetails.find((c) => c.hasCredentials);
+    if (!firstReadyRoute) return undefined;
+
+    const providerName = firstReadyRoute.provider;
+    const { resolveRemoteProvider } = await import("./providers/remote-provider-registry.js");
+    const resolvedSpec = resolveRemoteProvider(firstReadyRoute.modelSpec);
+    const modelName = resolvedSpec?.modelName || parsedModel;
+
+    let formatAdapterName = "OpenAIAPIFormat";
+    let declaredStreamFormat = "openai-sse";
+
+    const anthropicCompatProviders = ["minimax", "minimax-coding", "kimi", "kimi-coding", "z-ai"];
+    const isMinimaxModel = modelName.toLowerCase().includes("minimax");
+
+    if (anthropicCompatProviders.includes(providerName)) {
+      formatAdapterName = "AnthropicAPIFormat";
+      declaredStreamFormat = "anthropic-sse";
+    } else if (
+      (providerName === "opencode-zen" || providerName === "opencode-zen-go") &&
+      isMinimaxModel
+    ) {
+      formatAdapterName = "AnthropicAPIFormat";
+      declaredStreamFormat = "anthropic-sse";
+    } else if (providerName === "gemini" || providerName === "gemini-codeassist") {
+      formatAdapterName = "GeminiAPIFormat";
+      declaredStreamFormat = "gemini-sse";
+    } else if (providerName === "ollamacloud") {
+      formatAdapterName = "OllamaAPIFormat";
+      declaredStreamFormat = "openai-sse";
+    } else if (providerName === "litellm") {
+      formatAdapterName = "LiteLLMAPIFormat";
+      declaredStreamFormat = "openai-sse";
+    } else {
+      formatAdapterName = "OpenAIAPIFormat";
+      declaredStreamFormat = "openai-sse";
+    }
+
+    const { DialectManager } = await import("./adapters/dialect-manager.js");
+    const adapterManager = new DialectManager(modelName);
+    const modelTranslator = adapterManager.getAdapter();
+    const modelTranslatorName = modelTranslator.getName();
+
+    const TRANSPORT_OVERRIDES: Record<string, string> = {
+      litellm: "openai-sse",
+      openrouter: "openai-sse",
+    };
+    const transportOverride = TRANSPORT_OVERRIDES[providerName] || null;
+
+    const modelTranslatorFormat =
+      modelTranslatorName !== "DefaultAPIFormat" ? modelTranslator.getStreamFormat() : null;
+    const effectiveStreamFormat =
+      transportOverride || modelTranslatorFormat || declaredStreamFormat;
+
+    return {
+      formatAdapter: formatAdapterName,
+      declaredStreamFormat,
+      modelTranslator: modelTranslatorName,
+      contextWindow: modelTranslator.getContextWindow(),
+      supportsVision: modelTranslator.supportsVision(),
+      transportOverride,
+      effectiveStreamFormat,
+    };
+  }
+
+  // ── JSON path: existing batch logic, completely unchanged output ──
   if (jsonOutput) {
-    console.log(JSON.stringify(results, null, 2));
+    const DIM = "\x1b[2m";
+    const YELLOW = "\x1b[33m";
+    const RESET = "\x1b[0m";
+
+    let liveProxy: LiveProxy | null = null;
+    if (options.live) {
+      try {
+        const { findAvailablePort } = await import("./port-manager.js");
+        const { createProxyServer } = await import("./proxy-server.js");
+        const probePort = await findAvailablePort(47600);
+        console.error(
+          `${DIM}Probing providers via live requests (may incur small cost, use --no-probe to skip)...${RESET}`
+        );
+        liveProxy = await createProxyServer(
+          probePort,
+          process.env.OPENROUTER_API_KEY,
+          undefined,
+          false,
+          process.env.ANTHROPIC_API_KEY,
+          undefined,
+          { quiet: true }
+        );
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(
+          `${YELLOW}Failed to start probe proxy (${msg}). Falling back to static probe.${RESET}`
+        );
+        liveProxy = null;
+      }
+    }
+
+    try {
+      const results: ChainProbe[] = [];
+
+      for (const modelInput of models) {
+        const { parsed, chain, chainDetails } = buildModelChain(modelInput);
+
+        // Direct probe
+        let directProbeResult: ProbeResult | undefined;
+        if (liveProxy && chain.source === "direct") {
+          const directKeyInfo = API_KEY_MAP[parsed.provider];
+          const directProviderDef = getProviderByName(parsed.provider);
+          const directHasCreds = directProviderDef?.isLocal
+            ? isLocalProviderEnabled(parsed.provider)
+            : directKeyInfo?.envVar
+              ? !!process.env[directKeyInfo.envVar] ||
+                (directKeyInfo.aliases?.some((a) => !!process.env[a]) ?? false)
+              : true;
+          const directCredentialHint =
+            directProviderDef?.isLocal && !directHasCreds
+              ? "enable local provider in global config"
+              : directKeyInfo?.envVar;
+          directProbeResult = await probeProviderRoute(
+            liveProxy.url,
+            {
+              provider: parsed.provider,
+              modelSpec: modelInput,
+              hasCredentials: directHasCreds,
+              credentialHint: directCredentialHint,
+            },
+            options.timeoutMs
+          ).catch((e) => ({
+            state: "error" as const,
+            latencyMs: 0,
+            errorMessage: String(e instanceof Error ? e.message : e),
+          }));
+        }
+
+        // Chain probes (batch)
+        if (liveProxy) {
+          const probes = await Promise.all(
+            chainDetails.map((link) => {
+              return probeProviderRoute(
+                liveProxy!.url,
+                {
+                  provider: link.provider,
+                  modelSpec: link.modelSpec,
+                  hasCredentials: link.hasCredentials,
+                  credentialHint: link.credentialHint,
+                },
+                options.timeoutMs
+              ).catch((e) => ({
+                state: "error" as const,
+                latencyMs: 0,
+                errorMessage: String(e instanceof Error ? e.message : e),
+              }));
+            })
+          );
+          for (let i = 0; i < chainDetails.length; i++) {
+            chainDetails[i].probe = probes[i];
+          }
+        }
+
+        const wiring = await computeWiring(chainDetails, parsed.model);
+
+        results.push({
+          model: modelInput,
+          nativeProvider: parsed.provider,
+          isExplicit: parsed.isExplicitProvider,
+          routingSource: chain.source,
+          matchedPattern: chain.matchedPattern,
+          chain: chainDetails,
+          directProbe: directProbeResult,
+          wiring,
+        });
+      }
+
+      console.log(JSON.stringify(results, null, 2));
+    } finally {
+      if (liveProxy) {
+        try {
+          await liveProxy.shutdown();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     return;
   }
 
-  // TUI-style output
-  const totalWidth = 80;
-  const line = "─".repeat(totalWidth);
-  const doubleLine = "═".repeat(totalWidth);
+  // ── Interactive TUI path (OpenTUI React) ─────────────────────────
+  const initialState: ProbeAppState = {
+    steps: [],
+    links: [],
+    phase: "live",
+    results: [],
+    activeTab: "summary",
+  };
+  const tui = await startProbeTui(initialState);
 
-  console.log("");
-  console.log(`${BOLD}${CYAN}  PROVIDER ROUTING PROBE${RESET}`);
-  console.log(`  ${DIM}${doubleLine}${RESET}`);
-  console.log("");
+  const addStep = (name: string, status: ProbeStepState["status"]): void => {
+    tui.store.setState((prev) => ({
+      ...prev,
+      steps: [...prev.steps, { name, status }],
+    }));
+  };
+  const updateStep = (name: string, status: ProbeStepState["status"]): void => {
+    tui.store.setState((prev) => ({
+      ...prev,
+      steps: prev.steps.map((s) => (s.name === name ? { ...s, status } : s)),
+    }));
+  };
+  const setLinks = (links: ProbeLinkState[]): void => {
+    tui.store.setState((prev) => ({ ...prev, links }));
+  };
+  const updateLink = (id: string, patch: Partial<ProbeLinkState>): void => {
+    tui.store.setState((prev) => ({
+      ...prev,
+      links: prev.links.map((l) => (l.id === id ? { ...l, ...patch } : l)),
+    }));
+  };
 
-  for (const result of results) {
-    // Model header
-    const providerLabel = result.isExplicit
-      ? `${YELLOW}explicit${RESET}`
-      : `${DIM}detected: ${result.nativeProvider}${RESET}`;
+  let liveProxy: LiveProxy | null = null;
+  try {
+    // Step 1: Load routing rules
+    addStep("Loading routing rules", "running");
+    loadRoutingRules();
+    updateStep("Loading routing rules", "done");
 
-    console.log(`  ${BOLD}${result.model}${RESET}  ${providerLabel}`);
-
-    if (result.routingSource === "custom-rules") {
-      const pat = result.matchedPattern ? ` (pattern: "${result.matchedPattern}")` : "";
-      console.log(`  ${CYAN}Custom routing rules${pat}${RESET}`);
+    // Step 2: Start live proxy (if enabled)
+    if (options.live) {
+      addStep("Starting probe proxy", "running");
+      try {
+        const { findAvailablePort } = await import("./port-manager.js");
+        const { createProxyServer } = await import("./proxy-server.js");
+        const probePort = await findAvailablePort(47600);
+        liveProxy = await createProxyServer(
+          probePort,
+          process.env.OPENROUTER_API_KEY,
+          undefined,
+          false,
+          process.env.ANTHROPIC_API_KEY,
+          undefined,
+          { quiet: true }
+        );
+        updateStep("Starting probe proxy", "done");
+      } catch {
+        updateStep("Starting probe proxy", "error");
+        liveProxy = null;
+      }
     }
 
-    console.log(`  ${DIM}${line}${RESET}`);
+    // Step 4: Build chains + credential checks
+    addStep("Resolving routing chains", "running");
+    const modelChains: Array<{
+      modelInput: string;
+      parsed: ReturnType<typeof parseModelSpec>;
+      chain: ReturnType<typeof buildModelChain>["chain"];
+      chainDetails: ReturnType<typeof buildModelChain>["chainDetails"];
+    }> = [];
+    for (const modelInput of models) {
+      const { parsed, chain, chainDetails } = buildModelChain(modelInput);
+      modelChains.push({ modelInput, parsed, chain, chainDetails });
+    }
+    updateStep("Resolving routing chains", "done");
 
-    if (result.routingSource === "direct") {
-      console.log(
-        `  ${GREEN}  Direct → ${result.nativeProvider}${RESET}  (explicit provider prefix, no fallback chain)`
-      );
+    // Step 5: Live probing with progress bars
+    const directProbeResults = new Map<string, ProbeResult>();
 
-      // Show API key provenance layers for explicit provider routing
-      const directKeyInfo = API_KEY_MAP[result.nativeProvider];
-      if (directKeyInfo?.envVar) {
-        const provenance = resolveApiKeyProvenance(directKeyInfo.envVar, directKeyInfo.aliases);
-        console.log("");
-        if (provenance.effectiveValue) {
-          console.log(`  ${DIM}  API Key Resolution:${RESET}`);
-          for (const line of formatProvenanceProbe(provenance, "    ")) {
-            // Colorize the active layer
-            if (line.includes(">>>")) {
-              console.log(`  ${GREEN}${line}${RESET}`);
-            } else {
-              console.log(`  ${DIM}${line}${RESET}`);
-            }
-          }
-        } else {
-          console.log(`  ${RED}  API key: ${directKeyInfo.envVar} not set!${RESET}`);
+    if (liveProxy) {
+      // Collect all probe links across all models
+      const allLinks: Array<{
+        id: string;
+        displayName: string;
+        modelSpec: string;
+        provider: string;
+        pinnedSpec: string;
+        hasCredentials: boolean;
+        credentialHint?: string;
+        chainDetail: ReturnType<typeof buildModelChain>["chainDetails"][number] | null;
+        isDirect: boolean;
+        modelInput: string;
+      }> = [];
+
+      for (const { modelInput, parsed, chain, chainDetails } of modelChains) {
+        if (chain.source === "direct") {
+          const directKeyInfo = API_KEY_MAP[parsed.provider];
+          const directProviderDef = getProviderByName(parsed.provider);
+          const directHasCreds = directProviderDef?.isLocal
+            ? isLocalProviderEnabled(parsed.provider)
+            : directKeyInfo?.envVar
+              ? !!process.env[directKeyInfo.envVar] ||
+                (directKeyInfo.aliases?.some((a) => !!process.env[a]) ?? false)
+              : true;
+          const directCredentialHint =
+            directProviderDef?.isLocal && !directHasCreds
+              ? "enable local provider in global config"
+              : directKeyInfo?.envVar;
+          allLinks.push({
+            id: `${modelInput}:direct`,
+            displayName: parsed.provider,
+            modelSpec: modelInput,
+            provider: parsed.provider,
+            pinnedSpec: modelInput,
+            hasCredentials: directHasCreds,
+            credentialHint: directCredentialHint,
+            chainDetail: null,
+            isDirect: true,
+            modelInput,
+          });
+        }
+        for (const link of chainDetails) {
+          const pinnedSpec = pinProbeModelSpec(link);
+          allLinks.push({
+            id: `${modelInput}:${link.provider}`,
+            displayName: link.displayName,
+            modelSpec: pinnedSpec,
+            provider: link.provider,
+            pinnedSpec,
+            hasCredentials: link.hasCredentials,
+            credentialHint: link.credentialHint,
+            chainDetail: link,
+            isDirect: false,
+            modelInput,
+          });
         }
       }
-    } else if (result.chain.length === 0) {
-      console.log(`  ${RED}  No providers available${RESET} — no credentials configured`);
-    } else {
-      // Fallback chain table
-      const maxProviderLen = Math.max(...result.chain.map((c) => c.displayName.length), 12);
-      const maxSpecLen = Math.max(...result.chain.map((c) => c.modelSpec.length), 10);
 
-      console.log(
-        `  ${DIM}  #  ${"Provider".padEnd(maxProviderLen)}  ${"Model Spec".padEnd(maxSpecLen)}  Status${RESET}`
+      // Seed the store with waiting links
+      setLinks(
+        allLinks.map((l) => ({
+          id: l.id,
+          model: l.modelInput,
+          displayName: l.displayName,
+          modelSpec: l.modelSpec,
+          status: "waiting",
+        }))
       );
 
-      for (let i = 0; i < result.chain.length; i++) {
-        const entry = result.chain[i];
-        const num = `${i + 1}`.padStart(2);
-        const provider = entry.displayName.padEnd(maxProviderLen);
-        const spec = entry.modelSpec.padEnd(maxSpecLen);
+      // Fire all probes concurrently, updating per-link state as results arrive
+      const probePromises = allLinks.map(async (link) => {
+        updateLink(link.id, { status: "probing", startTime: Date.now() });
 
-        let status: string;
-        if (entry.hasCredentials) {
-          status = `${GREEN}● ready${RESET}`;
-        } else {
-          status = `${RED}○ missing ${DIM}(${entry.credentialHint})${RESET}`;
-        }
-
-        // Highlight first ready provider
-        const isFirstReady =
-          entry.hasCredentials && !result.chain.slice(0, i).some((c) => c.hasCredentials);
-        const prefix = isFirstReady ? `${BG_DIM}` : "";
-        const suffix = isFirstReady ? `${RESET}` : "";
-
-        console.log(`${prefix}  ${num}  ${provider}  ${DIM}${spec}${RESET}  ${status}${suffix}`);
-      }
-
-      // Summary
-      const readyCount = result.chain.filter((c) => c.hasCredentials).length;
-      const firstReady = result.chain.find((c) => c.hasCredentials);
-      if (readyCount === 0) {
-        console.log(`\n  ${RED}  No providers have credentials — this model will fail${RESET}`);
-      } else if (firstReady) {
-        console.log(
-          `\n  ${DIM}  Will use: ${RESET}${GREEN}${firstReady.displayName}${RESET}${DIM} (${readyCount}/${result.chain.length} providers available)${RESET}`
+        const result = await probeProviderRoute(
+          liveProxy!.url,
+          {
+            provider: link.provider,
+            modelSpec: link.modelSpec,
+            hasCredentials: link.hasCredentials,
+            credentialHint: link.credentialHint,
+          },
+          options.timeoutMs
+        ).catch(
+          (e): ProbeResult => ({
+            state: "error",
+            latencyMs: 0,
+            errorMessage: String(e instanceof Error ? e.message : e),
+          })
         );
 
-        // Show API key provenance for the active provider
-        if (firstReady.provenance?.effectiveValue) {
-          console.log("");
-          console.log(`  ${DIM}  API Key Resolution:${RESET}`);
-          for (const line of formatProvenanceProbe(firstReady.provenance, "    ")) {
-            if (line.includes(">>>")) {
-              console.log(`  ${GREEN}${line}${RESET}`);
-            } else {
-              console.log(`  ${DIM}${line}${RESET}`);
-            }
-          }
+        if (result.state === "live") {
+          updateLink(link.id, {
+            status: "live",
+            endTime: Date.now(),
+            timing: result.timing,
+          });
+        } else {
+          updateLink(link.id, {
+            status: "failed",
+            endTime: Date.now(),
+            error: describeProbeState(result),
+          });
         }
 
-        if (result.wiring) {
-          const w = result.wiring;
-          console.log("");
-          console.log(`  ${DIM}  Wiring:${RESET}`);
-          console.log(
-            `  ${DIM}    Format:     ${RESET}${w.formatAdapter}  ${DIM}→ ${w.declaredStreamFormat}${RESET}`
-          );
-
-          const ctxDisplay =
-            w.contextWindow >= 1_000_000
-              ? `${(w.contextWindow / 1_000_000).toFixed(1)}M`
-              : `${Math.round(w.contextWindow / 1000)}K`;
-          const visionDisplay = w.supportsVision ? `${GREEN}yes${RESET}` : `${RED}no${RESET}`;
-          console.log(
-            `  ${DIM}    Translator: ${RESET}${w.modelTranslator}  ${DIM}(${ctxDisplay} context, vision: ${visionDisplay}${DIM})${RESET}`
-          );
-
-          if (w.transportOverride) {
-            console.log(
-              `  ${DIM}    Override:   ${RESET}${YELLOW}transport overrides → ${w.transportOverride}${RESET}`
-            );
-          }
-
-          const parserColor = w.effectiveStreamFormat === w.declaredStreamFormat ? GREEN : YELLOW;
-          const parserNote = w.transportOverride
-            ? `${DIM}← transport override wins${RESET}`
-            : w.effectiveStreamFormat !== w.declaredStreamFormat
-              ? `${DIM}← model translator wins${RESET}`
-              : "";
-          console.log(
-            `  ${DIM}    Parser:     ${RESET}${parserColor}${w.effectiveStreamFormat}${RESET}  ${parserNote}`
-          );
+        if (link.isDirect) {
+          directProbeResults.set(link.modelInput, result);
+        } else if (link.chainDetail) {
+          link.chainDetail.probe = result;
         }
-      }
+      });
+
+      await Promise.all(probePromises);
     }
 
-    console.log("");
-  }
+    // Step 6: Compute wiring for each model while the progress UI is still up
+    // (computeWiring does async imports we want to finish before the flip).
+    // We build BOTH payloads from the same per-model data:
+    //   - `printable` (PrintableModelResult) feeds the non-TTY static printer
+    //     and the leaderboard-to-scrollback print on quit.
+    //   - `results` (ProbeModelResult) feeds the interactive Details tab.
+    const isLiveProbe = !!liveProxy;
+    const printable: PrintableModelResult[] = [];
+    const results: ProbeModelResult[] = [];
+    for (const { modelInput, parsed, chain, chainDetails } of modelChains) {
+      const wiring = await computeWiring(chainDetails, parsed.model);
+      const directProbe = directProbeResults.get(modelInput);
+      printable.push({
+        model: modelInput,
+        nativeProvider: parsed.provider,
+        isExplicit: parsed.isExplicitProvider,
+        routingSource: chain.source,
+        matchedPattern: chain.matchedPattern,
+        chain: chainDetails.map((c) => ({
+          provider: c.provider,
+          displayName: c.displayName,
+          modelSpec: c.modelSpec,
+          hasCredentials: c.hasCredentials,
+          credentialHint: c.credentialHint,
+          provenance: c.provenance,
+          probe: c.probe,
+        })),
+        directProbe,
+        wiring,
+      });
+      results.push({
+        model: modelInput,
+        nativeProvider: parsed.provider,
+        isExplicit: parsed.isExplicitProvider,
+        routingSource: chain.source,
+        matchedPattern: chain.matchedPattern,
+        routingExplanation: buildRoutingExplanation(parsed, chain),
+        links: buildResultLinks(parsed, chainDetails, directProbe),
+        wiring,
+      });
+    }
 
-  // Legend
-  console.log(`  ${DIM}${line}${RESET}`);
-  console.log(`  ${GREEN}●${RESET} ready    API key found, provider will be attempted`);
-  console.log(`  ${RED}○${RESET} missing  API key not set, provider skipped`);
-  console.log(`  ${BG_DIM}  highlighted  ${RESET} = first provider that will handle the request`);
-  console.log("");
-  console.log(
-    `  ${DIM}Chain order: LiteLLM → Zen Go → Subscription → Native API → OpenRouter${RESET}`
-  );
-  console.log(
-    `  ${DIM}Custom rules in .claudish.json or ~/.claudish/config.json override default chain${RESET}`
-  );
-  console.log("");
-  console.log(
-    `  ${DIM}Wiring shows the full adapter composition: format adapter → stream parser${RESET}`
-  );
-  console.log(
-    `  ${DIM}Override occurs when aggregators (LiteLLM, OpenRouter) normalize response format${RESET}`
-  );
-  console.log("");
+    // TTY gate: `process.stdout.isTTY` is the discriminator that distinguishes a
+    // bare interactive run (both std streams are a TTY) from a `… | cat` pipe
+    // (stdout is piped, stderr stays a TTY). The literal `stderr.isTTY` would
+    // route `… | cat` to the interactive path and hang forever waiting for `q`.
+    const interactive = !!process.stdout.isTTY && !!process.stderr.isTTY;
+
+    if (interactive) {
+      // STAY INSIDE THE TUI: land results + flip to the "done" phase (tabs),
+      // keep the app alive, and wait for the user to quit (q / Esc). Nothing is
+      // dumped to stdout. The live proxy can shut down now — all probes are done.
+      if (liveProxy) {
+        try {
+          await liveProxy.shutdown();
+        } catch {
+          /* ignore */
+        }
+        liveProxy = null;
+      }
+      tui.store.setResults(results);
+      await tui.waitForQuit();
+      await tui.shutdown();
+      // Clean exit: nothing dumped to scrollback. Everything (Summary,
+      // Leaderboard, Details) was viewable in the tabs while the app ran.
+    } else {
+      // Non-TTY / piped path — keep today's behavior. Shut down the renderer
+      // cleanly BEFORE printing static output (avoids the OpenTUI in-place
+      // reconciliation bug) and print the full static results table to stderr.
+      if (liveProxy) {
+        try {
+          await liveProxy.shutdown();
+        } catch {
+          /* ignore */
+        }
+        liveProxy = null;
+      }
+      await tui.shutdown();
+      printProbeResults(printable, isLiveProbe);
+    }
+  } finally {
+    if (liveProxy) {
+      try {
+        await liveProxy.shutdown();
+      } catch {
+        /* ignore */
+      }
+    }
+    await tui.shutdown();
+  }
 }
 
 /**
  * Print help message
  */
 function printHelp(): void {
+  // ── Color palette ─────────────────────────────────────────────────────────
+  // Gated on an interactive stdout + the NO_COLOR convention so that
+  // `claudish --help | less` / redirecting to a file stays free of escape codes.
+  const useColor = !!process.stdout.isTTY && !process.env.NO_COLOR;
+  const c = (code: string) => (s: string) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+  const bold = c("1");
+  const dim = c("2");
+  const cyan = c("36"); // section headers
+  const green = c("32"); // commands / flags
+  const yellow = c("33"); // values / placeholders
+  const magenta = c("35"); // provider shortcuts
+  const blue = c("34"); // env var names
+  // Section header helper — a colored, underlined title with a leading rule mark.
+  const h = (title: string) => bold(cyan(`▌ ${title}`));
+
   console.log(`
-claudish - Run Claude Code with any AI model (OpenRouter, Gemini, OpenAI, MiniMax, Kimi, GLM, Z.AI, Local)
+${bold("claudish")} ${dim("·")} Run Claude Code with any AI model
+${dim("OpenRouter · Gemini · OpenAI · xAI · MiniMax · Kimi · GLM · Z.AI · Sakana · Poe · LiteLLM · Local")}
 
-USAGE:
-  claudish                                # Interactive mode (default, shows model selector)
-  claudish [OPTIONS] <claude-args...>     # Single-shot mode (requires --model)
+${h("USAGE")}
+  ${green("claudish")}                                ${dim("# Interactive mode (default, model selector)")}
+  ${green("claudish")} ${yellow("[OPTIONS] <claude-args...>")}     ${dim("# Single-shot mode (requires --model)")}
+  ${green("claudish")} ${green("--team")} ${yellow("a,b,c")} ${yellow('"prompt"')}          ${dim("# Run models in parallel (magmux grid)")}
+  ${green("claudish")} ${green("--team")} ${yellow("a,b,c")} ${green("-f")} ${yellow("input.md")}       ${dim("# Team mode with file input")}
 
-MODEL ROUTING:
-  New syntax: provider@model[:concurrency]
-    google@gemini-3-pro              Direct Google API (explicit)
-    openrouter@google/gemini-3-pro   OpenRouter (explicit)
-    oai@gpt-5.3                      Direct OpenAI API (shortcut)
-    ollama@llama3.2:3                Local Ollama with 3 concurrent requests
-    ollama@llama3.2:0                Local Ollama with no limits
+${h("MODEL ROUTING")}
+  ${bold("New syntax:")} ${yellow("provider@model[:concurrency]")}
+    ${magenta("google@gemini-3-pro")}              ${dim("Direct Google API (explicit)")}
+    ${magenta("openrouter@google/gemini-3-pro")}   ${dim("OpenRouter (explicit)")}
+    ${magenta("oai@gpt-5.3")}                      ${dim("Direct OpenAI API (shortcut)")}
+    ${magenta("ollama@llama3.2:3")}                ${dim("Local Ollama, 3 concurrent requests")}
+    ${magenta("ollama@llama3.2:0")}                ${dim("Local Ollama, no limits")}
 
-  Provider shortcuts:
-    g, gemini    -> Google Gemini     google@gemini-3-pro
-    oai          -> OpenAI Direct     oai@gpt-5.3
-    or           -> OpenRouter        or@openai/gpt-5.3
-    mm, mmax     -> MiniMax Direct    mm@MiniMax-M2.1
-    kimi, moon   -> Kimi Direct       kimi@kimi-k2-thinking-turbo
-    glm, zhipu   -> GLM Direct        glm@glm-4.7
-    zai          -> Z.AI Direct       zai@glm-4.7
-    oc           -> OllamaCloud       oc@llama-3.1
-    llama,lc,meta-> OllamaCloud       llama@llama-3.1
-    zen          -> OpenCode Zen      zen@grok-code
-    v, vertex    -> Vertex AI         v@gemini-2.5-flash
-    go           -> Gemini CodeAssist go@gemini-2.5-flash
-    poe          -> Poe               poe@GPT-4o
-    ollama       -> Ollama (local)    ollama@llama3.2
-    lms,lmstudio -> LM Studio (local) lms@qwen
-    vllm         -> vLLM (local)      vllm@model
-    mlx          -> MLX (local)       mlx@model
+  ${bold("Provider shortcuts:")}
+    ${magenta("g, gemini")}      ${dim("->")} Google Gemini       ${dim("google@gemini-3-pro")}
+    ${magenta("oai")}            ${dim("->")} OpenAI Direct       ${dim("oai@gpt-5.3")}
+    ${magenta("cx, codex")}      ${dim("->")} OpenAI Codex        ${dim("cx@gpt-5.3 (Responses API)")}
+    ${magenta("or")}             ${dim("->")} OpenRouter          ${dim("or@openai/gpt-5.3")}
+    ${magenta("x-ai, xai, grok")} ${dim("->")} xAI / Grok         ${dim("x-ai@grok-3")}
+    ${magenta("mm, mmax")}       ${dim("->")} MiniMax Direct      ${dim("mm@MiniMax-M2.1")}
+    ${magenta("mmc")}            ${dim("->")} MiniMax Coding      ${dim("mmc@MiniMax-M2.1")}
+    ${magenta("kimi, moon")}     ${dim("->")} Kimi Direct         ${dim("kimi@kimi-k2-thinking-turbo")}
+    ${magenta("kc")}             ${dim("->")} Kimi Coding         ${dim("kc@kimi-k2-thinking-turbo")}
+    ${magenta("glm, zhipu")}     ${dim("->")} GLM Direct          ${dim("glm@glm-4.7")}
+    ${magenta("gc")}             ${dim("->")} GLM Coding          ${dim("gc@glm-4.7")}
+    ${magenta("z-ai, zai")}      ${dim("->")} Z.AI Direct         ${dim("z-ai@glm-4.7")}
+    ${magenta("oc, llama, lc, meta")} ${dim("->")} OllamaCloud    ${dim("oc@llama-3.1")}
+    ${magenta("zen")}            ${dim("->")} OpenCode Zen        ${dim("zen@grok-code")}
+    ${magenta("zengo, zgo")}     ${dim("->")} OpenCode Zen Go     ${dim("zengo@grok-code")}
+    ${magenta("v, vertex")}      ${dim("->")} Vertex AI           ${dim("v@gemini-2.5-flash")}
+    ${magenta("go")}             ${dim("->")} Gemini Code Assist  ${dim("go@gemini-2.5-flash")}
+    ${magenta("poe")}            ${dim("->")} Poe                 ${dim("poe@GPT-4o")}
+    ${magenta("litellm, ll")}    ${dim("->")} LiteLLM             ${dim("ll@gpt-4o (needs LITELLM_BASE_URL)")}
+    ${magenta("ds")}             ${dim("->")} DeepSeek            ${dim("ds@deepseek-chat")}
+    ${magenta("sakana, fugu")}   ${dim("->")} Sakana Fugu         ${dim("fugu@fugu-ultra")}
+    ${magenta("sc")}             ${dim("->")} Sakana Subscription ${dim("sc@fugu-ultra")}
+    ${magenta("ollama")}         ${dim("->")} Ollama (local)      ${dim("ollama@llama3.2")}
+    ${magenta("lms, lmstudio")}  ${dim("->")} LM Studio (local)   ${dim("lms@qwen")}
+    ${magenta("vllm")}           ${dim("->")} vLLM (local)        ${dim("vllm@model")}
+    ${magenta("mlx")}            ${dim("->")} MLX (local)         ${dim("mlx@model")}
 
-  Native model auto-detection (when no provider specified):
-    google/*, gemini-*      -> Google API
-    openai/*, gpt-*, o1-*   -> OpenAI API
-    meta-llama/*, llama-*   -> OllamaCloud
-    minimax/*, abab-*       -> MiniMax API
-    moonshot/*, kimi-*      -> Kimi API
-    zhipu/*, glm-*          -> GLM API
-    poe:*                   -> Poe
-    anthropic/*, claude-*   -> Native Anthropic
-    (unknown vendor/)       -> Error (use openrouter@vendor/model)
+  ${bold("Native auto-detection")} ${dim("(when no provider specified):")}
+    ${yellow("google/*, gemini-*")}      ${dim("->")} Google API
+    ${yellow("openai/*, gpt-*, o1-*")}   ${dim("->")} OpenAI API
+    ${yellow("x-ai/*, grok-*")}          ${dim("->")} xAI
+    ${yellow("meta-llama/*, llama-*")}   ${dim("->")} OllamaCloud
+    ${yellow("minimax/*, abab-*")}       ${dim("->")} MiniMax API
+    ${yellow("moonshot/*, kimi-*")}      ${dim("->")} Kimi API
+    ${yellow("zhipu/*, glm-*")}          ${dim("->")} GLM API
+    ${yellow("sakana/*, fugu-*")}        ${dim("->")} Sakana Fugu
+    ${yellow("poe:*")}                   ${dim("->")} Poe
+    ${yellow("anthropic/*, claude-*")}   ${dim("->")} Native Anthropic
+    ${yellow("(unknown vendor/)")}       ${dim("->")} Error (use openrouter@vendor/model)
 
-  Legacy syntax (deprecated, still works):
-    g/, gemini/      Google Gemini API      claudish --model g/gemini-2.0-flash "task"
-    oai/             OpenAI Direct API      claudish --model oai/gpt-4o "task"
-    mmax/, mm/       MiniMax Direct API     claudish --model mmax/MiniMax-M2.1 "task"
-    kimi/, moonshot/ Kimi Direct API        claudish --model kimi/kimi-k2-thinking-turbo "task"
-    ollama/          Ollama (local)         claudish --model ollama/llama3.2 "task"
-    http://...       Custom endpoint        claudish --model http://localhost:8000/model "task"
+  ${dim("A defaultProvider (config / --default-provider) catches bare names that match no rule.")}
 
-OPTIONS:
-  -i, --interactive        Run in interactive mode (default when no prompt given)
-  -m, --model <model>      OpenRouter model to use (required for single-shot mode)
-  -p, --profile <name>     Use named profile for model mapping (default: uses default profile)
-  --port <port>            Proxy server port (default: random)
-  -d, --debug              Enable debug logging to file (logs/claudish_*.log)
-  --no-logs                Disable always-on structural logging (~/.claudish/logs/)
-  --diag-mode <mode>       Diagnostic output: auto (default), pty, tmux, logfile, off
-                           Also: CLAUDISH_DIAG_MODE env var or "diagMode" in config.json
-  --log-level <level>      Log verbosity: debug (full), info (truncated), minimal (labels only)
-  -q, --quiet              Suppress [claudish] log messages (default in single-shot mode)
-  -v, --verbose            Show [claudish] log messages (default in interactive mode)
-  --json                   Output in JSON format for tool integration (implies --quiet)
-  --stdin                  Read prompt from stdin (useful for large prompts or piping)
-  --free                   Show only FREE models in the interactive selector
-  --monitor                Monitor mode - proxy to REAL Anthropic API and log all traffic
-  -y, --auto-approve       Skip permission prompts (--dangerously-skip-permissions)
-  --no-auto-approve        Explicitly enable permission prompts (default)
-  --dangerous              Pass --dangerouslyDisableSandbox to Claude Code
-  --cost-tracker           Enable cost tracking for API usage (NB!)
-  --audit-costs            Show cost analysis report
-  --reset-costs            Reset accumulated cost statistics
-  --models                 List ALL models (OpenRouter + OpenCode Zen + Ollama)
-  --models <query>         Fuzzy search all models by name, ID, or description
-  --top-models             List recommended/top programming models (curated)
-  --probe <models...>      Show fallback chain for each model (diagnostic)
-  --json                   Output in JSON format (use with --models, --top-models, --probe)
-  --force-update           Force refresh model cache from OpenRouter API
-  --version                Show version information
-  -h, --help               Show this help message
-  --help-ai                Show AI agent usage guide (file-based patterns, sub-agents)
-  --init                   Install Claudish skill in current project (.claude/skills/)
-  --                       Separator: everything after passes directly to Claude Code
+${h("OPTIONS")}
+  ${green("-i, --interactive")}        Run in interactive mode (default when no prompt given)
+  ${green("-m, --model")} ${yellow("<model>")}      Model to use (required for single-shot mode)
+  ${green("--profile")} ${yellow("<name>")}         Use named profile for model mapping (default profile if omitted)
+  ${green("--default-provider")} ${yellow("<name>")} Fallback provider for bare model names (builtin or customEndpoints key)
+                           ${dim("Precedence: this flag > CLAUDISH_DEFAULT_PROVIDER env > config.json")}
+  ${green("--op")} ${yellow("<op://glob>")}         Load API keys from a 1Password item glob (SDK-based, no op CLI)
+  ${green("--op")} ${yellow("<glob>")} ${green("--list")}      Preview which fields the glob would import (names only, no values)
+  ${green("--op-env")} ${yellow("<id>")}            Load env vars from a 1Password Environment (highest priority)
+  ${green("--port")} ${yellow("<port>")}            Proxy server port (default: random)
+  ${green("-d, --debug-claudish")}     Enable claudish debug logging to file (logs/claudish_*.log)
+                           ${dim('Always-on: CLAUDISH_DEBUG=1 env var or "debug": true in config.json')}
+  ${green("--no-debug-claudish")}      Force debug logging off for this run (when globally enabled)
+  ${green("--log-off")}                Disable always-on structural logging (~/.claudish/logs/)
+  ${green("--log-diag")} ${yellow("<mode>")}        Diagnostic output: auto (default), logfile, off
+                           ${dim('Also: CLAUDISH_DIAG_MODE env var or "diagMode" in config.json')}
+  ${green("--log-level")} ${yellow("<level>")}      Log verbosity: debug (full), info (truncated), minimal (labels)
+  ${green("-q, --quiet")}              Suppress [claudish] log messages (default in single-shot mode)
+  ${green("-v, --verbose")}            Show [claudish] log messages (default in interactive mode)
+  ${green("--json")}                   Output JSON for tool integration (implies --quiet)
+  ${green("--stdin")}                  Read prompt from stdin (large prompts / piping)
+  ${green("--free")}                   Show only FREE models in the interactive selector
+  ${green("--monitor")}                Monitor mode - proxy to REAL Anthropic API and log traffic
+  ${green("--advisor")} ${yellow('"m1,m2[:collector]"')}  Multi-model advisor replacement (implies --monitor)
+  ${green("-y, --auto-approve")}       Skip permission prompts (--dangerously-skip-permissions)
+  ${green("--no-auto-approve")}        Explicitly enable permission prompts (default)
+  ${green("--dangerous")}              Pass --dangerouslyDisableSandbox to Claude Code
+  ${green("--cost-track")}             Enable cost tracking for API usage
+  ${green("--cost-audit")}             Show cost analysis report
+  ${green("--cost-reset")}             Reset accumulated cost statistics
+  ${green("--version")}                Show version information
+  ${green("-h, --help")}               Show this help message
+  ${green("--help-ai")}                Show AI agent usage guide (file-based patterns, sub-agents)
+  ${green("--init")}                   Install Claudish skill in current project (.claude/skills/)
+  ${green("--")}                       Separator: everything after passes directly to Claude Code
 
-CLAUDE CODE FLAG PASSTHROUGH:
-  Any unrecognized flag is automatically forwarded to Claude Code.
-  Claudish flags (--model, --stdin, --quiet, etc.) can appear in any order.
+${h("MODEL DISCOVERY")}
+  ${green("--models")}                              Top 100 ranked (Firebase + local providers)
+  ${green("--models --provider")} ${yellow("<slug>")}                Filter the catalog to one provider
+                                          ${dim("e.g. --provider opencode-zen, anthropic, openai")}
+  ${green("--providers")}                           Every provider + active-model count
+  ${green("-s, --models-search")} ${yellow("<query>")}             Fuzzy search: id, brand synonyms (chatgpt,
+                                          ${dim("claude, grok), gateways (zen, oc, codex), caps")}
+  ${green("--models-top")}                          Curated recommended models (flagship + fast)
+  ${green("--probe")} ${yellow("<models...>")}                    Probe each provider in the fallback chain with
+                                          ${dim("a real 1-token request (may incur tiny cost)")}
+  ${green("--no-probe")}                            Skip live requests, show static chain only
+  ${green("--probe-timeout")} ${yellow("<secs>")}                 Per-link timeout for live probes (default: 40)
+  ${green("--models-refresh")}                      Force refresh the slim model catalog from Firebase
+  ${green("--models-skip-update")}                  Skip the launcher catalog warm step (offline)
+  ${green("--json")}                                JSON output (with --models / --models-top / --probe)
 
-  Examples:
-    claudish --model grok --agent test "task"           # --agent passes to Claude Code
-    claudish --model grok --effort high --stdin "task"   # --effort passes, --stdin stays
-    claudish --model grok --permission-mode plan -i      # Works in interactive mode too
+${h("TEAM MODE")}
+  ${green("--team")} ${yellow("<models>")}           Run multiple models in parallel (comma-separated)
+                           ${dim('Example: --team minimax-m2.5,kimi-k2.5 "prompt"')}
+  ${green("--mode")} ${yellow("<mode>")}             Team mode: default (grid), interactive, json
+  ${green("-f, --file")} ${yellow("<path>")}         Read prompt from file (use with --team or single-shot)
 
-  Use -- when a Claude Code flag value starts with '-':
-    claudish --model grok -- --system-prompt "-verbose mode" "task"
+${h("MODEL MAPPING")} ${dim("(per-role override)")}
+  ${green("--model-opus")} ${yellow("<model>")}      Model for Opus role (planning, complex tasks)
+  ${green("--model-sonnet")} ${yellow("<model>")}    Model for Sonnet role (default coding)
+  ${green("--model-haiku")} ${yellow("<model>")}     Model for Haiku role (fast tasks, background)
+  ${green("--model-subagent")} ${yellow("<model>")}  Model for sub-agents (Task tool)
 
-PROFILE MANAGEMENT:
-  claudish init [--local|--global]            Setup wizard - create config and first profile
-  claudish profile list [--local|--global]    List all profiles (both scopes by default)
-  claudish profile add [--local|--global]     Add a new profile
-  claudish profile remove [name] [--local|--global]  Remove a profile
-  claudish profile use [name] [--local|--global]     Set default profile
-  claudish profile show [name] [--local|--global]    Show profile details
-  claudish profile edit [name] [--local|--global]    Edit a profile
+${h("SUBCOMMANDS")}
+  ${green("claudish config")}                        Open the interactive config TUI (profiles,
+                                          ${dim("providers, routing, 1Password)")}
+  ${green("claudish providers")} ${yellow("[--json]")}             Show provider credential status (no key material)
+  ${green("claudish quota")} ${yellow("[provider]")}              Show remaining quota/usage (alias: usage)
+  ${green("claudish serve")} ${yellow("--port <n> --models <p>")}  Run the Claude Desktop redirect gateway
+  ${green("claudish update")}                        Check for updates and install the latest version
 
-  Scope flags:
-    --local   Target .claudish.json in the current directory (project-specific)
-    --global  Target ~/.claudish/config.json (shared across projects)
-    (omit)    Prompted interactively; suggests local if in a project directory
+  ${bold("Profiles:")}
+    ${green("claudish init")} ${yellow("[--local|--global]")}        Setup wizard - create config + first profile
+    ${green("claudish profile list")} ${yellow("[scope]")}          List all profiles (both scopes by default)
+    ${green("claudish profile add")} ${yellow("[scope]")}           Add a new profile
+    ${green("claudish profile remove")} ${yellow("[name] [scope]")}  Remove a profile
+    ${green("claudish profile use")} ${yellow("[name] [scope]")}     Set default profile
+    ${green("claudish profile show")} ${yellow("[name] [scope]")}    Show profile details
+    ${green("claudish profile edit")} ${yellow("[name] [scope]")}    Edit a profile
+    ${dim("scope = --local (.claudish.json) | --global (~/.claudish/config.json) | (prompted)")}
 
-UPDATE:
-  claudish update          Check for updates and install latest version
+  ${bold("Authentication:")}
+    ${green("claudish login")} ${yellow("[provider]")}              Login to an OAuth provider (interactive if omitted)
+    ${green("claudish logout")} ${yellow("[provider]")}             Clear OAuth credentials
+    ${dim("Providers: gemini, kimi")}
 
-AUTHENTICATION:
-  --gemini-login           Login to Gemini Code Assist via OAuth (for go@ prefix)
-  --gemini-logout          Clear Gemini OAuth credentials
-  --kimi-login             Login to Kimi/Moonshot AI via OAuth (for kc@ prefix)
-  --kimi-logout            Clear Kimi OAuth credentials
+${h("1PASSWORD")} ${dim("(SDK-based — no op CLI needed for secrets)")}
+  ${dim("Auth via OP_SERVICE_ACCOUNT_TOKEN, or OP_ACCOUNT / onepasswordAccount config (DesktopAuth).")}
+  ${green("--op")} ${yellow("<glob> --list")}        Preview which fields a glob would import (names only)
+  ${green("--op")} ${yellow("<glob>")} ${yellow("[...args]")}      Resolve a glob into env vars, then run a session
+                           ${dim("Inline op import requires a GLOB (self-names via field labels)")}
+                           ${dim('Example: claudish --op "op://Jack/Keys/**" --model gpt-4o "task"')}
+  ${green("--op-env")} ${yellow("<id>")}             Load a 1Password Environment (highest-priority source)
+  ${dim("Persistent setup (single refs, sets, environments, account): claudish config -> 1Password tab")}
 
-MODEL MAPPING (per-role override):
-  --model-opus <model>     Model for Opus role (planning, complex tasks)
-  --model-sonnet <model>   Model for Sonnet role (default coding)
-  --model-haiku <model>    Model for Haiku role (fast tasks, background)
-  --model-subagent <model> Model for sub-agents (Task tool)
+${h("CLAUDE CODE FLAG PASSTHROUGH")}
+  ${dim("Any unrecognized flag is forwarded to Claude Code. Claudish flags can appear in any order.")}
+    ${green("claudish")} --model grok ${yellow("--agent test")} ${yellow('"task"')}        ${dim("# --agent passes through")}
+    ${green("claudish")} --model grok ${yellow("--effort high")} --stdin ${yellow('"task"')}  ${dim("# --effort passes, --stdin stays")}
+    ${green("claudish")} --model grok ${yellow("--permission-mode plan")} -i   ${dim("# works in interactive too")}
+  ${dim("Use -- when a Claude Code flag value starts with '-':")}
+    ${green("claudish")} --model grok ${green("--")} ${yellow('--system-prompt "-verbose mode" "task"')}
 
-CUSTOM MODELS:
-  Claudish accepts ANY valid OpenRouter model ID, even if not in --list-models
-  Example: claudish --model openrouter@your_provider/custom-model-123 "task"
+${h("CUSTOM MODELS & ENDPOINTS")}
+  ${dim("Claudish accepts ANY valid model ID from the Firebase catalog, even if not in --models:")}
+    ${green("claudish")} --model ${yellow("openrouter@your_provider/custom-model-123")} ${yellow('"task"')}
+  ${dim("Named custom endpoints live in ~/.claudish/config.json under 'customEndpoints' and route via @:")}
+    ${green("claudish")} --model ${yellow("my-vllm@llama3.1-70b")} ${yellow('"task"')}
 
-MODES:
-  • Interactive mode (default): Shows model selector, starts persistent session
-  • Single-shot mode: Runs one task in headless mode and exits (requires --model)
+${h("MODES")}
+  ${green("•")} ${bold("Interactive")} ${dim("(default):")} shows model selector, starts a persistent session
+  ${green("•")} ${bold("Single-shot")} ${dim("(--model):")} runs one task headless and exits
 
-NOTES:
-  • Permission prompts are ENABLED by default (normal Claude Code behavior)
-  • Use -y or --auto-approve to skip permission prompts
-  • Model selector appears ONLY in interactive mode when --model not specified
-  • Use --dangerous to disable sandbox (use with extreme caution!)
+${h("NOTES")}
+  ${yellow("•")} Permission prompts are ${bold("ENABLED")} by default (normal Claude Code behavior)
+  ${yellow("•")} Use ${green("-y")} / ${green("--auto-approve")} to skip permission prompts
+  ${yellow("•")} Model selector appears ONLY in interactive mode when ${green("--model")} not specified
+  ${yellow("•")} ${green("--dangerous")} disables the sandbox — use with extreme caution
 
-ENVIRONMENT VARIABLES:
-  Claudish automatically loads .env file from current directory.
+${h("ENVIRONMENT VARIABLES")}
+  ${dim("Claudish auto-loads a .env file from the current directory.")}
 
-  Claude Code installation:
-  CLAUDE_PATH                     Custom path to Claude Code binary (optional)
-                                  Default search order:
-                                  1. CLAUDE_PATH env var
-                                  2. ~/.claude/local/claude (local install)
-                                  3. Global PATH (npm -g install)
+  ${bold("Claude Code installation:")}
+  ${blue("CLAUDE_PATH")}                     Custom path to Claude Code binary
+                                  ${dim("Search: CLAUDE_PATH -> ~/.claude/local/claude -> PATH")}
 
-  API Keys (at least one required for cloud models):
-  OPENROUTER_API_KEY              OpenRouter API key (default backend)
-  GEMINI_API_KEY                  Google Gemini API key (for g/ prefix)
-  VERTEX_API_KEY                  Vertex AI Express API key (for v/ prefix)
-  VERTEX_PROJECT                  Vertex AI project ID (OAuth mode, for v/ prefix)
-  VERTEX_LOCATION                 Vertex AI region (default: us-central1)
-  OPENAI_API_KEY                  OpenAI API key (for oai/ prefix)
-  MINIMAX_API_KEY                 MiniMax API key (for mmax/, mm/ prefix)
-  MOONSHOT_API_KEY                Kimi/Moonshot API key (for kimi/, moonshot/ prefix)
-  KIMI_API_KEY                    Alias for MOONSHOT_API_KEY
-  ZHIPU_API_KEY                   GLM/Zhipu API key (for glm/, zhipu/ prefix)
-  GLM_API_KEY                     Alias for ZHIPU_API_KEY
-  OLLAMA_API_KEY                  OllamaCloud API key (for oc/ prefix)
-  OPENCODE_API_KEY                OpenCode Zen API key (optional - free models work without it)
-  ANTHROPIC_API_KEY               Placeholder (prevents Claude Code dialog)
-  ANTHROPIC_AUTH_TOKEN            Placeholder (prevents Claude Code login screen)
+  ${bold("API keys")} ${dim("(at least one required for cloud models):")}
+  ${blue("OPENROUTER_API_KEY")}              OpenRouter (default backend)
+  ${blue("GEMINI_API_KEY")}                  Google Gemini ${dim("(g@, gemini@; alias GOOGLE_API_KEY)")}
+  ${blue("OPENAI_API_KEY")}                  OpenAI ${dim("(oai@)")}
+  ${blue("OPENAI_CODEX_API_KEY")}            OpenAI Codex / Responses API ${dim("(cx@, codex@)")}
+  ${blue("XAI_API_KEY")}                     xAI / Grok ${dim("(x-ai@, grok@)")}
+  ${blue("MINIMAX_API_KEY")}                 MiniMax ${dim("(mm@, mmax@)")}
+  ${blue("MINIMAX_CODING_API_KEY")}          MiniMax Coding Plan ${dim("(mmc@)")}
+  ${blue("MOONSHOT_API_KEY")}                Kimi / Moonshot ${dim("(kimi@, moon@; alias KIMI_API_KEY)")}
+  ${blue("KIMI_CODING_API_KEY")}             Kimi Coding Plan ${dim("(kc@)")}
+  ${blue("ZHIPU_API_KEY")}                   GLM / Zhipu ${dim("(glm@, zhipu@; alias GLM_API_KEY)")}
+  ${blue("GLM_CODING_API_KEY")}              GLM Coding Plan ${dim("(gc@; alias ZAI_CODING_API_KEY)")}
+  ${blue("ZAI_API_KEY")}                     Z.AI ${dim("(z-ai@, zai@)")}
+  ${blue("DEEPSEEK_API_KEY")}                DeepSeek ${dim("(ds@)")}
+  ${blue("SAKANA_API_KEY")}                  Sakana Fugu ${dim("(sakana@, fugu@)")}
+  ${blue("SAKANA_SUBSCRIPTION_API_KEY")}     Sakana Fugu Subscription ${dim("(sc@; separate subscription key)")}
+  ${blue("OLLAMA_API_KEY")}                  OllamaCloud ${dim("(oc@, llama@)")}
+  ${blue("OPENCODE_API_KEY")}                OpenCode Zen ${dim("(zen@; optional - free models work without it)")}
+  ${blue("POE_API_KEY")}                     Poe ${dim("(poe@)")}
+  ${blue("LITELLM_API_KEY")}                 LiteLLM ${dim("(litellm@, ll@; needs LITELLM_BASE_URL)")}
+  ${blue("VERTEX_API_KEY")}                  Vertex AI Express ${dim("(v@)")}
+  ${blue("VERTEX_PROJECT")}                  Vertex AI project ID ${dim("(OAuth mode, v@)")}
+  ${blue("VERTEX_LOCATION")}                 Vertex AI region ${dim("(default: us-central1)")}
+  ${blue("ANTHROPIC_API_KEY")}               Placeholder (prevents Claude Code dialog)
+  ${blue("ANTHROPIC_AUTH_TOKEN")}            Placeholder (prevents Claude Code login screen)
 
-  Custom endpoints:
-  GEMINI_BASE_URL                 Custom Gemini endpoint
-  OPENAI_BASE_URL                 Custom OpenAI/Azure endpoint
-  MINIMAX_BASE_URL                Custom MiniMax endpoint
-  MOONSHOT_BASE_URL               Custom Kimi/Moonshot endpoint
-  KIMI_BASE_URL                   Alias for MOONSHOT_BASE_URL
-  ZHIPU_BASE_URL                  Custom GLM/Zhipu endpoint
-  GLM_BASE_URL                    Alias for ZHIPU_BASE_URL
-  OLLAMACLOUD_BASE_URL            Custom OllamaCloud endpoint (default: https://ollama.com)
-  OPENCODE_BASE_URL               Custom OpenCode Zen endpoint (default: https://opencode.ai/zen)
+  ${bold("Custom / base-URL overrides:")}
+  ${blue("GEMINI_BASE_URL")}                 Custom Gemini endpoint
+  ${blue("OPENAI_BASE_URL")}                 Custom OpenAI / Azure endpoint
+  ${blue("MINIMAX_BASE_URL")}                Custom MiniMax endpoint
+  ${blue("MOONSHOT_BASE_URL")}               Custom Kimi / Moonshot endpoint ${dim("(alias KIMI_BASE_URL)")}
+  ${blue("ZHIPU_BASE_URL")}                  Custom GLM / Zhipu endpoint ${dim("(alias GLM_BASE_URL)")}
+  ${blue("SAKANA_BASE_URL")}                 Custom Sakana endpoint ${dim("(default: https://api.sakana.ai)")}
+  ${blue("LITELLM_BASE_URL")}                LiteLLM gateway base URL ${dim("(required for ll@)")}
+  ${blue("OLLAMACLOUD_BASE_URL")}            OllamaCloud ${dim("(default: https://ollama.com)")}
+  ${blue("OPENCODE_BASE_URL")}               OpenCode Zen ${dim("(default: https://opencode.ai/zen)")}
 
-  Local providers:
-  OLLAMA_BASE_URL                 Ollama server (default: http://localhost:11434)
-  OLLAMA_HOST                     Alias for OLLAMA_BASE_URL
-  LMSTUDIO_BASE_URL               LM Studio server (default: http://localhost:1234)
-  VLLM_BASE_URL                   vLLM server (default: http://localhost:8000)
-  MLX_BASE_URL                    MLX server (default: http://127.0.0.1:8080)
+  ${bold("Local providers:")}
+  ${blue("OLLAMA_BASE_URL")}                 Ollama server ${dim("(default: http://localhost:11434; alias OLLAMA_HOST)")}
+  ${blue("LMSTUDIO_BASE_URL")}               LM Studio server ${dim("(default: http://localhost:1234)")}
+  ${blue("VLLM_BASE_URL")}                   vLLM server ${dim("(default: http://localhost:8000)")}
+  ${blue("MLX_BASE_URL")}                    MLX server ${dim("(default: http://127.0.0.1:8080)")}
 
-  Model settings:
-  CLAUDISH_MODEL                  Default model to use (default: openai/gpt-5.3)
-  CLAUDISH_PORT                   Default port for proxy
-  CLAUDISH_CONTEXT_WINDOW         Override context window size
+  ${bold("Claudish settings:")}
+  ${blue("CLAUDISH_MODEL")}                  Default model ${dim("(default: openai/gpt-5.3)")}
+  ${blue("CLAUDISH_DEFAULT_PROVIDER")}       Fallback provider for bare names ${dim("(see --default-provider)")}
+  ${blue("CLAUDISH_PORT")}                   Default proxy port
+  ${blue("CLAUDISH_CONTEXT_WINDOW")}         Override context window size
+  ${blue("CLAUDISH_DIAG_MODE")}              Diagnostic output: auto / logfile / off
+  ${blue("CLAUDISH_DEBUG")}                  Always enable debug logging: 1 / true ${dim("(same as -d)")}
+  ${blue("CLAUDISH_MCP_TOOLS")}              MCP tool gating: all / low-level / agentic / channel
+  ${blue("CLAUDISH_MODEL_OPUS")}             Override model for Opus role
+  ${blue("CLAUDISH_MODEL_SONNET")}           Override model for Sonnet role
+  ${blue("CLAUDISH_MODEL_HAIKU")}            Override model for Haiku role
+  ${blue("CLAUDISH_MODEL_SUBAGENT")}         Override model for sub-agents
+  ${blue("NO_COLOR")}                        Set to disable colored output
 
-  Model mapping (per-role):
-  CLAUDISH_MODEL_OPUS             Override model for Opus role
-  CLAUDISH_MODEL_SONNET           Override model for Sonnet role
-  CLAUDISH_MODEL_HAIKU            Override model for Haiku role
-  CLAUDISH_MODEL_SUBAGENT         Override model for sub-agents
+  ${bold("1Password auth:")}
+  ${blue("OP_SERVICE_ACCOUNT_TOKEN")}        Service-account token (preferred for headless)
+  ${blue("OP_ACCOUNT")}                      Account URL for DesktopAuth ${dim("(e.g. my-team.1password.com)")}
 
-EXAMPLES:
-  # Interactive mode (default) - shows model selector
-  claudish
-  claudish --interactive
+${h("EXAMPLES")}
+  ${dim("# Interactive (default) - model selector")}
+  ${green("claudish")}
+  ${green("claudish")} --free                          ${dim("# only FREE models")}
 
-  # Interactive mode with only FREE models
-  claudish --free
+  ${dim("# Explicit provider routing")}
+  ${green("claudish")} --model ${magenta("google@gemini-3-pro")} ${yellow('"implement auth"')}
+  ${green("claudish")} --model ${magenta("oai@gpt-5.3")} ${yellow('"add tests for login"')}
+  ${green("claudish")} --model ${magenta("openrouter@deepseek/deepseek-r1")} ${yellow('"unknown vendor"')}
 
-  # New @ syntax - explicit provider routing
-  claudish --model google@gemini-3-pro "implement user authentication"
-  claudish --model openrouter@openai/gpt-5.3 "add tests for login"
-  claudish --model oai@gpt-5.3 "direct to OpenAI"
+  ${dim("# Native auto-detection (provider inferred from model name)")}
+  ${green("claudish")} --model ${yellow("gpt-4o")} ${yellow('"routes to OpenAI"')}
+  ${green("claudish")} --model ${yellow("gemini-2.5-pro")} ${yellow('"routes to Google"')}
 
-  # Native model auto-detection (provider detected from model name)
-  claudish --model gpt-4o "routes to OpenAI API (detected from model name)"
-  claudish --model llama-3.1-70b "routes to OllamaCloud (detected)"
-  claudish --model openrouter@deepseek/deepseek-r1 "explicit OpenRouter for unknown vendors"
+  ${dim("# Per-role model mapping")}
+  ${green("claudish")} --model-opus ${magenta("oai@gpt-5.3")} --model-sonnet ${magenta("google@gemini-3-pro")}
 
-  # Direct Gemini API (multiple ways)
-  claudish --model google@gemini-2.0-flash "explicit Google"
-  claudish --model g@gemini-2.0-flash "shortcut"
-  claudish --model gemini-2.5-pro "auto-detected from model name"
+  ${dim("# stdin for large prompts (diffs, code review)")}
+  ${dim("git diff |")} ${green("claudish")} --stdin --model ${magenta("oai@gpt-5.3")} ${yellow('"Review these changes"')}
 
-  # Vertex AI (Google Cloud - supports Google + partner models)
-  VERTEX_API_KEY=... claudish --model v@gemini-2.5-flash "Express mode"
-  VERTEX_PROJECT=my-project claudish --model vertex@gemini-2.5-flash "OAuth mode"
+  ${dim("# Local models with concurrency control")}
+  ${green("claudish")} --model ${magenta("ollama@llama3.2:3")} ${yellow('"3 concurrent requests"')}
+  ${green("claudish")} --model ${magenta("lms@qwen2.5-coder")} ${yellow('"LM Studio shortcut"')}
+  ${green("claudish")} --model ${yellow('"http://localhost:8000/mistral"')} ${yellow('"any OpenAI-compatible URL"')}
 
-  # Direct OpenAI API
-  claudish --model oai@gpt-4o "implement feature"
-  claudish --model oai@o1 "complex reasoning"
+  ${dim("# Autonomous (no prompts, no sandbox) — use with caution")}
+  ${green("claudish")} -y --dangerous ${yellow('"refactor entire codebase"')}
 
-  # Direct MiniMax API
-  claudish --model mm@MiniMax-M2.1 "implement feature"
-  claudish --model mmax@MiniMax-M2 "code review"
-
-  # Direct Kimi API (with reasoning support)
-  claudish --model kimi@kimi-k2-thinking-turbo "complex analysis"
-
-  # Direct GLM API
-  claudish --model glm@glm-4.7 "code generation"
-
-  # OpenCode Zen (free models)
-  claudish --model zen@grok-code "implement feature"
-
-  # Local models with concurrency control
-  claudish --model ollama@llama3.2 "default sequential (1 at a time)"
-  claudish --model ollama@llama3.2:3 "allow 3 concurrent requests"
-  claudish --model ollama@llama3.2:0 "no limits (bypass queue)"
-  claudish --model lms@qwen2.5-coder "LM Studio shortcut"
-
-  # Per-role model mapping (works with all syntaxes)
-  claudish --model-opus oai@gpt-5.3 --model-sonnet google@gemini-3-pro --model-haiku mm@MiniMax-M2.1
-
-  # Use stdin for large prompts (e.g., git diffs, code review)
-  echo "Review this code..." | claudish --stdin --model g@gemini-2.0-flash
-  git diff | claudish --stdin --model oai@gpt-5.3 "Review these changes"
-
-  # Monitor mode - understand how Claude Code works
-  claudish --monitor --debug "analyze code structure"
-
-  # Skip permission prompts (auto-approve)
-  claudish -y "make changes to config"
-  claudish --auto-approve "refactor the function"
-
-  # Dangerous mode (disable sandbox - use with extreme caution)
-  claudish --dangerous "refactor entire codebase"
-
-  # Both flags (fully autonomous - no prompts, no sandbox)
-  claudish -y --dangerous "refactor entire codebase"
-
-  # With custom port
-  claudish --port 3000 "analyze code structure"
-
-  # Pass flags to claude
-  claudish --model openrouter@x-ai/grok-code-fast-1 --verbose "debug issue"
-
-  # JSON output for tool integration (quiet by default)
-  claudish --json "list 5 prime numbers"
-
-  # Verbose mode in single-shot (show [claudish] logs)
-  claudish --verbose "analyze code structure"
-
-LOCAL MODELS (Ollama, LM Studio, vLLM):
-  # Use local Ollama model (prefix syntax)
-  claudish --model ollama/llama3.2 "implement feature"
-  claudish --model ollama:codellama "review this code"
-
-  # Use local LM Studio model
-  claudish --model lmstudio/qwen2.5-coder "write tests"
-
-  # Use any OpenAI-compatible endpoint (URL syntax)
-  claudish --model "http://localhost:11434/llama3.2" "task"
-  claudish --model "http://192.168.1.100:8000/mistral" "remote server"
-
-  # Custom Ollama endpoint
-  OLLAMA_BASE_URL=http://192.168.1.50:11434 claudish --model ollama/llama3.2 "task"
-  OLLAMA_HOST=http://192.168.1.50:11434 claudish --model ollama/llama3.2 "task"
-
-AVAILABLE MODELS:
-  List all models:     claudish --models  (includes OpenRouter, OpenCode Zen, Ollama)
-  Search models:       claudish --models <query>
-  Top recommended:     claudish --top-models
-  Probe routing:       claudish --probe minimax-m2.5 kimi-k2.5 gemini-3.1-pro-preview
-  Free models only:    claudish --free  (interactive selector with free models)
-  JSON output:         claudish --models --json
-  Force cache update:  claudish --models --force-update
-  (Cache auto-updates every 2 days)
-
-MORE INFO:
-  GitHub: https://github.com/MadAppGang/claude-code
-  OpenRouter: https://openrouter.ai
+${h("MORE INFO")}
+  ${dim("GitHub:")}     ${blue("https://github.com/MadAppGang/claude-code")}
+  ${dim("OpenRouter:")} ${blue("https://openrouter.ai")}
 `);
 }
 
@@ -2059,193 +2228,24 @@ async function initializeClaudishSkill(): Promise<void> {
 }
 
 /**
- * Print available models in enhanced table format
+ * Print a terse model hint when `--model` is passed without a value.
+ * Backed by the sync recommended-models loader — no network calls here.
  */
 function printAvailableModels(): void {
-  // Try to read enhanced model data from JSON file
-  let lastUpdated = "unknown";
-  let models: any[] = [];
-
   try {
-    // Check writable cache first, then bundled fallback
-    const cachePath = existsSync(CACHED_MODELS_PATH) ? CACHED_MODELS_PATH : BUNDLED_MODELS_PATH;
-    if (existsSync(cachePath)) {
-      const data = JSON.parse(readFileSync(cachePath, "utf-8"));
-      lastUpdated = data.lastUpdated || "unknown";
-      models = data.models || [];
-    }
-  } catch {
-    // Fallback to basic model list
     const basicModels = getAvailableModels();
     const modelInfo = loadModelInfo();
+    console.log("\nAvailable models (type `claudish --models-top` for full table):\n");
     for (const model of basicModels) {
       const info = modelInfo[model];
+      if (!info) continue;
       console.log(`  ${model}`);
       console.log(`    ${info.name} - ${info.description}`);
-      console.log("");
     }
-    return;
-  }
-
-  console.log(`\nRecommended Models (last updated: ${lastUpdated}):\n`);
-
-  // Table header
-  console.log("  Model                        Pricing     Context  Capabilities");
-  console.log("  " + "─".repeat(66));
-
-  // Table rows
-  for (const model of models) {
-    const modelId = model.id.length > 28 ? model.id.substring(0, 25) + "..." : model.id;
-    const modelIdPadded = modelId.padEnd(28);
-
-    // Format pricing (average) - handle special cases
-    let pricing = model.pricing?.average || "N/A";
-
-    // Handle special pricing cases
-    if (pricing.includes("-1000000")) {
-      pricing = "varies"; // Auto-router pricing varies by routed model
-    } else if (pricing === "$0.00/1M" || pricing === "FREE") {
-      pricing = "FREE";
-    }
-
-    const pricingPadded = pricing.padEnd(10);
-
-    // Format context
-    const context = model.context || "N/A";
-    const contextPadded = context.padEnd(7);
-
-    // Capabilities emojis
-    const tools = model.supportsTools ? "🔧" : "  ";
-    const reasoning = model.supportsReasoning ? "🧠" : "  ";
-    const vision = model.supportsVision ? "👁️ " : "  ";
-    const capabilities = `${tools} ${reasoning} ${vision}`;
-
-    console.log(`  ${modelIdPadded} ${pricingPadded} ${contextPadded} ${capabilities}`);
-  }
-
-  console.log("");
-  console.log("  Capabilities: 🔧 Tools  🧠 Reasoning  👁️  Vision");
-  console.log("");
-  console.log("Set default with: export CLAUDISH_MODEL=<model>");
-  console.log("               or: export ANTHROPIC_MODEL=<model>");
-  console.log("Or use: claudish --model <model> ...");
-  console.log("\nForce update: claudish --list-models --force-update\n");
-}
-
-/**
- * Print available models in JSON format
- */
-function printAvailableModelsJSON(): void {
-  // Check writable cache first, then bundled fallback
-  const jsonPath = existsSync(CACHED_MODELS_PATH) ? CACHED_MODELS_PATH : BUNDLED_MODELS_PATH;
-
-  try {
-    const jsonContent = readFileSync(jsonPath, "utf-8");
-    const data = JSON.parse(jsonContent);
-
-    // Output clean JSON to stdout — IDs are provider-agnostic
-    console.log(JSON.stringify(data, null, 2));
+    console.log("");
   } catch (error) {
-    // If JSON file doesn't exist, construct from model info
-    const models = getAvailableModels();
-    const modelInfo = loadModelInfo();
-
-    const output = {
-      version: VERSION,
-      lastUpdated: new Date().toISOString().split("T")[0],
-      source: "runtime",
-      models: models
-        .filter((m) => m !== "custom")
-        .map((modelId) => {
-          const info = modelInfo[modelId];
-          return {
-            id: modelId,
-            name: info.name,
-            description: info.description,
-            provider: info.provider,
-            priority: info.priority,
-          };
-        }),
-    };
-
-    console.log(JSON.stringify(output, null, 2));
-  }
-}
-
-/**
- * Fetch ALL OpenCode Zen models from models.dev API
- * Returns all models with full metadata, marks free ones
- */
-async function fetchZenModels(): Promise<any[]> {
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const opencode = data.opencode;
-    if (!opencode?.models) return [];
-
-    // Get all models with metadata
-    return Object.entries(opencode.models).map(([id, m]: [string, any]) => {
-      const isFree = m.cost?.input === 0 && m.cost?.output === 0;
-      return {
-        id: `zen/${id}`,
-        name: m.name || id,
-        context_length: m.limit?.context || 128000,
-        max_output: m.limit?.output || 32000,
-        pricing: isFree
-          ? { prompt: "0", completion: "0" }
-          : { prompt: String(m.cost?.input || 0), completion: String(m.cost?.output || 0) },
-        isZen: true,
-        isFree,
-        supportsTools: m.tool_call || false,
-        supportsReasoning: m.reasoning || false,
-      };
-    });
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Fetch GLM Coding Plan models from models.dev API
- * Returns all models with full metadata (subscription-based, all free)
- */
-async function fetchGLMCodingModels(): Promise<any[]> {
-  try {
-    const response = await fetch("https://models.dev/api.json", {
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!response.ok) {
-      return [];
-    }
-
-    const data = await response.json();
-    const codingPlan = data["zai-coding-plan"];
-    if (!codingPlan?.models) return [];
-
-    return Object.entries(codingPlan.models).map(([id, m]: [string, any]) => {
-      const inputModalities = m.modalities?.input || [];
-      return {
-        id: `gc/${id}`,
-        name: m.name || id,
-        description: `GLM Coding Plan model (subscription)`,
-        context_length: m.limit?.context || 131072,
-        pricing: { prompt: "0", completion: "0" },
-        isGLMCoding: true,
-        isSubscription: true,
-        supportsTools: m.tool_call || false,
-        supportsReasoning: m.reasoning || false,
-        supportsVision: inputModalities.includes("image") || inputModalities.includes("video"),
-      };
-    });
-  } catch {
-    return [];
+    console.error(
+      `Failed to load available models: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 }

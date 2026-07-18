@@ -1,12 +1,11 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import {
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  existsSync,
-  readdirSync,
-  statSync,
   createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -18,12 +17,27 @@ export interface TeamManifest {
   shuffleOrder: string[];
 }
 
+export interface ModelError {
+  /** Model ID that failed (anonymized id used in the report). */
+  model: string;
+  /** The command that was run. */
+  command: string;
+  /** Tail of the captured stderr, if any. */
+  stderrSnippet?: string;
+  /** Path to the full error log file. */
+  errorLogPath: string;
+  /** Working directory the child ran in. */
+  workDir: string;
+}
+
 export interface ModelStatus {
   state: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "TIMEOUT";
   exitCode: number | null;
   startedAt: string | null;
   completedAt: string | null;
   outputSize: number;
+  /** Populated on FAILED/TIMEOUT with details for the failure report. */
+  error?: ModelError;
 }
 
 export interface TeamStatus {
@@ -74,10 +88,35 @@ export interface TeamVerdict {
 export function validateSessionPath(sessionPath: string): string {
   const resolved = resolve(sessionPath);
   const cwd = process.cwd();
-  if (!resolved.startsWith(cwd + "/") && resolved !== cwd) {
+  if (!resolved.startsWith(`${cwd}/`) && resolved !== cwd) {
     throw new Error(`Session path must be within current directory: ${sessionPath}`);
   }
   return resolved;
+}
+
+// ─── Sentinel Model Validation ───────────────────────────────────────────────
+
+/**
+ * Model names that are semantic directives for the calling agent, not real
+ * external model IDs. These must never be passed to claudish child processes.
+ */
+const SENTINEL_MODELS = new Set([
+  "internal", // means "use a local Claude Code Task agent"
+  "default", // means "use whatever Claude Code is configured with"
+  "opus", // Claude tier selector — calling agent should handle
+  "sonnet", // Claude tier selector — calling agent should handle
+  "haiku", // Claude tier selector — calling agent should handle
+]);
+
+/**
+ * Check if a model ID is a sentinel or native Anthropic model.
+ * These cannot be run as external claudish processes.
+ */
+function isSentinelModel(model: string): boolean {
+  const lower = model.toLowerCase();
+  if (SENTINEL_MODELS.has(lower)) return true;
+  if (lower.startsWith("claude-")) return true;
+  return false;
 }
 
 // ─── Core Functions ───────────────────────────────────────────────────────────
@@ -89,6 +128,21 @@ export function validateSessionPath(sessionPath: string): string {
 export function setupSession(sessionPath: string, models: string[], input?: string): TeamManifest {
   if (models.length === 0) {
     throw new Error("At least one model is required");
+  }
+
+  // Reject re-use of existing session directory to prevent overwriting results
+  if (existsSync(join(sessionPath, "manifest.json"))) {
+    throw new Error(
+      `Session already exists at ${sessionPath}. Use a new directory path or delete the existing session first.`
+    );
+  }
+
+  // Reject sentinel model names that should be handled by the calling agent
+  const sentinels = models.filter(isSentinelModel);
+  if (sentinels.length > 0) {
+    throw new Error(
+      `Invalid model(s) for team run: ${sentinels.join(", ")}. These are Claude Code agent selectors, not external model IDs. Use real external models (e.g., "gemini-2.0-flash", "gpt-4o", "or@deepseek/deepseek-r1"). For Claude models, use a Task agent instead of the team tool.`
+    );
   }
 
   // Create directories
@@ -188,7 +242,6 @@ export async function runModels(
   for (const [anonId, entry] of Object.entries(manifest.models)) {
     const outputPath = join(sessionPath, `response-${anonId}.md`);
     const errorLogPath = join(sessionPath, "errors", `${anonId}.log`);
-    const workDir = join(sessionPath, "work", anonId);
 
     // CRITICAL FIX: do NOT use -p flag (-p means --profile in claudish)
     // --stdin triggers non-interactive single-shot mode
@@ -200,9 +253,14 @@ export async function runModels(
     });
 
     const proc = spawn("claudish", args, {
-      cwd: workDir,
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
+    });
+
+    // Count bytes flowing through stdout for accurate outputSize tracking
+    let byteCount = 0;
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      byteCount += chunk.length;
     });
 
     // Stream stdout to disk via pipe — no memory buffering
@@ -225,20 +283,32 @@ export async function runModels(
 
       const finish = () => {
         if (resolved) return;
+        // Don't overwrite TIMEOUT state — timeout handler may have fired
+        // between proc "exit" and outputStream "close" events
+        if (statusCache.models[anonId].state === "TIMEOUT") {
+          resolved = true;
+          resolve();
+          return;
+        }
         resolved = true;
 
-        let outputSize = 0;
-        try {
-          outputSize = statSync(outputPath).size;
-        } catch {
-          // file may not exist if process produced no output
-        }
+        const outputSize = byteCount;
 
+        const failed = exitCode !== 0;
         updateModelStatus(anonId, {
-          state: exitCode === 0 ? "COMPLETED" : "FAILED",
+          state: failed ? "FAILED" : "COMPLETED",
           exitCode: exitCode ?? 1,
           completedAt: new Date().toISOString(),
           outputSize,
+          error: failed
+            ? {
+                model: anonId,
+                command: `claudish ${args.join(" ")}`,
+                stderrSnippet: stderr ? stderr.slice(-2000) : undefined,
+                errorLogPath,
+                workDir: sessionPath,
+              }
+            : undefined,
         });
 
         opts.onStatusChange?.(anonId, statusCache.models[anonId]);
@@ -282,9 +352,12 @@ export async function runModels(
     new Promise<void>((resolve) => {
       timeoutHandle = setTimeout(() => {
         for (const [id, proc] of processes) {
-          if (!proc.killed) {
-            proc.kill("SIGTERM");
-            // Mark as TIMEOUT — exit handler will see this and skip overwrite
+          const current = statusCache.models[id];
+          // Only timeout models that are still RUNNING — not ones that already
+          // completed/failed. proc.killed is NOT reliable: it's only true when
+          // the parent called .kill(), not when the child exited naturally.
+          if (current.state === "RUNNING") {
+            if (!proc.killed) proc.kill("SIGTERM");
             updateModelStatus(id, {
               state: "TIMEOUT",
               completedAt: new Date().toISOString(),
@@ -383,7 +456,7 @@ export function buildJudgePrompt(input: string, responses: Record<string, string
   const ids = Object.keys(responses).sort();
   let prompt = "## Blind Evaluation Task\n\n";
   prompt += "### Original Task\n\n";
-  prompt += input + "\n\n";
+  prompt += `${input}\n\n`;
   prompt += "---\n\n";
   prompt += "### Responses to Evaluate\n\n";
   prompt +=
@@ -391,7 +464,7 @@ export function buildJudgePrompt(input: string, responses: Record<string, string
 
   for (const id of ids) {
     prompt += `#### Response ${id}\n\n`;
-    prompt += responses[id] + "\n\n";
+    prompt += `${responses[id]}\n\n`;
     prompt += "---\n\n";
   }
 
@@ -427,6 +500,7 @@ export function parseJudgeVotes(judgePath: string, responseIds: string[]): VoteR
     // Parse ```vote ... ``` blocks
     const votePattern = /```vote\s*\n([\s\S]*?)\n\s*```/g;
     let match: RegExpExecArray | null;
+    // biome-ignore lint/suspicious/noAssignInExpressions: canonical RegExp.exec() iteration idiom
     while ((match = votePattern.exec(content)) !== null) {
       const block = match[1];
       const responseMatch = block.match(/RESPONSE:\s*(\S+)/);
@@ -446,7 +520,7 @@ export function parseJudgeVotes(judgePath: string, responseIds: string[]): VoteR
         judgeId,
         responseId,
         verdict: verdict as "APPROVE" | "REJECT" | "ABSTAIN",
-        confidence: parseInt(confidenceMatch?.[1] ?? "5", 10),
+        confidence: Number.parseInt(confidenceMatch?.[1] ?? "5", 10),
         summary: summaryMatch?.[1]?.trim() ?? "",
         keyIssues:
           keyIssuesMatch?.[1]

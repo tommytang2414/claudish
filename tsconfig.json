@@ -21,6 +21,7 @@
   "files": [],
   "references": [
     { "path": "packages/cli" },
-    { "path": "packages/macos-bridge" }
+    { "path": "packages/macos-bridge" },
+    { "path": "packages/custom-renderer" }
   ]
 }

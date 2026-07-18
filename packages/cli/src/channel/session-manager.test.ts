@@ -17,20 +17,14 @@
  * recognise.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import {
-  mkdtempSync,
-  writeFileSync,
-  existsSync,
-  readFileSync,
-  rmSync,
-} from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { SessionManager } from "./session-manager.js";
-import type { SessionManagerOptions, ChannelEvent } from "./types.js";
+import type { ChannelEvent, SessionManagerOptions } from "./types.js";
 
 // ─── Setup: PATH shim ────────────────────────────────────────────────────────
 
@@ -51,11 +45,7 @@ beforeAll(() => {
 
   // Write a `claudish` wrapper that calls the fake via bun
   const shimPath = join(shimDir, "claudish");
-  writeFileSync(
-    shimPath,
-    `#!/bin/sh\nexec bun run "${FAKE_CLAUDISH_TS}" "$@"\n`,
-    { mode: 0o755 }
-  );
+  writeFileSync(shimPath, `#!/bin/sh\nexec bun run "${FAKE_CLAUDISH_TS}" "$@"\n`, { mode: 0o755 });
 
   // Prepend shim directory to PATH so our fake is found first
   process.env.PATH = `${shimDir}:${ORIGINAL_PATH}`;
@@ -66,18 +56,16 @@ afterAll(() => {
   process.env.PATH = ORIGINAL_PATH;
 
   // Clean up shim directory
-  try { rmSync(shimDir, { recursive: true, force: true }); } catch {}
+  try {
+    rmSync(shimDir, { recursive: true, force: true });
+  } catch {}
 });
 
 // ─── Helper utilities ────────────────────────────────────────────────────────
 
 /** Wait until a predicate returns true, checking every `intervalMs` ms.
  *  Rejects if the predicate hasn't returned true within `timeoutMs`. */
-function waitUntil(
-  predicate: () => boolean,
-  timeoutMs = 5000,
-  intervalMs = 50
-): Promise<void> {
+function waitUntil(predicate: () => boolean, timeoutMs = 5000, intervalMs = 50): Promise<void> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs;
     const check = () => {
@@ -198,13 +186,15 @@ describe("SessionManager", () => {
     try {
       ids.push(limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] }));
       ids.push(limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] }));
-      expect(() =>
-        limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] })
-      ).toThrow(/Max sessions/);
+      expect(() => limited.createSession({ model: "m", claudishFlags: ["--sleep", "3"] })).toThrow(
+        /Max sessions/
+      );
     } finally {
       // Cancel all sessions before shutdown so SIGTERM resolves quickly
       for (const id of ids) {
-        try { limited.cancelSession(id); } catch {}
+        try {
+          limited.cancelSession(id);
+        } catch {}
       }
       await limited.shutdownAll();
     }

@@ -1,14 +1,21 @@
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
-import { writeFileSync, unlinkSync, mkdirSync, existsSync, readFileSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { join, basename } from "node:path";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { isatty } from "node:tty";
 import { ENV } from "./config.js";
-import type { ClaudishConfig } from "./types.js";
 import { parseModelSpec } from "./providers/model-parser.js";
-import type { MtmDiagRunner } from "./pty-diag-runner.js";
-// Backward-compat alias
-type PtyDiagRunner = MtmDiagRunner;
+import { setClaudeCodeRunning } from "./telemetry.js";
+import type { ClaudishConfig } from "./types.js";
 
 /**
  * Check if any resolved model mapping targets a native Anthropic model (claude-*).
@@ -24,6 +31,58 @@ function hasNativeAnthropicMapping(config: ClaudishConfig): boolean {
     config.modelSubagent,
   ];
   return models.some((m) => m && parseModelSpec(m).provider === "native-anthropic");
+}
+
+/**
+ * "Proxy mode" = claudish points Claude Code at its local proxy with a placeholder
+ * API key (see the auth block in runClaudeWithProxy). In this mode the session
+ * authenticates via ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, so a user/project/local
+ * setting of `forceLoginMethod: "claudeai"` would block it at startup.
+ *
+ * The inverse — native-Anthropic models or --monitor — uses the user's REAL claude.ai
+ * subscription credentials, so we must NOT touch their login method there.
+ */
+export function isProxyAuthMode(config: ClaudishConfig): boolean {
+  return !config.monitor && !hasNativeAnthropicMapping(config);
+}
+
+/**
+ * OS-specific path to Claude Code's *managed* settings file — the highest-precedence
+ * tier, which "cannot be overridden by anything" (not even our --settings overlay).
+ * https://code.claude.com/docs/en/settings
+ */
+function managedSettingsPath(): string {
+  if (isWindows()) {
+    return join(
+      process.env.PROGRAMDATA || "C:\\ProgramData",
+      "ClaudeCode",
+      "managed-settings.json"
+    );
+  }
+  if (process.platform === "darwin") {
+    return "/Library/Application Support/ClaudeCode/managed-settings.json";
+  }
+  return "/etc/claude-code/managed-settings.json";
+}
+
+/**
+ * Read-only check: does the OS managed-settings policy force the claude.ai login
+ * method? If so, an API-key/proxy session is blocked at startup and NOTHING claudish
+ * writes can override it. Best-effort — any read/parse failure returns false (absent).
+ */
+export function managedSettingsForcesClaudeAi(
+  readFile: typeof readFileSync = readFileSync
+): boolean {
+  try {
+    // A missing file throws ENOENT here, which the catch maps to "absent" — no separate
+    // existsSync pre-check needed (and it would bypass the injected reader in tests).
+    const raw = readFile(managedSettingsPath(), "utf-8");
+    const parsed = JSON.parse(raw as string) as { forceLoginMethod?: unknown };
+    return parsed.forceLoginMethod === "claudeai";
+  } catch {
+    // Missing/unreadable/permission-denied/garbled → treat as "no managed block we can see".
+    return false;
+  }
 }
 
 // Use process.platform directly to ensure runtime evaluation
@@ -52,6 +111,7 @@ const path = require('path');
 const CYAN = "\\x1b[96m";
 const YELLOW = "\\x1b[93m";
 const GREEN = "\\x1b[92m";
+const RED = "\\x1b[91m";
 const MAGENTA = "\\x1b[95m";
 const DIM = "\\x1b[2m";
 const RESET = "\\x1b[0m";
@@ -80,13 +140,14 @@ process.stdin.on('end', () => {
     try {
       const tokens = JSON.parse(fs.readFileSync('${escapedTokenPath}', 'utf-8'));
       cost = tokens.total_cost || 0;
-      ctx = tokens.context_left_percent || 100;
+      ctx = tokens.context_left_percent ?? -1;
       inputTokens = tokens.input_tokens || 0;
-      contextWindow = tokens.context_window || 0;
+      contextWindow = typeof tokens.context_window === 'number' ? tokens.context_window : 0;
       isFree = tokens.is_free || false;
       isEstimated = tokens.is_estimated || false;
       providerName = tokens.provider_name || '';
       if (tokens.model_name) model = tokens.model_name;
+      var quotaRemaining = tokens.quota_remaining;
     } catch (e) {
       try {
         const json = JSON.parse(input);
@@ -107,7 +168,10 @@ process.stdin.on('end', () => {
     const modelDisplay = providerName ? providerName + ' ' + model : model;
     // Format context display as progress bar: [████░░░░░░] 116k/1M
     let ctxDisplay = '';
-    if (inputTokens > 0 && contextWindow > 0) {
+    if (ctx < 0 || contextWindow <= 0) {
+      // Unknown context window — show token count only
+      ctxDisplay = inputTokens > 0 ? formatTokens(inputTokens) + ' tokens' : 'N/A';
+    } else if (inputTokens > 0 && contextWindow > 0) {
       const usedPct = 100 - ctx; // ctx is "left", so used = 100 - left
       const barWidth = 15;
       const filled = Math.round((usedPct / 100) * barWidth);
@@ -117,7 +181,14 @@ process.stdin.on('end', () => {
     } else {
       ctxDisplay = ctx + '%';
     }
-    console.log(\`\${CYAN}\${BOLD}\${dir}\${RESET} \${DIM}•\${RESET} \${YELLOW}\${modelDisplay}\${RESET} \${DIM}•\${RESET} \${GREEN}\${costDisplay}\${RESET} \${DIM}•\${RESET} \${MAGENTA}\${ctxDisplay}\${RESET}\`);
+    let quotaDisplay = '';
+    if (typeof quotaRemaining === 'number') {
+      const usedPct = ((1 - quotaRemaining) * 100).toFixed(0);
+      const remainPct = (quotaRemaining * 100).toFixed(0);
+      const qColor = quotaRemaining > 0.5 ? GREEN : quotaRemaining > 0.2 ? YELLOW : RED;
+      quotaDisplay = ' ' + DIM + '•' + RESET + ' ' + qColor + remainPct + '% quota' + RESET;
+    }
+    console.log(\`\${CYAN}\${BOLD}\${dir}\${RESET} \${DIM}•\${RESET} \${YELLOW}\${modelDisplay}\${RESET} \${DIM}•\${RESET} \${GREEN}\${costDisplay}\${RESET} \${DIM}•\${RESET} \${MAGENTA}\${ctxDisplay}\${RESET}\${quotaDisplay}\`);
   } catch (e) {
     console.log('claudish');
   }
@@ -137,8 +208,9 @@ process.stdin.on('end', () => {
  * file watcher trying to watch socket files in /tmp (which causes UNKNOWN errors)
  */
 function createTempSettingsFile(
-  modelDisplay: string,
-  port: string
+  _modelDisplay: string,
+  port: string,
+  proxyAuthMode: boolean
 ): { path: string; statusLine: { type: string; command: string; padding: number } } {
   const homeDir = process.env.HOME || process.env.USERPROFILE || tmpdir();
   const claudishDir = join(homeDir, ".claudish");
@@ -176,7 +248,7 @@ function createTempSettingsFile(
     // Both cost and context percentage come from our token file
     // Helper function to format tokens with k/M suffix (pure bash, no awk)
     const formatTokensBash = `fmt_tok() { local n=\${1:-0}; if [ "$n" -ge 1000000 ]; then echo "$((n/1000000))M"; elif [ "$n" -ge 1000 ]; then echo "$((n/1000))k"; else echo "$n"; fi; }`;
-    statusCommand = `JSON=$(cat) && DIR=$(basename "$(pwd)") && [ \${#DIR} -gt 15 ] && DIR="\${DIR:0:12}..." || true && CTX=100 && COST="0" && IS_FREE="false" && IS_EST="false" && PROVIDER="" && TOKEN_MODEL="" && IN_TOK=0 && CTX_WIN=0 && ${formatTokensBash} && if [ -f "${tokenFilePath}" ]; then TOKENS=$(cat "${tokenFilePath}" 2>/dev/null | tr -d ' \\n') && REAL_CTX=$(echo "$TOKENS" | grep -o '"context_left_percent":[0-9]*' | grep -o '[0-9]*') && if [ ! -z "$REAL_CTX" ]; then CTX="$REAL_CTX"; fi && REAL_COST=$(echo "$TOKENS" | grep -o '"total_cost":[0-9.]*' | cut -d: -f2) && if [ ! -z "$REAL_COST" ]; then COST="$REAL_COST"; fi && IN_TOK=$(echo "$TOKENS" | grep -o '"input_tokens":[0-9]*' | grep -o '[0-9]*') && CTX_WIN=$(echo "$TOKENS" | grep -o '"context_window":[0-9]*' | grep -o '[0-9]*') && IS_FREE=$(echo "$TOKENS" | grep -o '"is_free":[a-z]*' | cut -d: -f2) && IS_EST=$(echo "$TOKENS" | grep -o '"is_estimated":[a-z]*' | cut -d: -f2) && PROVIDER=$(echo "$TOKENS" | grep -o '"provider_name":"[^"]*"' | cut -d'"' -f4) && TOKEN_MODEL=$(echo "$TOKENS" | grep -o '"model_name":"[^"]*"' | cut -d'"' -f4); fi && if [ "$CLAUDISH_IS_LOCAL" = "true" ]; then COST_DISPLAY="LOCAL"; elif [ "$IS_FREE" = "true" ]; then COST_DISPLAY="FREE"; elif [ "$IS_EST" = "true" ]; then COST_DISPLAY=$(printf "~\\$%.3f" "$COST"); else COST_DISPLAY=$(printf "\\$%.3f" "$COST"); fi && MODEL_DISPLAY="\${TOKEN_MODEL:-$CLAUDISH_ACTIVE_MODEL_NAME}" && if [ ! -z "$PROVIDER" ]; then MODEL_DISPLAY="$PROVIDER $MODEL_DISPLAY"; fi && if [ "$IN_TOK" -gt 0 ] 2>/dev/null && [ "$CTX_WIN" -gt 0 ] 2>/dev/null; then CTX_DISPLAY="$CTX% ($(fmt_tok $IN_TOK)/$(fmt_tok $CTX_WIN))"; else CTX_DISPLAY="$CTX%"; fi && printf "${CYAN}${BOLD}%s${RESET} ${DIM}•${RESET} ${YELLOW}%s${RESET} ${DIM}•${RESET} ${GREEN}%s${RESET} ${DIM}•${RESET} ${MAGENTA}%s${RESET}\\n" "$DIR" "$MODEL_DISPLAY" "$COST_DISPLAY" "$CTX_DISPLAY"`;
+    statusCommand = `JSON=$(cat) && DIR=$(basename "$(pwd)") && [ \${#DIR} -gt 15 ] && DIR="\${DIR:0:12}..." || true && CTX=-1 && COST="0" && IS_FREE="false" && IS_EST="false" && PROVIDER="" && TOKEN_MODEL="" && IN_TOK=0 && CTX_WIN=0 && ${formatTokensBash} && if [ -f "${tokenFilePath}" ]; then TOKENS=$(cat "${tokenFilePath}" 2>/dev/null | tr -d ' \\n') && REAL_CTX=$(echo "$TOKENS" | grep -o '"context_left_percent":-\\?[0-9]*' | grep -o '\\-\\?[0-9]*') && if [ ! -z "$REAL_CTX" ]; then CTX="$REAL_CTX"; fi && REAL_COST=$(echo "$TOKENS" | grep -o '"total_cost":[0-9.]*' | cut -d: -f2) && if [ ! -z "$REAL_COST" ]; then COST="$REAL_COST"; fi && IN_TOK=$(echo "$TOKENS" | grep -o '"input_tokens":[0-9]*' | grep -o '[0-9]*') && CTX_WIN=$(echo "$TOKENS" | grep -o '"context_window":[0-9]*' | grep -o '[0-9]*') && IS_FREE=$(echo "$TOKENS" | grep -o '"is_free":[a-z]*' | cut -d: -f2) && IS_EST=$(echo "$TOKENS" | grep -o '"is_estimated":[a-z]*' | cut -d: -f2) && PROVIDER=$(echo "$TOKENS" | grep -o '"provider_name":"[^"]*"' | cut -d'"' -f4) && TOKEN_MODEL=$(echo "$TOKENS" | grep -o '"model_name":"[^"]*"' | cut -d'"' -f4); fi && if [ "$CLAUDISH_IS_LOCAL" = "true" ]; then COST_DISPLAY="LOCAL"; elif [ "$IS_FREE" = "true" ]; then COST_DISPLAY="FREE"; elif [ "$IS_EST" = "true" ]; then COST_DISPLAY=$(printf "~\\$%.3f" "$COST"); else COST_DISPLAY=$(printf "\\$%.3f" "$COST"); fi && MODEL_DISPLAY="\${TOKEN_MODEL:-$CLAUDISH_ACTIVE_MODEL_NAME}" && if [ ! -z "$PROVIDER" ]; then MODEL_DISPLAY="$PROVIDER $MODEL_DISPLAY"; fi && if [ "$CTX" -lt 0 ] 2>/dev/null || [ "$CTX_WIN" -le 0 ] 2>/dev/null; then if [ "$IN_TOK" -gt 0 ] 2>/dev/null; then CTX_DISPLAY="$(fmt_tok $IN_TOK) tokens"; else CTX_DISPLAY="N/A"; fi; elif [ "$IN_TOK" -gt 0 ] 2>/dev/null && [ "$CTX_WIN" -gt 0 ] 2>/dev/null; then CTX_DISPLAY="$CTX% ($(fmt_tok $IN_TOK)/$(fmt_tok $CTX_WIN))"; else CTX_DISPLAY="$CTX%"; fi && printf "${CYAN}${BOLD}%s${RESET} ${DIM}•${RESET} ${YELLOW}%s${RESET} ${DIM}•${RESET} ${GREEN}%s${RESET} ${DIM}•${RESET} ${MAGENTA}%s${RESET}\\n" "$DIR" "$MODEL_DISPLAY" "$COST_DISPLAY" "$CTX_DISPLAY"`;
   }
 
   const statusLine = {
@@ -185,10 +257,42 @@ function createTempSettingsFile(
     padding: 0,
   };
 
-  const settings = { statusLine };
+  // claudish points Claude Code at its local proxy via ANTHROPIC_BASE_URL and
+  // injects a placeholder ANTHROPIC_API_KEY so Claude Code authenticates against
+  // the proxy instead of prompting for a claude.ai login. Claude Code then warns
+  // "claude.ai connectors are disabled because ANTHROPIC_API_KEY ... is set" on
+  // every session — harmless noise that reads like an error to users. claude.ai
+  // org connectors are irrelevant when routing through the proxy, so disable them
+  // outright, which removes the warning. (Verified: setting this suppresses the
+  // message; users can still override via their own --settings, which is merged
+  // on top of this temp file.)
+  const settings = buildClaudishSettingsOverlay(statusLine, proxyAuthMode);
 
   writeFileSync(tempPath, JSON.stringify(settings, null, 2), "utf-8");
   return { path: tempPath, statusLine };
+}
+
+/**
+ * Build the claudish `--settings` overlay object. This loads at the CLI-args precedence
+ * tier, above the user/project/local settings files, so keys here override those three.
+ *
+ * - `disableClaudeAiConnectors` suppresses the proxy-mode connector warning.
+ * - `forceLoginMethod: "console"` is added ONLY in proxy mode: the session authenticates
+ *   via the placeholder ANTHROPIC_API_KEY, and a user/project/local
+ *   `forceLoginMethod: "claudeai"` would block that at startup. In native-Anthropic /
+ *   --monitor mode we leave it out so the user's real claude.ai subscription keeps working.
+ *
+ * (The OS *managed* tier can't be overridden — that case aborts before we get here.)
+ */
+export function buildClaudishSettingsOverlay(
+  statusLine: { type: string; command: string; padding: number },
+  proxyAuthMode: boolean
+): Record<string, unknown> {
+  const settings: Record<string, unknown> = { statusLine, disableClaudeAiConnectors: true };
+  if (proxyAuthMode) {
+    settings.forceLoginMethod = "console";
+  }
+  return settings;
 }
 
 /**
@@ -206,7 +310,8 @@ function createTempSettingsFile(
 function mergeUserSettingsIfPresent(
   config: ClaudishConfig,
   tempSettingsPath: string,
-  statusLine: { type: string; command: string; padding: number }
+  statusLine: { type: string; command: string; padding: number },
+  proxyAuthMode: boolean
 ): void {
   const idx = config.claudeArgs.indexOf("--settings");
   if (idx === -1 || !config.claudeArgs[idx + 1]) {
@@ -230,6 +335,19 @@ function mergeUserSettingsIfPresent(
     // Inject claudish statusLine into user settings (overrides any existing statusLine)
     userSettings.statusLine = statusLine;
 
+    // Default claude.ai connectors off (suppresses the proxy-mode warning) —
+    // but let the user override it if they explicitly set the field.
+    if (!("disableClaudeAiConnectors" in userSettings)) {
+      userSettings.disableClaudeAiConnectors = true;
+    }
+
+    // In proxy mode, force the console login method so the placeholder-API-key session
+    // isn't blocked by a claude.ai-forcing user/project/local setting — unless the user's
+    // own --settings explicitly sets forceLoginMethod, in which case respect their choice.
+    if (proxyAuthMode && !("forceLoginMethod" in userSettings)) {
+      userSettings.forceLoginMethod = "console";
+    }
+
     // Overwrite the temp settings file with the merged result
     writeFileSync(tempSettingsPath, JSON.stringify(userSettings, null, 2), "utf-8");
   } catch {
@@ -251,8 +369,7 @@ function mergeUserSettingsIfPresent(
 export async function runClaudeWithProxy(
   config: ClaudishConfig,
   proxyUrl: string,
-  onCleanup?: () => void,
-  ptyDiagRunner?: PtyDiagRunner | null
+  onCleanup?: () => void
 ): Promise<number> {
   // Use actual OpenRouter model ID (no translation)
   // This ensures ANY model works, not just our shortlist
@@ -266,11 +383,37 @@ export async function runClaudeWithProxy(
   const portMatch = proxyUrl.match(/:(\d+)/);
   const port = portMatch ? portMatch[1] : "unknown";
 
+  // Proxy mode authenticates via the placeholder API key, so a claude.ai-forcing
+  // login policy would block the session. Compute it once, then neutralize it.
+  const proxyAuthMode = isProxyAuthMode(config);
+
+  // The OS *managed* settings tier cannot be overridden by our --settings overlay.
+  // If it forces claude.ai login while we're in proxy mode, Claude Code will refuse
+  // to start with an API key — fail fast with a clear reason instead of a confusing
+  // downstream error. (Native-Anthropic/--monitor sessions use the real subscription,
+  // so a claude.ai policy is fine there and we don't check.)
+  if (proxyAuthMode && managedSettingsForcesClaudeAi()) {
+    console.error(
+      "[claudish] Error: your organization's managed Claude Code settings force the " +
+        'claude.ai login method (forceLoginMethod: "claudeai").\n' +
+        "  claudish routes Claude Code through its local proxy using API-key auth, which " +
+        "that policy blocks at startup, and managed settings cannot be overridden.\n" +
+        "  Ask your Claude Code administrator to relax this policy, or run a native " +
+        "Anthropic model (which uses your real claude.ai subscription)."
+    );
+    onCleanup?.();
+    return 1;
+  }
+
   // Create temporary settings file with custom status line for this instance
-  const { path: tempSettingsPath, statusLine } = createTempSettingsFile(modelId, port);
+  const { path: tempSettingsPath, statusLine } = createTempSettingsFile(
+    modelId ?? "default",
+    port,
+    proxyAuthMode
+  );
 
   // Merge user's --settings into our temp settings file if user provided one
-  mergeUserSettingsIfPresent(config, tempSettingsPath, statusLine);
+  mergeUserSettingsIfPresent(config, tempSettingsPath, statusLine, proxyAuthMode);
 
   // Build claude arguments
   const claudeArgs: string[] = [];
@@ -291,8 +434,12 @@ export async function runClaudeWithProxy(
     claudeArgs.push(...config.claudeArgs);
   } else {
     // Single-shot mode - add all arguments
-    // Add -p flag FIRST to enable headless/print mode (non-interactive, exits after task)
-    claudeArgs.push("-p");
+    // Add -p flag FIRST to enable headless/print mode (non-interactive, exits after task).
+    // Skip if the caller already passed -p/--print through (they are synonyms; adding
+    // both is harmless to Claude Code but produces a confusing duplicated arg line).
+    if (!config.claudeArgs.includes("-p") && !config.claudeArgs.includes("--print")) {
+      claudeArgs.push("-p");
+    }
     if (config.autoApprove) {
       claudeArgs.push("--dangerously-skip-permissions");
     }
@@ -379,10 +526,18 @@ export async function runClaudeWithProxy(
     }
   }
 
-  // Helper function to log messages (respects quiet flag)
+  // Helper function to log claudish's own chatter (respects quiet flag).
+  // In single-shot/print mode, stdout belongs to Claude Code's machine-readable
+  // output (e.g. --output-format stream-json, parsed line-by-line by consumers
+  // like madbench), so claudish must never write to it. Route to stderr instead —
+  // humans read stderr equally well. Interactive mode keeps stdout.
   const log = (message: string) => {
     if (!config.quiet) {
-      console.log(message);
+      if (config.interactive) {
+        console.log(message);
+      } else {
+        console.error(message);
+      }
     }
   };
 
@@ -411,51 +566,100 @@ export async function runClaudeWithProxy(
     process.exit(1);
   }
 
-  // Spawn claude CLI process.
-  // MTM path: when ptyDiagRunner (MtmDiagRunner) is available in interactive mode,
-  // delegate spawning to mtm. mtm launches with `stdio: inherit`, takes over the
-  // terminal, runs Claude Code in the top pane (real PTY), and shows diagnostics
-  // in the bottom pane via tail -f on the diag log.
-  // Fallback path: standard stdio: 'inherit' spawn (non-interactive or no mtm).
-  const needsShell = isWindows();
+  // Spawn Claude Code with direct stdio: 'inherit' — no terminal multiplexer wrapper.
+  const needsShell = isWindows() && claudeBinary.endsWith(".cmd");
   const spawnCommand = needsShell ? `"${claudeBinary}"` : claudeBinary;
 
-  let exitCode: number;
+  // Signal telemetry that the child now owns the TTY — suppresses the consent
+  // prompt readline that would otherwise race the child for stdin (#85/88/99).
+  setClaudeCodeRunning(true);
 
-  if (config.interactive && ptyDiagRunner) {
-    // MTM path: mtm handles terminal setup and launches Claude Code
-    exitCode = await ptyDiagRunner.run(spawnCommand, claudeArgs, env, needsShell);
-
-    // Clean up temporary settings file
+  // stdio selection.
+  //
+  // Normally we inherit claudish's own fds. But claudish decides interactive
+  // mode from ARGS (no positional prompt, no --stdin), independent of TTY
+  // state — whereas Claude Code decides interactive-vs-print from whether its
+  // STDOUT is a TTY ("non-interactive mode ... when stdout is not a TTY, e.g.
+  // piped" — claude --help). When claudish runs under a wrapper that pipes
+  // stdout/stderr but leaves stdin a TTY (notably `op run`, which pipes
+  // stdout/stderr to mask secrets), a blind `inherit` hands the child a piped
+  // fd 1 → the child self-selects --print → with no prompt it dies with
+  // "Input must be provided either through stdin or as a prompt argument when
+  // using --print". claudish's interactive INTENT and the child's interactive
+  // REALITY diverge.
+  //
+  // Fix: when we intend interactive but our own stdout is NOT a TTY while stdin
+  // STILL is (the op-run shape), open a fresh writable handle to the SAME
+  // terminal as stdin and hand it to the child as stdout+stderr, so the child
+  // sees a TTY on fd 1 and launches its real interactive UI. We cannot reuse
+  // fd 0 directly (Bun rejects the stdin fd in a stdout/stderr slot:
+  // ERR_INVALID_ARG_TYPE), and /dev/tty is detached (ENXIO) under op run — so
+  // we open "/dev/fd/0", which resolves to stdin's underlying tty and yields a
+  // distinct fd number. claudish writes nothing to its own stdout during an
+  // interactive run (logs go to stderr), so abandoning the piped fd 1 for the
+  // child loses nothing. Any failure falls back to plain "inherit".
+  let ttyFd: number | undefined;
+  const childWantsTty = config.interactive && !process.stdout.isTTY && Boolean(process.stdin.isTTY);
+  if (childWantsTty) {
     try {
-      unlinkSync(tempSettingsPath);
+      const fd = openSync("/dev/fd/0", "r+");
+      if (isatty(fd)) {
+        ttyFd = fd;
+      } else {
+        closeSync(fd); // not actually a tty — don't use it
+      }
     } catch {
-      // Ignore cleanup errors
+      ttyFd = undefined; // couldn't open a writable tty handle — fall back below
     }
-  } else {
-    // Standard stdio: 'inherit' path (non-interactive or PTY unavailable)
-    const proc = spawn(spawnCommand, claudeArgs, {
-      env,
-      stdio: "inherit",
-      shell: needsShell,
+  } else if (config.interactive && !process.stdout.isTTY && !process.stdin.isTTY) {
+    // Truly headless: interactive intent but no terminal on any stream. The
+    // child would fall into --print and emit a cryptic error; surface an
+    // actionable one instead.
+    console.error(
+      "[claudish] An interactive session was requested but no terminal is attached " +
+        "(stdin and stdout are both non-TTY). Pass a prompt argument, or use --stdin / -p " +
+        "for non-interactive mode."
+    );
+  }
+
+  const stdio: Parameters<typeof spawn>[2]["stdio"] =
+    ttyFd !== undefined ? [0, ttyFd, ttyFd] : "inherit";
+
+  const proc = spawn(spawnCommand, claudeArgs, {
+    env,
+    stdio,
+    shell: needsShell,
+  });
+
+  // Close our copy of the tty write fd once the child has inherited it. The
+  // child keeps its own dup, so this doesn't disturb the running session.
+  if (ttyFd !== undefined) {
+    const fdToClose = ttyFd;
+    proc.on("spawn", () => {
+      try {
+        closeSync(fdToClose);
+      } catch {
+        /* already closed */
+      }
     });
+  }
 
-    // Handle process termination signals (includes cleanup)
-    setupSignalHandlers(proc, tempSettingsPath, config.quiet, onCleanup);
+  // Handle process termination signals (includes cleanup)
+  setupSignalHandlers(proc, tempSettingsPath, config.quiet, onCleanup);
 
-    // Wait for claude to exit
-    exitCode = await new Promise<number>((resolve) => {
-      proc.on("exit", (code) => {
-        resolve(code ?? 1);
-      });
+  // Wait for claude to exit
+  const exitCode = await new Promise<number>((resolve) => {
+    proc.on("exit", (code) => {
+      setClaudeCodeRunning(false);
+      resolve(code ?? 1);
     });
+  });
 
-    // Clean up temporary settings file
-    try {
-      unlinkSync(tempSettingsPath);
-    } catch {
-      // Ignore cleanup errors
-    }
+  // Clean up temporary settings file
+  try {
+    unlinkSync(tempSettingsPath);
+  } catch {
+    // Ignore cleanup errors
   }
 
   return exitCode;
@@ -479,10 +683,12 @@ function setupSignalHandlers(
   for (const signal of signals) {
     process.on(signal, () => {
       if (!quiet) {
-        console.log(`\n[claudish] Received ${signal}, shutting down...`);
+        // stderr: this is claudish's own diagnostic chatter and must not land
+        // on stdout, which may carry Claude Code's machine-readable output.
+        console.error(`\n[claudish] Received ${signal}, shutting down...`);
       }
       proc.kill();
-      // Run optional cleanup (e.g. close diag tmux pane) before exit
+      // Run optional cleanup before exit
       if (onCleanup) {
         try {
           onCleanup();

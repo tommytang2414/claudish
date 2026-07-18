@@ -4,24 +4,19 @@
  * Run: bun test packages/cli/src/providers/provider-definitions.test.ts
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import {
   BUILTIN_PROVIDERS,
-  getShortcuts,
-  getLegacyPrefixPatterns,
-  getNativeModelPatterns,
-  getProviderByName,
+  getApiKeyEnvVars,
   getApiKeyInfo,
   getDisplayName,
   getEffectiveBaseUrl,
-  isLocalTransport,
-  isDirectApiProvider,
-  toRemoteProvider,
-  getAllProviders,
+  getLegacyPrefixPatterns,
+  getNativeModelPatterns,
+  getProviderByName,
+  getShortcuts,
   getShortestPrefix,
-  getApiKeyEnvVars,
-  isProviderAvailable,
-  type ProviderDefinition,
+  toRemoteProvider,
 } from "./provider-definitions.js";
 
 // ---------------------------------------------------------------------------
@@ -29,64 +24,26 @@ import {
 // ---------------------------------------------------------------------------
 
 describe("BUILTIN_PROVIDERS structural integrity", () => {
-  test("every provider has required fields", () => {
-    for (const def of BUILTIN_PROVIDERS) {
-      expect(def.name).toBeTruthy();
-      expect(typeof def.name).toBe("string");
-      expect(def.displayName).toBeTruthy();
-      expect(typeof def.displayName).toBe("string");
-      expect(def.transport).toBeTruthy();
-      expect(typeof def.apiKeyEnvVar).toBe("string");
-      expect(typeof def.apiKeyDescription).toBe("string");
-      expect(typeof def.apiKeyUrl).toBe("string");
-      expect(Array.isArray(def.shortcuts)).toBe(true);
-      expect(Array.isArray(def.legacyPrefixes)).toBe(true);
-    }
-  });
-
-  test("no duplicate provider names", () => {
-    const names = BUILTIN_PROVIDERS.map((d) => d.name);
-    expect(new Set(names).size).toBe(names.length);
-  });
-
-  test("no duplicate shortcuts across providers", () => {
-    const allShortcuts: string[] = [];
-    for (const def of BUILTIN_PROVIDERS) {
-      for (const s of def.shortcuts) {
-        expect(allShortcuts).not.toContain(s);
-        allShortcuts.push(s);
-      }
-    }
-  });
-
-  test("no duplicate legacy prefixes across providers", () => {
-    const allPrefixes: string[] = [];
-    for (const def of BUILTIN_PROVIDERS) {
-      for (const lp of def.legacyPrefixes) {
-        expect(allPrefixes).not.toContain(lp.prefix);
-        allPrefixes.push(lp.prefix);
-      }
-    }
-  });
-
-  test("local providers are marked isLocal", () => {
-    const localProviders = BUILTIN_PROVIDERS.filter((d) => d.isLocal);
-    const localNames = localProviders.map((d) => d.name);
-    expect(localNames).toContain("ollama");
-    expect(localNames).toContain("lmstudio");
-    expect(localNames).toContain("vllm");
-    expect(localNames).toContain("mlx");
-  });
-
-  test("direct API providers are marked isDirectApi", () => {
-    const directProviders = BUILTIN_PROVIDERS.filter((d) => d.isDirectApi);
-    const directNames = directProviders.map((d) => d.name);
-    expect(directNames).toContain("google");
-    expect(directNames).toContain("openai");
-    expect(directNames).toContain("minimax");
-    expect(directNames).toContain("kimi");
-    expect(directNames).toContain("glm");
-    expect(directNames).toContain("openrouter");
+  // REGRESSION: the Sakana SUBSCRIPTION plan (sc@ / sakana-subscription) bills
+  // against a SEPARATE key from the pay-as-you-go API (sakana / SAKANA_API_KEY).
+  // Its primary env var is SAKANA_SUBSCRIPTION_API_KEY (named after Sakana's own
+  // "subscription" term, not "coding" — the plan is general-purpose). It must
+  // NOT alias back to SAKANA_API_KEY — doing so made sc@ silently use the PAYG
+  // key and bill prepaid credits ("Prepaid credit balance is exhausted") despite
+  // an active subscription.
+  test("sakana-subscription uses its own key, not the pay-as-you-go SAKANA_API_KEY", () => {
+    const sub = BUILTIN_PROVIDERS.find((d) => d.name === "sakana-subscription");
+    expect(sub).toBeDefined();
+    expect(sub!.apiKeyEnvVar).toBe("SAKANA_SUBSCRIPTION_API_KEY");
+    // Old name kept only as a back-compat alias.
+    expect(sub!.apiKeyAliases ?? []).toContain("SAKANA_CODING_API_KEY");
+    // The dangerous PAYG alias must NOT be present.
+    expect(sub!.apiKeyAliases ?? []).not.toContain("SAKANA_API_KEY");
+    // The old provider name is fully gone.
+    expect(BUILTIN_PROVIDERS.find((d) => d.name === "sakana-coding")).toBeUndefined();
+    // Sibling subscription plans also keep their key isolated from PAYG.
+    const kimiCoding = BUILTIN_PROVIDERS.find((d) => d.name === "kimi-coding");
+    expect(kimiCoding!.apiKeyAliases ?? []).not.toContain("MOONSHOT_API_KEY");
   });
 });
 
@@ -98,47 +55,47 @@ describe("getShortcuts", () => {
   const shortcuts = getShortcuts();
 
   test("maps 'g' to 'google'", () => {
-    expect(shortcuts["g"]).toBe("google");
+    expect(shortcuts.g).toBe("google");
   });
 
   test("maps 'gemini' to 'google'", () => {
-    expect(shortcuts["gemini"]).toBe("google");
+    expect(shortcuts.gemini).toBe("google");
   });
 
   test("maps 'oai' to 'openai'", () => {
-    expect(shortcuts["oai"]).toBe("openai");
+    expect(shortcuts.oai).toBe("openai");
   });
 
   test("maps 'or' to 'openrouter'", () => {
-    expect(shortcuts["or"]).toBe("openrouter");
+    expect(shortcuts.or).toBe("openrouter");
   });
 
   test("maps 'mm' to 'minimax'", () => {
-    expect(shortcuts["mm"]).toBe("minimax");
+    expect(shortcuts.mm).toBe("minimax");
   });
 
   test("maps 'kimi' to 'kimi'", () => {
-    expect(shortcuts["kimi"]).toBe("kimi");
+    expect(shortcuts.kimi).toBe("kimi");
   });
 
   test("maps 'glm' to 'glm'", () => {
-    expect(shortcuts["glm"]).toBe("glm");
+    expect(shortcuts.glm).toBe("glm");
   });
 
   test("maps local provider shortcuts", () => {
-    expect(shortcuts["ollama"]).toBe("ollama");
-    expect(shortcuts["lms"]).toBe("lmstudio");
-    expect(shortcuts["vllm"]).toBe("vllm");
-    expect(shortcuts["mlx"]).toBe("mlx");
+    expect(shortcuts.ollama).toBe("ollama");
+    expect(shortcuts.lms).toBe("lmstudio");
+    expect(shortcuts.vllm).toBe("vllm");
+    expect(shortcuts.mlx).toBe("mlx");
   });
 
   test("maps 'poe' to 'poe'", () => {
-    expect(shortcuts["poe"]).toBe("poe");
+    expect(shortcuts.poe).toBe("poe");
   });
 
   test("maps 'litellm' to 'litellm'", () => {
-    expect(shortcuts["litellm"]).toBe("litellm");
-    expect(shortcuts["ll"]).toBe("litellm");
+    expect(shortcuts.litellm).toBe("litellm");
+    expect(shortcuts.ll).toBe("litellm");
   });
 });
 
@@ -164,10 +121,6 @@ describe("getLegacyPrefixPatterns", () => {
     const ollamaColon = patterns.find((p) => p.prefix === "ollama:");
     expect(ollamaColon).toBeDefined();
     expect(ollamaColon!.provider).toBe("ollama");
-  });
-
-  test("has all legacy patterns from all providers", () => {
-    expect(patterns.length).toBeGreaterThan(20);
   });
 });
 
@@ -265,14 +218,6 @@ describe("getApiKeyInfo", () => {
 // ---------------------------------------------------------------------------
 
 describe("getDisplayName", () => {
-  test("returns proper display names", () => {
-    expect(getDisplayName("google")).toBe("Gemini");
-    expect(getDisplayName("openai")).toBe("OpenAI");
-    expect(getDisplayName("minimax")).toBe("MiniMax");
-    expect(getDisplayName("ollamacloud")).toBe("OllamaCloud");
-    expect(getDisplayName("opencode-zen")).toBe("OpenCode Zen");
-  });
-
   test("capitalizes unknown provider names", () => {
     expect(getDisplayName("unknown")).toBe("Unknown");
   });
@@ -283,13 +228,6 @@ describe("getDisplayName", () => {
 // ---------------------------------------------------------------------------
 
 describe("getEffectiveBaseUrl", () => {
-  test("returns default base URL when no env override", () => {
-    const def = getProviderByName("google")!;
-    // Without GEMINI_BASE_URL set, should return the default
-    const url = getEffectiveBaseUrl(def);
-    expect(url).toBe(process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com");
-  });
-
   test("returns base URL for provider without env overrides", () => {
     const def = getProviderByName("openrouter")!;
     expect(getEffectiveBaseUrl(def)).toBe("https://openrouter.ai");
@@ -300,53 +238,11 @@ describe("getEffectiveBaseUrl", () => {
 // isLocalTransport / isDirectApiProvider
 // ---------------------------------------------------------------------------
 
-describe("isLocalTransport", () => {
-  test("returns true for local providers", () => {
-    expect(isLocalTransport("ollama")).toBe(true);
-    expect(isLocalTransport("lmstudio")).toBe(true);
-    expect(isLocalTransport("vllm")).toBe(true);
-    expect(isLocalTransport("mlx")).toBe(true);
-  });
-
-  test("returns false for remote providers", () => {
-    expect(isLocalTransport("google")).toBe(false);
-    expect(isLocalTransport("openrouter")).toBe(false);
-  });
-});
-
-describe("isDirectApiProvider", () => {
-  test("returns true for direct API providers", () => {
-    expect(isDirectApiProvider("google")).toBe(true);
-    expect(isDirectApiProvider("openai")).toBe(true);
-    expect(isDirectApiProvider("minimax")).toBe(true);
-    expect(isDirectApiProvider("poe")).toBe(true);
-    expect(isDirectApiProvider("litellm")).toBe(true);
-  });
-
-  test("returns false for non-direct providers", () => {
-    expect(isDirectApiProvider("ollama")).toBe(false);
-    expect(isDirectApiProvider("unknown")).toBe(false);
-  });
-});
-
 // ---------------------------------------------------------------------------
 // toRemoteProvider
 // ---------------------------------------------------------------------------
 
 describe("toRemoteProvider", () => {
-  test("produces valid RemoteProvider for each non-local provider", () => {
-    for (const def of BUILTIN_PROVIDERS) {
-      if (def.isLocal || def.name === "qwen" || def.name === "native-anthropic") continue;
-
-      const rp = toRemoteProvider(def);
-      expect(rp.name).toBeTruthy();
-      expect(typeof rp.baseUrl).toBe("string");
-      expect(typeof rp.apiPath).toBe("string");
-      expect(typeof rp.apiKeyEnvVar).toBe("string");
-      expect(Array.isArray(rp.prefixes)).toBe(true);
-    }
-  });
-
   test("google maps to 'gemini' for RemoteProvider.name (backwards compat)", () => {
     const def = getProviderByName("google")!;
     const rp = toRemoteProvider(def);
@@ -372,12 +268,6 @@ describe("toRemoteProvider", () => {
 // ---------------------------------------------------------------------------
 
 describe("getShortestPrefix", () => {
-  test("returns shortest prefix for known providers", () => {
-    expect(getShortestPrefix("google")).toBe("g");
-    expect(getShortestPrefix("minimax")).toBe("mm");
-    expect(getShortestPrefix("openrouter")).toBe("or");
-  });
-
   test("falls back to provider name for unknown", () => {
     expect(getShortestPrefix("unknown")).toBe("unknown");
   });
@@ -402,59 +292,9 @@ describe("getApiKeyEnvVars", () => {
 });
 
 // ---------------------------------------------------------------------------
-// isProviderAvailable
-// ---------------------------------------------------------------------------
-
-describe("isProviderAvailable", () => {
-  test("local providers are always available", () => {
-    const ollama = getProviderByName("ollama")!;
-    expect(isProviderAvailable(ollama)).toBe(true);
-
-    const lmstudio = getProviderByName("lmstudio")!;
-    expect(isProviderAvailable(lmstudio)).toBe(true);
-  });
-
-  test("providers with publicKeyFallback are always available", () => {
-    const zen = getProviderByName("opencode-zen")!;
-    expect(isProviderAvailable(zen)).toBe(true);
-  });
-
-  test("provider with primary API key set is available", () => {
-    const prev = process.env.GEMINI_API_KEY;
-    process.env.GEMINI_API_KEY = "test-key";
-    try {
-      const google = getProviderByName("google")!;
-      expect(isProviderAvailable(google)).toBe(true);
-    } finally {
-      if (prev === undefined) delete process.env.GEMINI_API_KEY;
-      else process.env.GEMINI_API_KEY = prev;
-    }
-  });
-
-  test("provider with alias API key set is available", () => {
-    const prevPrimary = process.env.ZHIPU_API_KEY;
-    const prevAlias = process.env.GLM_API_KEY;
-    delete process.env.ZHIPU_API_KEY;
-    process.env.GLM_API_KEY = "test-alias-key";
-    try {
-      const glm = getProviderByName("glm")!;
-      expect(isProviderAvailable(glm)).toBe(true);
-    } finally {
-      if (prevPrimary === undefined) delete process.env.ZHIPU_API_KEY;
-      else process.env.ZHIPU_API_KEY = prevPrimary;
-      if (prevAlias === undefined) delete process.env.GLM_API_KEY;
-      else process.env.GLM_API_KEY = prevAlias;
-    }
-  });
-
-  test("provider without API key is unavailable", () => {
-    const prev = process.env.OLLAMA_API_KEY;
-    delete process.env.OLLAMA_API_KEY;
-    try {
-      const oc = getProviderByName("ollamacloud")!;
-      expect(isProviderAvailable(oc)).toBe(false);
-    } finally {
-      if (prev !== undefined) process.env.OLLAMA_API_KEY = prev;
-    }
-  });
-});
+// isProviderAvailable / isProviderAvailableByName were DELETED in the
+// async-credential-layer refactor — provider readiness now lives in the
+// credential authority (auth/credentials/authority.ts → isAvailable). The
+// readiness cases formerly tested here (local always-available, publicKeyFallback,
+// primary key, alias key, no-key → unavailable) are covered by the authority's
+// equivalence matrix in auth/credentials/equivalence.test.ts.

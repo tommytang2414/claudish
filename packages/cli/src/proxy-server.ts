@@ -1,76 +1,130 @@
+import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { serve } from "@hono/node-server";
-import { log, logStderr, isLoggingEnabled } from "./logger.js";
-import type { ProxyServer } from "./types.js";
-import { NativeHandler } from "./handlers/native-handler.js";
-import { OpenRouterProviderTransport } from "./providers/transport/openrouter.js";
-import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
-import { LocalTransport } from "./providers/transport/local.js";
 import { LocalModelAdapter } from "./adapters/local-adapter.js";
-import { GeminiProviderTransport } from "./providers/transport/gemini-apikey.js";
-import { GeminiCodeAssistProviderTransport } from "./providers/transport/gemini-codeassist.js";
-import { GeminiAPIFormat } from "./adapters/gemini-api-format.js";
-import { VertexProviderTransport, parseVertexModel } from "./providers/transport/vertex-oauth.js";
-import { DefaultAPIFormat } from "./adapters/base-api-format.js";
-import { PoeProvider } from "./providers/transport/poe.js";
-import type { ModelHandler } from "./handlers/types.js";
+import { OpenRouterAPIFormat } from "./adapters/openrouter-api-format.js";
+import { credentials } from "./auth/credentials/authority.js";
 import { ComposedHandler, type ComposedHandlerOptions } from "./handlers/composed-handler.js";
-import { LiteLLMProviderTransport } from "./providers/transport/litellm.js";
-import { LiteLLMAPIFormat } from "./adapters/litellm-api-format.js";
-import { OpenAIProviderTransport } from "./providers/transport/openai.js";
-import { OpenAIAPIFormat } from "./adapters/openai-api-format.js";
-import { AnthropicProviderTransport } from "./providers/transport/anthropic-compat.js";
-import { AnthropicAPIFormat } from "./adapters/anthropic-api-format.js";
-import { OllamaProviderTransport } from "./providers/transport/ollamacloud.js";
-import { OllamaAPIFormat } from "./adapters/ollama-api-format.js";
-import {
-  resolveProvider,
-  parseUrlModel,
-  createUrlProvider,
-} from "./providers/provider-registry.js";
-import { parseModelSpec } from "./providers/model-parser.js";
-import {
-  resolveRemoteProvider,
-  validateRemoteProviderApiKey,
-  getRegisteredRemoteProviders,
-} from "./providers/remote-provider-registry.js";
-import { getVertexConfig, validateVertexOAuthConfig } from "./auth/vertex-auth.js";
-import { resolveModelProvider } from "./providers/provider-resolver.js";
-import { warmPricingCache } from "./services/pricing-cache.js";
-import { fetchLiteLLMModels } from "./model-loader.js";
-import {
-  resolveModelNameSync,
-  logResolution,
-  warmAllCatalogs,
-} from "./providers/model-catalog-resolver.js";
 import { FallbackHandler } from "./handlers/fallback-handler.js";
 import type { FallbackCandidate } from "./handlers/fallback-handler.js";
-import { getFallbackChain, warmZenModelCache, warmZenGoModelCache } from "./providers/auto-route.js";
+import { NativeHandler } from "./handlers/native-handler.js";
+import { wrapAnthropicError } from "./handlers/shared/anthropic-error.js";
+import type { ModelHandler } from "./handlers/types.js";
+import { log, logStderr } from "./logger.js";
+import { warmRecommendedModels } from "./model-loader.js";
+import { loadConfig } from "./profile-config.js";
+import { API_KEY_MAP } from "./providers/api-key-map.js";
+import { loadCustomEndpoints } from "./providers/custom-endpoints-loader.js";
 import {
-  loadRoutingRules,
-  matchRoutingRule,
-  buildRoutingChain,
-} from "./providers/routing-rules.js";
+  ensureCatalogReady,
+  logResolution,
+  resolveModelNameSync,
+  warmAllCatalogs,
+} from "./providers/model-catalog-resolver.js";
+import { parseModelSpec } from "./providers/model-parser.js";
 import { createHandlerForProvider } from "./providers/provider-profiles.js";
+import {
+  createUrlProvider,
+  parseUrlModel,
+  resolveProvider,
+} from "./providers/provider-registry.js";
+import { resolveModelProvider } from "./providers/provider-resolver.js";
+import { resolveRemoteProvider } from "./providers/remote-provider-registry.js";
+import { loadRoutingRules, route } from "./providers/routing-rules.js";
+import { LocalTransport } from "./providers/transport/local.js";
+import { OpenRouterProviderTransport } from "./providers/transport/openrouter.js";
+import { PoeProvider } from "./providers/transport/poe.js";
+import type { ProviderTransport } from "./providers/transport/types.js";
+import { warmPricingCache } from "./services/pricing-cache.js";
+import type { ProxyServer } from "./types.js";
+
+/**
+ * Routing failures are TERMINAL — no provider can serve the request (missing
+ * credential, empty chain, unknown model). They must surface to the client as a
+ * non-retryable HTTP 400, not a retryable 500: a 500 makes Claude Code loop on
+ * "API error · Retrying · attempt N/10" and hide the real cause. Tagging the
+ * error lets the request handlers map it to 400 with the actionable message.
+ */
+class RoutingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RoutingError";
+  }
+}
+
+/**
+ * A single slot-routing entry for `claudish serve`. Claude Desktop sends
+ * `body.model = <slot>` (a Claude-recognized id it accepts into its picker);
+ * we route that to the user's real `model` on `provider`.
+ *
+ *   provider: a pinned provider slug (canonical BUILTIN_PROVIDERS name, e.g.
+ *             "x-ai", "google", "openrouter"), or null/undefined = autoroute
+ *             (let claudish's existing auto-chain pick).
+ */
+export interface SlotRoute {
+  model: string;
+  provider?: string | null;
+}
 
 export interface ProxyServerOptions {
   summarizeTools?: boolean; // Summarize tool descriptions for local models
   quiet?: boolean; // Suppress informational stderr output (e.g., [Auto-route])
   isInteractive?: boolean; // Whether the current session is interactive (gates consent prompt)
+  advisorModels?: string[]; // Advisor models from --advisor flag
+  advisorCollector?: string | null; // Collector model (null = no synthesis)
+  /**
+   * Exact slot-id → real-model map for `claudish serve` (Claude Desktop
+   * redirect). Consulted BEFORE the substring tier `modelMap` in
+   * getHandlerForRequest, so distinct slots that share a tier substring
+   * (e.g. two "opus" slots) don't collide. Optional — existing callers
+   * leave it undefined and behavior is unchanged.
+   */
+  slotMap?: Map<string, SlotRoute>;
+  /**
+   * Slot ids this gateway advertises on `GET /v1/models` (Claude Desktop
+   * builds its picker only from a live /v1/models call). These MUST be the
+   * Claude-recognized slot ids, not the real model ids. Defaults to [].
+   */
+  servedSlotIds?: string[];
 }
 
 export async function createProxyServer(
   port: number,
-  openrouterApiKey?: string,
+  // Legacy: the OpenRouter key is now resolved through the credential authority
+  // (transport getHeaders()), not passed in. Param retained for signature
+  // stability; callers may pass undefined.
+  _openrouterApiKey?: string,
   model?: string,
-  monitorMode: boolean = false,
+  monitorMode = false,
   anthropicApiKey?: string,
   modelMap?: { opus?: string; sonnet?: string; haiku?: string; subagent?: string },
   options: ProxyServerOptions = {}
 ): Promise<ProxyServer> {
+  // Load user-declared custom endpoints from ~/.claudish/config.json and
+  // register them in the runtime provider registry so they appear in lookups
+  // and handler creation. Runs once per proxy lifetime; idempotent.
+  try {
+    const customEpResult = loadCustomEndpoints(loadConfig());
+    if (customEpResult.registered > 0) {
+      log(`[Proxy] Registered ${customEpResult.registered} custom endpoint(s) from config`);
+    }
+    for (const err of customEpResult.errors) {
+      console.error(`[claudish] customEndpoints['${err.name}'] failed validation: ${err.message}`);
+    }
+  } catch (err) {
+    // Config read failure should not crash the proxy — the rest of startup
+    // continues and users get the default (builtin-only) set of providers.
+    log(
+      `[Proxy] customEndpoints load skipped: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
   // Define handlers for different roles
-  const nativeHandler = new NativeHandler(anthropicApiKey);
+  const nativeHandler = new NativeHandler(
+    anthropicApiKey,
+    options.advisorModels,
+    options.advisorCollector
+  );
   const openRouterHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> OpenRouter Handler
   const localProviderHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> Local Provider Handler
   const remoteProviderHandlers = new Map<string, ModelHandler>(); // Map from Target Model ID -> Gemini/OpenAI Handler
@@ -89,7 +143,10 @@ export async function createProxyServer(
     const modelId = targetModel.includes("@") ? parsed.model : targetModel;
 
     if (!openRouterHandlers.has(modelId)) {
-      const orProvider = new OpenRouterProviderTransport(openrouterApiKey || "", modelId);
+      // The OpenRouter key is resolved through the credential authority inside
+      // the transport's getHeaders() (single source of truth) — the legacy
+      // openrouterApiKey param is no longer the signing source.
+      const orProvider = new OpenRouterProviderTransport("", modelId);
       const orAdapter = new OpenRouterAPIFormat(modelId);
       openRouterHandlers.set(
         modelId,
@@ -104,19 +161,20 @@ export async function createProxyServer(
   };
 
   // Helper to get or create Poe handler for a target model
-  const getPoeHandler = (
+  const getPoeHandler = async (
     targetModel: string,
     invocationMode?: ComposedHandlerOptions["invocationMode"]
-  ): ModelHandler | null => {
-    const poeApiKey = process.env.POE_API_KEY;
-    if (!poeApiKey) {
-      log(`[Proxy] POE_API_KEY not set, cannot use Poe model: ${targetModel}`);
+  ): Promise<ModelHandler | null> => {
+    // Gate on the authority (env → config → op://), not a raw env read.
+    if (!(await credentials.isAvailable("poe"))) {
+      log(`[Proxy] Poe credentials not available, cannot use Poe model: ${targetModel}`);
       return null;
     }
     // Strip "poe:" prefix to get the actual model name for the API
     const modelId = targetModel.replace(/^poe:/, "");
     if (!poeHandlers.has(modelId)) {
-      const poeTransport = new PoeProvider(poeApiKey);
+      // The transport resolves its key through the authority in getHeaders().
+      const poeTransport = new PoeProvider();
       poeHandlers.set(
         modelId,
         new ComposedHandler(poeTransport, modelId, modelId, port, {
@@ -194,10 +252,10 @@ export async function createProxyServer(
 
   // Helper to get or create remote provider handler (Gemini, OpenAI)
   // TODO: Consolidate src/ and packages/core/src/ - they're manually synced duplicates
-  const getRemoteProviderHandler = (
+  const getRemoteProviderHandler = async (
     targetModel: string,
     invocationMode?: ComposedHandlerOptions["invocationMode"]
-  ): ModelHandler | null => {
+  ): Promise<ModelHandler | null> => {
     if (remoteProviderHandlers.has(targetModel)) {
       return remoteProviderHandlers.get(targetModel)!;
     }
@@ -228,8 +286,8 @@ export async function createProxyServer(
     const resolveTarget =
       resolution.wasAutoRouted && resolution.fullModelId ? resolution.fullModelId : targetModel;
 
-    // If resolver says use direct-api and key is available, create handler
-    if (resolution.category === "direct-api" && resolution.apiKeyAvailable) {
+    // If resolver says use direct-api, resolve credentials via the authority.
+    if (resolution.category === "direct-api") {
       const resolved = resolveRemoteProvider(resolveTarget);
       if (!resolved) return null;
 
@@ -238,10 +296,39 @@ export async function createProxyServer(
         return null; // Will fall through to OpenRouterHandler
       }
 
-      // Get API key - empty string for providers that don't require auth (like zen/ free models)
-      const apiKey = resolved.provider.apiKeyEnvVar
-        ? process.env[resolved.provider.apiKeyEnvVar] || ""
-        : "";
+      // Resolve the API key ON DEMAND via the credential authority — the SINGLE
+      // source of truth. This pulls env → aliases → config → 1Password (lazy SDK)
+      // and writes a resolved op:// key through to process.env. Providers that
+      // need no auth (e.g. zen/ free) have no apiKeyEnvVar → empty key.
+      let apiKey = "";
+      if (resolved.provider.apiKeyEnvVar) {
+        // HARDENING: getRequestAuth THROWS for a name the authority never
+        // registered (e.g. a runtime-renamed provider missing an alias), which
+        // would surface as an HTTP 500. Degrade to the same "no credential"
+        // path a missing key takes (null → explicit-spec routing reject → 400,
+        // or bare-name fallback) — but warn on stderr so the registration gap
+        // stays loud instead of silently masquerading as a missing key.
+        if (!credentials.get(resolved.provider.name)) {
+          console.error(
+            `[Proxy] No credential provider registered for "${resolved.provider.name}" — treating as missing credential (authority registration gap)`
+          );
+          log(
+            `[Proxy] Credential authority has no provider registered under "${resolved.provider.name}"`
+          );
+          return null;
+        }
+        const auth = await credentials.getRequestAuth(resolved.provider.name, {
+          model: resolved.modelName,
+        });
+        // Extract the bearer / x-api-key value back into the construction-time
+        // key string createHandlerForProvider expects.
+        apiKey =
+          auth.headers.Authorization?.replace(/^Bearer\s+/i, "") || auth.headers["x-api-key"] || "";
+        // ANTI-POISON: a provider that requires a key but resolved empty must NOT
+        // be cached — return null (falls through to OpenRouter) so a key added
+        // later (TUI hydrate-on-add, op:// resolve) is picked up on the next try.
+        if (!apiKey) return null;
+      }
 
       const handler = createHandlerForProvider({
         provider: resolved.provider,
@@ -269,27 +356,15 @@ export async function createProxyServer(
     return null;
   };
 
-  // Pre-warm LiteLLM model cache for auto-routing (non-blocking)
-  if (process.env.LITELLM_BASE_URL && process.env.LITELLM_API_KEY) {
-    fetchLiteLLMModels(process.env.LITELLM_BASE_URL, process.env.LITELLM_API_KEY)
-      .then(() => {
-        log("[Proxy] LiteLLM model cache pre-warmed for auto-routing");
-      })
-      .catch(() => {});
-  }
+  // Direct-provider catalog warmup (LiteLLM, Zen, Zen Go) was removed in
+  // commit 5 of the model-catalog and routing redesign. claudish only fetches
+  // Firebase catalogs now. The OpenRouter catalog is still warmed below via
+  // warmAllCatalogs() since it backs vendor-prefix resolution.
 
-  // Pre-warm Zen model cache for fallback chain filtering (non-blocking)
-  warmZenModelCache()
-    .then(() => log("[Proxy] Zen model cache pre-warmed for fallback filtering"))
-    .catch(() => {});
-
-  // Pre-warm Zen Go model cache separately (Zen Go serves only 4 models via /go endpoint)
-  warmZenGoModelCache()
-    .then(() => log("[Proxy] Zen Go model cache pre-warmed for fallback filtering"))
-    .catch(() => {});
-
-  // Load custom routing rules once at startup (local .claudish.json takes priority over global)
-  const customRoutingRules = loadRoutingRules();
+  // Load effective routing rules once at startup. Returns a merged view of
+  // DEFAULT_ROUTING_RULES + global config + local config (local wins). The
+  // routing engine consults these via route() for every bare-name request.
+  const effectiveRoutingRules = loadRoutingRules();
 
   // Cache fallback handlers by target model string.
   // No TTL/invalidation: claudish is ephemeral per session, so env changes
@@ -316,17 +391,41 @@ export async function createProxyServer(
     return "auto-route";
   };
 
-  const getHandlerForRequest = (requestedModel: string): ModelHandler => {
+  const getHandlerForRequest = async (requestedModel: string): Promise<ModelHandler> => {
     // 1. Monitor Mode Override
     if (monitorMode) return nativeHandler;
 
     // 2. Resolve target model based on mappings or defaults
-    // Priority: role mappings > default model (--model) > requested model (native)
+    // Priority: exact slot map > role mappings > default model (--model) > requested model (native)
     let target = requestedModel;
     let wasFromModelMap = false;
 
+    // 2a. Exact slot-id map (claudish serve / Claude Desktop redirect).
+    // Claude Desktop sends body.model = a Claude-recognized SLOT id; route it
+    // to the real model the user assigned that slot. Checked BEFORE the
+    // substring tier match below so two slots sharing a tier substring
+    // (e.g. claude-opus-4-1 + claude-opus-4-20250514) route distinctly
+    // instead of colliding. Rewrite `target` and fall through to the existing
+    // pipeline (explicit-provider path for pinned, auto-route + catalog
+    // resolution for null-provider, native passthrough for claude-* reals).
+    let slotMatched = false;
+    const slot = options.slotMap?.get(requestedModel);
+    if (slot) {
+      target =
+        slot.provider != null && slot.provider !== ""
+          ? `${slot.provider}@${slot.model}`
+          : slot.model;
+      slotMatched = true;
+      if (!options.quiet) {
+        logStderr(`[Serve] slot ${requestedModel} → ${target}`);
+      }
+    }
+
     const req = requestedModel.toLowerCase();
-    if (modelMap) {
+    if (slotMatched) {
+      // Slot map already set `target` — skip the substring tier match and the
+      // --model fallback entirely so they can't override the exact mapping.
+    } else if (modelMap) {
       // Role-specific mappings take highest priority
       if (req.includes("opus") && modelMap.opus) {
         target = modelMap.opus;
@@ -347,12 +446,16 @@ export async function createProxyServer(
 
     const invocationMode = detectInvocationMode(target, wasFromModelMap);
 
-    // 2b. Catalog resolution — resolve vendor prefix for OpenRouter and LiteLLM
+    // 2b. Catalog resolution — resolve vendor prefix for OpenRouter.
     // This must happen after target is determined but before handler construction.
-    // resolveModelNameSync is synchronous (uses in-memory cache + readFileSync).
+    // ensureCatalogReady awaits the catalog if not yet warm (with 5s timeout).
+    // resolveModelNameSync then reads from the in-memory cache synchronously.
+    // (LiteLLM catalog resolution was removed in commit 5 — users type the
+    // exact LiteLLM model_group name now; see plan §D.)
     {
       const parsedTarget = parseModelSpec(target);
-      if (parsedTarget.provider === "openrouter" || parsedTarget.provider === "litellm") {
+      if (parsedTarget.provider === "openrouter") {
+        await ensureCatalogReady(parsedTarget.provider, 5000);
         const resolution = resolveModelNameSync(parsedTarget.model, parsedTarget.provider);
         logResolution(parsedTarget.model, resolution, options.quiet);
         if (resolution.wasResolved) {
@@ -364,8 +467,9 @@ export async function createProxyServer(
     }
 
     // 2c. Provider fallback chain for auto-routed models
-    // When no explicit provider@ prefix is given, build a priority chain of providers
-    // and wrap them in a FallbackHandler that tries each in order on retryable errors.
+    // When no explicit provider@ prefix is given, consult the routing engine
+    // (defaults + user overrides merged in loadRoutingRules), filter to
+    // credentialed providers, and wrap them in a FallbackHandler.
     {
       const parsedForFallback = parseModelSpec(target);
       if (
@@ -378,23 +482,22 @@ export async function createProxyServer(
           return fallbackHandlerCache.get(cacheKey)!;
         }
 
-        const matchedEntries = customRoutingRules
-          ? matchRoutingRule(parsedForFallback.model, customRoutingRules)
-          : null;
-        const chain = matchedEntries
-          ? buildRoutingChain(matchedEntries, parsedForFallback.model)
-          : getFallbackChain(parsedForFallback.model, parsedForFallback.provider);
-        if (chain.length > 0) {
+        // Ensure catalog is warm before route() builds OpenRouter modelSpecs.
+        await ensureCatalogReady("openrouter", 5000);
+
+        const plan = await route(parsedForFallback.model, effectiveRoutingRules);
+        if (plan.kind === "ok") {
+          const chain = [plan.primary, ...plan.fallbacks];
           const candidates: FallbackCandidate[] = [];
-          for (const route of chain) {
+          for (const candidate of chain) {
             let handler: ModelHandler | null = null;
-            if (route.provider === "openrouter") {
-              handler = getOpenRouterHandler(route.modelSpec, invocationMode);
+            if (candidate.provider === "openrouter") {
+              handler = getOpenRouterHandler(candidate.modelSpec, invocationMode);
             } else {
-              handler = getRemoteProviderHandler(route.modelSpec, invocationMode);
+              handler = await getRemoteProviderHandler(candidate.modelSpec, invocationMode);
             }
             if (handler) {
-              candidates.push({ name: route.displayName, handler });
+              candidates.push({ name: candidate.displayName, handler });
             }
           }
 
@@ -405,20 +508,31 @@ export async function createProxyServer(
             fallbackHandlerCache.set(cacheKey, resultHandler);
 
             if (!options.quiet && candidates.length > 1) {
-              const source = matchedEntries ? "[Custom]" : "[Fallback]";
               logStderr(
-                `${source} ${candidates.length} providers for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`
+                `[Route] ${candidates.length} providers for ${parsedForFallback.model}: ${candidates.map((c) => c.name).join(" → ")}`
               );
             }
             return resultHandler;
           }
+        } else {
+          // No routable provider for a bare model name. Routing is fully
+          // data-driven now (DEFAULT_ROUTING_RULES + user overrides) — if the
+          // chain is empty and credential filtering produces nothing, that's
+          // the user's configured outcome. Throw so the request handler
+          // surfaces a clean error instead of silently falling through to a
+          // legacy OpenRouter fallback. (Pre-commit-5 there was a hidden
+          // OpenRouter step 7 that masked the no-route case.)
+          const message = plan.hint
+            ? `[Route] ${plan.reason}\n${plan.hint}`
+            : `[Route] ${plan.reason}`;
+          throw new RoutingError(message);
         }
       }
     }
 
     // 3. Check for Poe Model (poe: prefix)
     if (isPoeModel(target)) {
-      const poeHandler = getPoeHandler(target, invocationMode);
+      const poeHandler = await getPoeHandler(target, invocationMode);
       if (poeHandler) {
         log(`[Proxy] Routing to Poe: ${target}`);
         return poeHandler;
@@ -426,7 +540,7 @@ export async function createProxyServer(
     }
 
     // 4. Check for Remote Provider (g/, gemini/, oai/, openai/, mmax/, mm/, kimi/, moonshot/, glm/, zhipu/)
-    const remoteHandler = getRemoteProviderHandler(target, invocationMode);
+    const remoteHandler = await getRemoteProviderHandler(target, invocationMode);
     if (remoteHandler) return remoteHandler;
 
     // 5. Check for Local Provider (ollama/, lmstudio/, vllm/, or URL)
@@ -445,7 +559,32 @@ export async function createProxyServer(
       return nativeHandler;
     }
 
-    // 7. OpenRouter Handler (default for any model with "/" or explicit provider not matched above)
+    // 6b. Explicit non-OpenRouter spec that produced no handler above means its
+    // credential is MISSING — its key didn't resolve, so getRemoteProviderHandler
+    // returned null. Per the routing contract, an explicit provider@model must
+    // NOT silently fall through to OpenRouter (defaultProvider/last-resort
+    // fallback applies to BARE names only). Silently routing e.g. sc@fugu-ultra
+    // to OpenRouter caused it to catalog-resolve "fugu-ultra" → an xAI model
+    // (status line "Xai") + a confusing "API error", hiding the real cause: no
+    // Sakana key. Fail loudly with an actionable hint instead.
+    if (hasExplicitProvider) {
+      const parsedExplicit = parseModelSpec(target);
+      // openrouter@... legitimately uses the OpenRouter handler below.
+      if (parsedExplicit.provider !== "openrouter") {
+        const keyInfo = API_KEY_MAP[parsedExplicit.provider];
+        const keyNames = keyInfo
+          ? [keyInfo.envVar, ...(keyInfo.aliases ?? [])].join(" or ")
+          : undefined;
+        const hint = keyNames
+          ? `No API key for provider "${parsedExplicit.provider}". Set ${keyNames} (env, config, or 1Password import).`
+          : `No API key for provider "${parsedExplicit.provider}".`;
+        throw new RoutingError(
+          `Explicit model "${target}" could not be routed — its provider has no credential. ${hint}`
+        );
+      }
+    }
+
+    // 7. OpenRouter Handler (default for any model with "/" or explicit OpenRouter spec)
     return getOpenRouterHandler(target, invocationMode);
   };
 
@@ -461,12 +600,91 @@ export async function createProxyServer(
   );
   app.get("/health", (c) => c.json({ status: "ok" }));
 
+  // Model discovery for Claude Desktop "third-party inference" mode.
+  // The app builds its model picker ONLY from a live GET /v1/models, and
+  // silently drops any id it doesn't recognize — so `serve` advertises the
+  // Claude-recognized SLOT ids here (supplied via options.servedSlotIds),
+  // NOT the real model ids those slots route to. Defaults to an empty list
+  // for non-serve callers (the picker is irrelevant to them).
+  const servedSlotIds = options.servedSlotIds ?? [];
+  app.get("/v1/models", (c) => {
+    return c.json({
+      object: "list",
+      has_more: false,
+      data: servedSlotIds.map((id) => ({
+        id,
+        object: "model",
+        type: "model",
+        created: 1716000000,
+        owned_by: "claudish",
+      })),
+    });
+  });
+
+  /**
+   * Probe-model discovery for self-hosted / user-deployed providers
+   * (litellm, ollama, lmstudio, vllm, mlx, ollamacloud). The cloud
+   * /probeModels catalog can't enumerate user deployments — only the
+   * endpoint itself knows what's available. The TUI calls this when the
+   * catalog has no entry for a provider.
+   *
+   * GET /v1/probe-discover?provider=<slug>
+   * → 200 { provider, model } on success
+   * → 200 { provider, model: null, reason } on discovery failure
+   * → 404 if provider has no transport-level discoverer
+   */
+  app.get("/v1/probe-discover", async (c) => {
+    const provider = c.req.query("provider");
+    if (!provider) return c.json({ error: "missing provider query" }, 400);
+    // Optional exclude list — TUI's probe loop passes models that already
+    // failed so discovery returns the next candidate. Format: comma-separated.
+    const excludeQuery = c.req.query("exclude") ?? "";
+    const exclude = new Set(
+      excludeQuery
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+    // Use a sentinel model name — the handler factory needs one, but
+    // discoverProbeModel doesn't consult the modelName field.
+    const targetModel = `${provider}@<discover>`;
+    // Try local providers first (ollama, lmstudio, vllm, mlx). They're
+    // filtered out of the remote registry by design, so getRemoteProviderHandler
+    // returns null for them and we'd otherwise report "transport does not
+    // support discovery" even though LocalTransport DOES implement it.
+    const handler =
+      getLocalProviderHandler(targetModel) ?? (await getRemoteProviderHandler(targetModel));
+    const transport = (handler as unknown as { provider?: ProviderTransport })?.provider;
+    if (!transport?.discoverProbeModel) {
+      return c.json({ provider, model: null, reason: "transport does not support discovery" }, 404);
+    }
+    try {
+      const outcome = await transport.discoverProbeModel(exclude);
+      return c.json({
+        provider,
+        model: outcome.model,
+        reason: outcome.model ? null : (outcome.reason ?? "no model available"),
+      });
+    } catch (e: unknown) {
+      return c.json(
+        {
+          provider,
+          model: null,
+          reason: e instanceof Error ? e.message : String(e),
+        },
+        500
+      );
+    }
+  });
+
   // Token counting
   app.post("/v1/messages/count_tokens", async (c) => {
     try {
       const body = await c.req.json();
-      const reqModel = body.model || "claude-3-opus-20240229";
-      const handler = getHandlerForRequest(reqModel);
+      if (typeof body?.model !== "string" || body.model.length === 0) {
+        return c.json(wrapAnthropicError(400, "missing required field: model"), 400);
+      }
+      const handler = await getHandlerForRequest(body.model);
 
       // If native, we just forward. OpenRouter needs estimation.
       if (handler instanceof NativeHandler) {
@@ -479,26 +697,41 @@ export async function createProxyServer(
           body: JSON.stringify(body),
         });
         return c.json(await res.json());
-      } else {
-        // OpenRouter handler logic (estimation)
-        const txt = JSON.stringify(body);
-        return c.json({ input_tokens: Math.ceil(txt.length / 4) });
       }
+      // OpenRouter handler logic (estimation)
+      const txt = JSON.stringify(body);
+      return c.json({ input_tokens: Math.ceil(txt.length / 4) });
     } catch (e) {
-      return c.json({ error: String(e) }, 500);
+      if (e instanceof RoutingError) {
+        return c.json(wrapAnthropicError(400, e.message, "invalid_request_error"), 400);
+      }
+      return c.json(wrapAnthropicError(500, String(e)), 500);
     }
   });
 
   app.post("/v1/messages", async (c) => {
     try {
       const body = await c.req.json();
-      const handler = getHandlerForRequest(body.model);
+      // Request-metadata trace (debug log only — the [RequestMeta] prefix is
+      // NOT structural-log-worthy, so it never reaches the always-on redacted
+      // log). Captures the three fields claudish otherwise never reads, to
+      // diff ultracode vs plain-xhigh sessions for a wire-level marker.
+      log(
+        `[RequestMeta] model=${body.model} output_config=${JSON.stringify(body.output_config) ?? "(none)"} metadata=${JSON.stringify(body.metadata) ?? "(none)"} anthropic-beta=${c.req.header("anthropic-beta") ?? "(none)"}`
+      );
+      const handler = await getHandlerForRequest(body.model);
 
       // Route
       return handler.handle(c, body);
     } catch (e) {
       log(`[Proxy] Error: ${e}`);
-      return c.json({ error: { type: "server_error", message: String(e) } }, 500);
+      // Routing failures are terminal — surface as a non-retryable 400 so the
+      // client shows the real reason (e.g. missing key) instead of looping on
+      // "API error · Retrying". Other errors stay 500.
+      if (e instanceof RoutingError) {
+        return c.json(wrapAnthropicError(400, e.message, "invalid_request_error"), 400);
+      }
+      return c.json(wrapAnthropicError(500, String(e)), 500);
     }
   });
 
@@ -506,27 +739,50 @@ export async function createProxyServer(
 
   // Port resolution
   const addr = server.address();
-  const actualPort = typeof addr === "object" && addr?.port ? addr.port : port;
-  if (actualPort !== port) port = actualPort;
+  const resolvedPort = typeof addr === "object" && addr?.port ? addr.port : port;
 
-  log(`[Proxy] Server started on port ${port}`);
+  log(`[Proxy] Server started on port ${resolvedPort}`);
 
   // Warm pricing cache in background (non-blocking)
   warmPricingCache().catch(() => {});
 
-  // Warm model catalog resolvers in background (non-blocking)
-  // OpenRouter always warms; LiteLLM only if configured.
-  const catalogProvidersToWarm = ["openrouter"];
-  if (process.env.LITELLM_BASE_URL) catalogProvidersToWarm.push("litellm");
-  warmAllCatalogs(catalogProvidersToWarm).catch(() => {
+  // Warm recommended models from Firebase in background (non-blocking)
+  warmRecommendedModels().catch(() => {});
+
+  // Warm model catalog resolvers in background (non-blocking).
+  // OpenRouter is the only registered resolver post-commit-5 — the LiteLLM
+  // resolver was removed (claudish doesn't fetch LiteLLM's catalog anymore).
+  warmAllCatalogs(["openrouter"]).catch(() => {
     // Warming failures are non-fatal — resolver falls back to passthrough
   });
 
   return {
-    port,
-    url: `http://127.0.0.1:${port}`,
+    port: resolvedPort,
+    url: `http://127.0.0.1:${resolvedPort}`,
     shutdown: async () => {
-      return new Promise<void>((resolve) => server.close((e) => resolve()));
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+    invalidateHandlerCache: (providerSlug?: string) => {
+      if (!providerSlug) {
+        localProviderHandlers.clear();
+        remoteProviderHandlers.clear();
+        return;
+      }
+      // Handler cache keys are model specs like "lmstudio@<model>". Drop
+      // any whose left-of-@ matches the slug, plus any using the slug as
+      // a legacy prefix (e.g. "ollama/llama3"). Both forms route to the
+      // same transport so both need invalidation.
+      const matches = (k: string) =>
+        k === providerSlug ||
+        k.startsWith(`${providerSlug}@`) ||
+        k.startsWith(`${providerSlug}/`) ||
+        k.startsWith(`${providerSlug}:`);
+      for (const k of [...localProviderHandlers.keys()]) {
+        if (matches(k)) localProviderHandlers.delete(k);
+      }
+      for (const k of [...remoteProviderHandlers.keys()]) {
+        if (matches(k)) remoteProviderHandlers.delete(k);
+      }
     },
   };
 }

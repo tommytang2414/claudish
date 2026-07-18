@@ -19,7 +19,7 @@
  * - kimi/, moonshot/ -> Kimi/Moonshot API (Anthropic-compatible)
  * - glm/, zhipu/ -> GLM/Zhipu API (OpenAI-compatible)
  * - gc/ -> GLM Coding Plan API (OpenAI-compatible)
- * - zai/ -> Z.AI API (Anthropic-compatible)
+ * - z-ai/ (legacy: zai/) -> Z.AI API (Anthropic-compatible)
  * - oc/ -> OllamaCloud API (OpenAI-compatible)
  * - zen/ -> OpenCode Zen API (OpenAI-compatible + Anthropic for MiniMax)
  * - or/, no prefix with "/" -> OpenRouter (existing handler)
@@ -29,8 +29,8 @@ import type {
   RemoteProvider,
   ResolvedRemoteProvider,
 } from "../handlers/shared/remote-provider-types.js";
-import { parseModelSpec, isLocalProviderName } from "./model-parser.js";
-import { getAllProviders, toRemoteProvider } from "./provider-definitions.js";
+import { isLocalProviderName, parseModelSpec } from "./model-parser.js";
+import { getAllProviders, getEffectiveBaseUrl, toRemoteProvider } from "./provider-definitions.js";
 
 /**
  * Remote provider configurations — derived from BUILTIN_PROVIDERS.
@@ -40,7 +40,14 @@ const getRemoteProviders = (): RemoteProvider[] => {
   return getAllProviders()
     .filter(
       (def) =>
-        !def.isLocal && def.baseUrl !== "" && def.name !== "qwen" && def.name !== "native-anthropic"
+        !def.isLocal &&
+        // Resolve baseUrlEnvVars so user-deployed providers like LiteLLM
+        // (static baseUrl: "", populated via LITELLM_BASE_URL) aren't filtered
+        // out. Without this, resolveRemoteProvider("litellm@...") returns null
+        // and probe-discovery / runtime routing both fail.
+        getEffectiveBaseUrl(def) !== "" &&
+        def.name !== "qwen" &&
+        def.name !== "native-anthropic"
     )
     .map(toRemoteProvider);
 };
@@ -137,7 +144,7 @@ export function validateRemoteProviderApiKey(provider: RemoteProvider): string |
       MOONSHOT_API_KEY:
         "export MOONSHOT_API_KEY='your-key' (get from https://platform.moonshot.cn/)",
       KIMI_CODING_API_KEY:
-        "export KIMI_CODING_API_KEY='sk-kimi-...' (get from https://kimi.com/code membership page, or run: claudish --kimi-login)",
+        "export KIMI_CODING_API_KEY='sk-kimi-...' (get from https://kimi.com/code membership page, or run: claudish login kimi)",
       ZHIPU_API_KEY: "export ZHIPU_API_KEY='your-key' (get from https://open.bigmodel.cn/)",
       GLM_CODING_API_KEY: "export GLM_CODING_API_KEY='your-key' (get from https://z.ai/subscribe)",
       OLLAMA_API_KEY: "export OLLAMA_API_KEY='your-key' (get from https://ollama.com/account)",

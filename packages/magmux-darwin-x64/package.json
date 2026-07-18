@@ -1,0 +1,14 @@
+{
+  "name": "@claudish/magmux-darwin-x64",
+  "version": "6.7.0",
+  "description": "magmux binary for macOS x64",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "main": "bin/magmux",
+  "files": ["bin/"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MadAppGang/claudish"
+  }
+}

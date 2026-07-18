@@ -15,13 +15,14 @@
  * Device ID stored at: ~/.claudish/kimi-device-id
  */
 
+import { exec } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFileSync, existsSync, unlinkSync, openSync, writeSync, closeSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { homedir, hostname, platform, release } from "node:os";
 import { join } from "node:path";
-import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import { log } from "../logger.js";
+import { VERSION } from "../version.js";
 
 const execAsync = promisify(exec);
 
@@ -105,6 +106,21 @@ export class KimiOAuth {
   }
 
   /**
+   * Re-read the credential file from disk into the in-memory singleton.
+   *
+   * The singleton loads credentials ONCE in its constructor, so a login that
+   * happens in a CHILD process (e.g. the config TUI spawns `claudish login
+   * kimi`) writes a fresh token file this long-lived parent never sees — its
+   * request path keeps using the stale startup snapshot and fails until the
+   * process is relaunched. Calling this after a login child returns picks up the
+   * new token in-process, no restart needed. (Device ID is preserved.)
+   */
+  reloadCredentials(): void {
+    this.credentials = this.loadCredentials();
+    this.refreshPromise = null;
+  }
+
+  /**
    * Check if credentials exist (without validating expiry)
    * Use this to determine if login is needed before making requests
    */
@@ -176,15 +192,10 @@ export class KimiOAuth {
   }
 
   /**
-   * Get version from package.json
+   * Get version from generated version.ts
    */
   private getVersion(): string {
-    try {
-      const packageJson = JSON.parse(readFileSync(join(__dirname, "../../package.json"), "utf-8"));
-      return packageJson.version;
-    } catch {
-      return "4.0.6"; // Fallback
-    }
+    return VERSION;
   }
 
   /**
@@ -214,10 +225,10 @@ export class KimiOAuth {
     // Step 2: Display user code and open browser
     console.log("\n🔐 Kimi OAuth Login");
     console.log("═".repeat(60));
-    console.log(`\nPlease authorize this device:`);
+    console.log("\nPlease authorize this device:");
     console.log(`\n  Visit: ${deviceAuth.verification_uri_complete}`);
     console.log(`  User Code: ${deviceAuth.user_code}`);
-    console.log(`\nWaiting for authorization...`);
+    console.log("\nWaiting for authorization...");
 
     await this.openBrowser(deviceAuth.verification_uri_complete);
 
@@ -316,18 +327,20 @@ export class KimiOAuth {
           // User hasn't authorized yet, continue polling
           log("[KimiOAuth] Authorization pending...");
           continue;
-        } else if (result.error === "slow_down") {
+        }
+        if (result.error === "slow_down") {
           // FIX H2: RFC 8628 Section 3.5 - increase interval by 5 seconds
           currentInterval += 5000;
           log(`[KimiOAuth] Slow down requested, new interval: ${currentInterval / 1000}s`);
           continue;
-        } else if (result.error === "expired_token") {
-          throw new Error("Device code expired. Please run `claudish --kimi-login` again.");
-        } else if (result.error === "access_denied") {
-          throw new Error("Authorization denied by user.");
-        } else {
-          throw new Error(`OAuth error: ${result.error} - ${result.error_description}`);
         }
+        if (result.error === "expired_token") {
+          throw new Error("Device code expired. Please run `claudish login kimi` again.");
+        }
+        if (result.error === "access_denied") {
+          throw new Error("Authorization denied by user.");
+        }
+        throw new Error(`OAuth error: ${result.error} - ${result.error_description}`);
       }
 
       // Success!
@@ -349,7 +362,7 @@ export class KimiOAuth {
    */
   private async pollForTokenWithRetry(deviceCode: string, retryCount = 0): Promise<TokenResponse> {
     const maxRetries = 3;
-    const backoffMs = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
+    const backoffMs = 2 ** retryCount * 1000; // 1s, 2s, 4s
 
     try {
       const url = `${OAUTH_CONFIG.authHost}${OAUTH_CONFIG.tokenPath}`;
@@ -436,7 +449,7 @@ export class KimiOAuth {
 
     // Check if we have credentials
     if (!this.credentials) {
-      throw new Error("No Kimi OAuth credentials found. Please run `claudish --kimi-login` first.");
+      throw new Error("No Kimi OAuth credentials found. Please run `claudish login kimi` first.");
     }
 
     // Check if token is still valid (with 5-minute buffer)
@@ -468,7 +481,7 @@ export class KimiOAuth {
    */
   private async doRefreshToken(): Promise<string> {
     if (!this.credentials) {
-      throw new Error("No Kimi OAuth credentials found. Please run `claudish --kimi-login` first.");
+      throw new Error("No Kimi OAuth credentials found. Please run `claudish login kimi` first.");
     }
 
     log("[KimiOAuth] Refreshing access token");
@@ -536,10 +549,7 @@ export class KimiOAuth {
 
       // No API key available, throw error with instructions
       throw new Error(
-        `OAuth credentials invalid. Please re-login or set API key:\n` +
-          `  - Run: claudish --kimi-login\n` +
-          `  - Or set: export MOONSHOT_API_KEY='your-api-key'\n\n` +
-          `Details: ${e.message}`
+        `OAuth credentials invalid. Please re-login or set API key:\n  - Run: claudish login kimi\n  - Or set: export MOONSHOT_API_KEY='your-api-key'\n\nDetails: ${e.message}`
       );
     }
   }

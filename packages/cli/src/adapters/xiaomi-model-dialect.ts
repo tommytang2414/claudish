@@ -7,12 +7,11 @@
  * - Context window comes dynamically from OpenRouter model catalog
  */
 
-import { BaseAPIFormat, AdapterResult, matchesModelFamily } from "./base-api-format.js";
 import { log } from "../logger.js";
-import { lookupModel } from "./model-catalog.js";
+import { type AdapterResult, BaseAPIFormat, matchesModelFamily } from "./base-api-format.js";
 
 export class XiaomiModelDialect extends BaseAPIFormat {
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     return {
       cleanedText: textContent,
       extractedToolCalls: [],
@@ -20,14 +19,14 @@ export class XiaomiModelDialect extends BaseAPIFormat {
     };
   }
 
-  override getToolNameLimit(): number | null {
-    return lookupModel(this.modelId)?.toolNameLimit ?? null;
+  override getToolNameLimit(): number {
+    return 64;
   }
 
   override prepareRequest(request: any, originalRequest: any): any {
     // Xiaomi doesn't support thinking params
     if (originalRequest.thinking) {
-      log(`[XiaomiModelDialect] Stripping thinking object (not supported by Xiaomi API)`);
+      log("[XiaomiModelDialect] Stripping thinking object (not supported by Xiaomi API)");
       delete request.thinking;
     }
 

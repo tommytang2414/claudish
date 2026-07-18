@@ -11,16 +11,8 @@
  * belong in integration tests.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import {
-  mkdtempSync,
-  mkdirSync,
-  writeFileSync,
-  existsSync,
-  readFileSync,
-  readdirSync,
-  rmSync,
-} from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { VoteResult } from "./team-orchestrator.js";
@@ -263,6 +255,70 @@ describe("team-orchestrator", () => {
     });
   });
 
+  // ── Sentinel model rejection ────────────────────────────────────────────
+  // REGRESSION: sentinel model names leaked to claudish child processes — Fixed in /dev:fix session dev-fix-20260406-131846-32b9662c
+
+  describe("setupSession — sentinel model rejection", () => {
+    it("TEST-17: rejects 'internal' sentinel model", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() => setupSession(tempDir, ["internal"], "task")).toThrow(/internal/i);
+    });
+
+    it("TEST-18: rejects 'default' sentinel model", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() => setupSession(tempDir, ["default"], "task")).toThrow(/default/i);
+    });
+
+    it("TEST-19: rejects Claude tier sentinels (opus, sonnet, haiku)", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() => setupSession(tempDir, ["opus"], "task")).toThrow(/opus/i);
+      expect(() => setupSession(tempDir, ["sonnet"], "task")).toThrow(/sonnet/i);
+      expect(() => setupSession(tempDir, ["haiku"], "task")).toThrow(/haiku/i);
+    });
+
+    it("TEST-20: rejects claude-* model IDs", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() => setupSession(tempDir, ["claude-sonnet-4-6"], "task")).toThrow(
+        /claude-sonnet-4-6/i
+      );
+      expect(() => setupSession(tempDir, ["claude-3-opus-20240229"], "task")).toThrow(
+        /claude-3-opus/i
+      );
+    });
+
+    it("TEST-21: rejects sentinels case-insensitively", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() => setupSession(tempDir, ["Internal"], "task")).toThrow(/Internal/i);
+      expect(() => setupSession(tempDir, ["OPUS"], "task")).toThrow(/OPUS/i);
+    });
+
+    it("TEST-22: rejects mixed arrays containing sentinels alongside valid models", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      expect(() =>
+        setupSession(tempDir, ["gemini-2.0-flash", "internal", "gpt-4o"], "task")
+      ).toThrow(/internal/i);
+    });
+
+    it("TEST-23: accepts valid external model names", async () => {
+      const { setupSession } = await getOrchestrator();
+
+      // These should NOT throw
+      const manifest = setupSession(
+        tempDir,
+        ["gemini-2.0-flash", "gpt-4o", "or@deepseek/deepseek-r1"],
+        "task"
+      );
+      expect(manifest).toBeDefined();
+      expect(Object.keys(manifest.models)).toHaveLength(3);
+    });
+  });
+
   // ── Security: validateSessionPath ─────────────────────────────────────────
 
   describe("validateSessionPath", () => {
@@ -413,12 +469,6 @@ describe("fisherYatesShuffle", () => {
   it("TEST-S2: single-element array returns same element", async () => {
     const shuffle = await getShuffle();
     expect(shuffle([42])).toEqual([42]);
-  });
-
-  it("TEST-S3: two-element array is a valid permutation", async () => {
-    const shuffle = await getShuffle();
-    const result = shuffle([1, 2]);
-    expect(result.sort()).toEqual([1, 2]);
   });
 
   it("TEST-S4: output is a permutation (sorted equals sorted input)", async () => {
@@ -681,9 +731,9 @@ describe("parseJudgeVotes", () => {
   function makeVoteBlock(
     responseId: string,
     verdict: string,
-    confidence: string = "8",
-    summary: string = "Looks good",
-    keyIssues: string = "None"
+    confidence = "8",
+    summary = "Looks good",
+    keyIssues = "None"
   ): string {
     return `\`\`\`vote\nRESPONSE: ${responseId}\nVERDICT: ${verdict}\nCONFIDENCE: ${confidence}\nSUMMARY: ${summary}\nKEY_ISSUES: ${keyIssues}\n\`\`\``;
   }

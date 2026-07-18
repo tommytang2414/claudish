@@ -6,16 +6,13 @@
  * Used by: MiniMax, Kimi, Kimi Coding, Z.AI
  */
 
-import { BaseAPIFormat, type AdapterResult } from "./base-api-format.js";
 import type { StreamFormat } from "../providers/transport/types.js";
-import { lookupModel } from "./model-catalog.js";
+import { type AdapterResult, BaseAPIFormat } from "./base-api-format.js";
 
 export class AnthropicAPIFormat extends BaseAPIFormat {
-  private providerName: string;
-
-  constructor(modelId: string, providerName: string) {
+  constructor(modelId: string, _providerName?: string) {
     super(modelId);
-    this.providerName = providerName.toLowerCase();
+    // _providerName retained for backward compat with call sites; no longer used.
   }
 
   processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
@@ -26,7 +23,7 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
     };
   }
 
-  shouldHandle(modelId: string): boolean {
+  shouldHandle(_modelId: string): boolean {
     return false; // Not auto-selected; always explicitly passed
   }
 
@@ -112,18 +109,6 @@ export class AnthropicAPIFormat extends BaseAPIFormat {
 
   override getStreamFormat(): StreamFormat {
     return "anthropic-sse";
-  }
-
-  override getContextWindow(): number {
-    // Try catalog lookup first (handles kimi/minimax model name variants)
-    const catalogEntry = lookupModel(this.modelId);
-    if (catalogEntry) return catalogEntry.contextWindow;
-
-    // Provider name fallbacks for when model ID alone doesn't identify the family
-    if (this.providerName === "kimi" || this.providerName === "kimi-coding") return 131_072;
-    if (this.providerName === "minimax" || this.providerName === "minimax-coding") return 204_800;
-
-    return 128_000; // Default
   }
 
   override supportsVision(): boolean {

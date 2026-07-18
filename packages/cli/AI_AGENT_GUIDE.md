@@ -1,6 +1,6 @@
 # Claudish AI Agent Usage Guide
 
-**Version:** 2.2.0
+**Version:** 7.0.0
 **Target Audience:** AI Agents running within Claude Code
 **Purpose:** Quick reference for using Claudish CLI and MCP server in agentic workflows
 
@@ -65,6 +65,18 @@ claudish --model vertex/qwen/qwen3-coder-480b-a35b-instruct-maas "implement"
 claudish --model vertex/openai/gpt-oss-120b-maas "reason"
 ```
 
+### Default provider (v7.0.0+)
+
+Bare model names (no `provider@` prefix) route through the configured default provider. Override per-invocation:
+
+```bash
+claudish --default-provider litellm --model minimax-m2.5 "task"
+```
+
+Explicit `provider@model` syntax always bypasses `defaultProvider` and routes directly to the named provider.
+
+Custom endpoints can be registered in `~/.claudish/config.json`. See [docs/settings-reference.md](../../docs/settings-reference.md) for the full schema.
+
 ## Prerequisites
 
 1. **Install Claudish:**
@@ -125,7 +137,7 @@ claudish --model vertex/openai/gpt-oss-120b-maas "reason"
 
 **Update models:**
 ```bash
-claudish --models --force-update
+claudish --models --models-refresh
 ```
 
 ## Critical: File-Based Pattern for Sub-Agents
@@ -245,15 +257,16 @@ for (const model of models) {
 | `--model <model>` | OpenRouter model to use | `--model x-ai/grok-code-fast-1` |
 | `--stdin` | Read prompt from stdin | `cat task.md \| claudish --stdin --model grok` |
 | `--json` | JSON output (structured) | `claudish --json "task"` |
-| `--list-models` | List available models | `claudish --list-models --json` |
+| `--models` | List available models | `claudish --models --json` |
 
 ### Useful Flags
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--default-provider <name>` | Override default provider for bare model routing (v7.0.0+) | Auto-detected |
 | `--quiet` / `-q` | Suppress logs | Enabled in single-shot |
 | `--verbose` / `-v` | Show logs | Enabled in interactive |
-| `--debug` / `-d` | Debug logging to file | Disabled |
+| `--debug-claudish` / `-d` | Debug logging to file | Disabled |
 | `--no-auto-approve` | Require prompts | Auto-approve enabled |
 
 ### Claude Code Flag Passthrough
@@ -425,7 +438,7 @@ Claude: [calls compare_models tool with models=["openai/gpt-5.3", "google/gemini
 ### JSON Output (Recommended)
 
 ```bash
-claudish --list-models --json
+claudish --models --json
 ```
 
 **Output:**
@@ -458,7 +471,7 @@ claudish --list-models --json
 ### Parse in TypeScript
 
 ```typescript
-const { stdout } = await Bash("claudish --list-models --json");
+const { stdout } = await Bash("claudish --models --json");
 const data = JSON.parse(stdout);
 
 // Get all model IDs
@@ -534,7 +547,7 @@ try {
 } catch (error) {
   if (error.message.includes("Model not found")) {
     console.error("Model unavailable. Listing alternatives...");
-    await Bash("claudish --list-models");
+    await Bash("claudish --models");
   } else {
     console.error("Claudish error:", error.message);
   }
@@ -596,7 +609,7 @@ console.log(`Total cost: $${totalCost.toFixed(4)}`);
 3. **Use --json output** for automation and parsing
 4. **Handle errors gracefully** with fallbacks
 5. **Track costs** when running multiple tasks
-6. **Update models regularly** with `--force-update`
+6. **Update models regularly** with `--models-refresh`
 7. **Use --stdin** for large prompts (git diffs, code review)
 
 ### ❌ DON'T
@@ -615,7 +628,7 @@ console.log(`Total cost: $${totalCost.toFixed(4)}`);
 npm install -g claudish
 
 # Get models
-claudish --list-models --json
+claudish --models --json
 
 # Run task
 claudish --model x-ai/grok-code-fast-1 "your task"
@@ -627,7 +640,7 @@ git diff | claudish --stdin --model google/gemini-2.5-flash "review"
 claudish --json --model grok "task" | jq -r '.total_cost_usd'
 
 # Update models
-claudish --list-models --force-update
+claudish --models --models-refresh
 
 # Get help
 claudish --help
@@ -731,6 +744,6 @@ claudish --help-ai > claudish-agent-guide.md
 
 ---
 
-**Version:** 2.2.0
-**Last Updated:** January 22, 2026
+**Version:** 7.0.0
+**Last Updated:** April 14, 2026
 **Maintained by:** MadAppGang

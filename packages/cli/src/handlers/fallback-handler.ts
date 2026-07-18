@@ -10,9 +10,9 @@
  */
 
 import type { Context } from "hono";
-import type { ModelHandler } from "./types.js";
 import { logStderr } from "../logger.js";
 import { ComposedHandler } from "./composed-handler.js";
+import type { ModelHandler } from "./types.js";
 
 export interface FallbackCandidate {
   /** Human-readable provider name for logging */
@@ -24,7 +24,7 @@ export interface FallbackCandidate {
 export class FallbackHandler implements ModelHandler {
   private candidates: FallbackCandidate[];
   /** Index of the last provider that successfully handled a request. */
-  private lastSuccessIndex: number = 0;
+  private lastSuccessIndex = 0;
 
   constructor(candidates: FallbackCandidate[]) {
     this.candidates = candidates;
@@ -65,6 +65,10 @@ export class FallbackHandler implements ModelHandler {
           this.lastSuccessIndex = idx;
           if (errors.length > 0) {
             logStderr(`[Fallback] ${name} succeeded after ${errors.length} failed attempt(s)`);
+            // Update status bar to show the actual provider used
+            if (handler instanceof ComposedHandler) {
+              handler.getTokenTracker()?.setProviderDisplayName(name);
+            }
           }
           return response;
         }
@@ -217,5 +221,5 @@ function parseErrorMessage(body: string): string {
 }
 
 function truncate(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + "..." : s;
+  return s.length > max ? `${s.slice(0, max)}...` : s;
 }

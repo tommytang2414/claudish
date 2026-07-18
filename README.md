@@ -19,7 +19,7 @@
 **Claudish** (Claude-ish) is a CLI tool that allows you to run Claude Code with any AI model by proxying requests through a local Anthropic API-compatible server.
 
 **Supported Providers:**
-- **Cloud:** OpenRouter (580+ models), Google Gemini, OpenAI, MiniMax, Kimi, GLM, Z.AI, OllamaCloud, OpenCode Zen
+- **Cloud:** OpenRouter (580+ models), Google Gemini, OpenAI, MiniMax, Kimi, GLM, Z.AI, Sakana Fugu, OllamaCloud, OpenCode Zen
 - **Local:** Ollama, LM Studio, vLLM, MLX
 - **Enterprise:** Vertex AI (Google Cloud)
 
@@ -198,7 +198,7 @@ claudish --help-ai > claudish-agent-guide.md
    claudish --models gemini
 
    # Get top recommended models (JSON)
-   claudish --top-models --json
+   claudish --models-top --json
    ```
 
 2. **Run Claudish through sub-agent** (recommended pattern):
@@ -250,7 +250,7 @@ claudish --help-ai > claudish-agent-guide.md
 - ✅ Use file-based patterns to avoid context window pollution
 - ✅ Delegate to sub-agents instead of running directly
 - ✅ Return summaries only (not full conversation transcripts)
-- ✅ Choose appropriate model for task (see `--models` or `--top-models`)
+- ✅ Choose appropriate model for task (see `--models` or `--models-top`)
 
 **Resources:**
 - Full AI agent guide: `claudish --help-ai`
@@ -272,17 +272,19 @@ claudish [OPTIONS] <claude-args...>
 | Flag | Short | Description | Default |
 |------|-------|-------------|---------|
 | `--model <model>` | `-m` | Model to use (`provider@model` syntax) | Interactive selector |
+| `--default-provider <name>` | | Default provider for bare model routing (v7.0.0+) | Auto-detected |
 | `--model-opus <model>` | | Model for Opus role (planning, complex tasks) | |
 | `--model-sonnet <model>` | | Model for Sonnet role (default coding) | |
 | `--model-haiku <model>` | | Model for Haiku role (fast tasks) | |
 | `--model-subagent <model>` | | Model for sub-agents (Task tool) | |
 | `--profile <name>` | `-p` | Named profile for model mapping | Default profile |
+| `--op-env <id>` | | Load env vars from a 1Password Environment (highest priority) | |
 | `--interactive` | `-i` | Interactive mode (persistent session) | Auto when no prompt |
 | `--auto-approve` | `-y` | Skip permission prompts | `false` |
 | `--no-auto-approve` | | Explicitly enable permission prompts | |
 | `--dangerous` | | Pass `--dangerouslyDisableSandbox` | `false` |
 | `--port <port>` | | Proxy server port | Random (3000-9000) |
-| `--debug` | `-d` | Enable debug logging to `logs/` | `false` |
+| `--debug-claudish` | `-d` | Enable debug logging to `logs/` | `false` |
 | `--log-level <level>` | | Log verbosity: `debug`, `info`, `minimal` | `info` |
 | `--quiet` | `-q` | Suppress `[claudish]` messages | Default in single-shot |
 | `--verbose` | `-v` | Show `[claudish]` messages | Default in interactive |
@@ -291,12 +293,12 @@ claudish [OPTIONS] <claude-args...>
 | `--free` | | Show only free models in selector | `false` |
 | `--monitor` | | Proxy to real Anthropic API and log traffic | `false` |
 | `--summarize-tools` | | Summarize tool descriptions (for local models) | `false` |
-| `--cost-tracker` | | Enable cost tracking (enables monitor mode) | `false` |
-| `--audit-costs` | | Show cost analysis report | |
-| `--reset-costs` | | Reset accumulated cost statistics | |
-| `--models [query]` | `-s` | List all models or fuzzy search | |
-| `--top-models` | | Show curated recommended models | |
-| `--force-update` | | Force refresh model cache | |
+| `--cost-track` | | Enable cost tracking (enables monitor mode) | `false` |
+| `--cost-audit` | | Show cost analysis report | |
+| `--cost-reset` | | Reset accumulated cost statistics | |
+| `--models [query]` | `-s` (`--models-search`) | List all models or fuzzy search | |
+| `--models-top` | | Show curated recommended models | |
+| `--models-refresh` | | Force refresh model cache | |
 | `--init` | | Install Claudish skill in current project | |
 | `--mcp` | | Run as MCP server | |
 | `--gemini-login` | | Login to Gemini Code Assist via OAuth | |
@@ -328,6 +330,8 @@ Claudish automatically loads `.env` from the current directory at startup. For t
 | `ZHIPU_API_KEY` | GLM/Zhipu (`glm@`) | `GLM_API_KEY` |
 | `GLM_CODING_API_KEY` | GLM Coding Plan (`gc@`) | `ZAI_CODING_API_KEY` |
 | `ZAI_API_KEY` | Z.AI (`zai@`) | |
+| `SAKANA_API_KEY` | Sakana Fugu (`sakana@`, `fugu@`) | |
+| `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` |
 | `OLLAMA_API_KEY` | OllamaCloud (`oc@`) | |
 | `OPENCODE_API_KEY` | OpenCode Zen (`zen@`) — optional for free models | |
 | `LITELLM_API_KEY` | LiteLLM (`ll@`) — requires `LITELLM_BASE_URL` | |
@@ -351,6 +355,7 @@ Claudish automatically loads `.env` from the current directory at startup. For t
 | `CLAUDISH_TELEMETRY` | Override telemetry (`0`/`false`/`off` to disable) | From config |
 | `CLAUDISH_LOCAL_MAX_PARALLEL` | Max concurrent local model requests (1-8) | `1` |
 | `CLAUDISH_LOCAL_QUEUE_ENABLED` | Enable/disable local model queue | `true` |
+| `CLAUDISH_DEFAULT_PROVIDER` | Default provider for bare model routing (v7.0.0+) | Auto-detected |
 | `CLAUDISH_QWEN_NO_THINK` | Disable thinking for Qwen models (`1`) | |
 
 #### Claude Code Compatibility
@@ -438,6 +443,96 @@ claudish profile edit <name>                # Edit profile
 
 For the complete configuration reference, see [Settings Reference](docs/settings-reference.md).
 
+## 1Password Integration
+
+Resolve provider API keys from 1Password instead of storing them in plaintext. Claudish reads [secret references](https://developer.1password.com/docs/cli/secret-references/) (`op://vault/item/field`) and resolves them at startup — the secret never lives in your config or shell history.
+
+**Authentication** is automatic, in this order:
+
+1. **`OP_SERVICE_ACCOUNT_TOKEN`** — a [service-account token](https://developer.1password.com/docs/service-accounts/) for headless/CI use (resolved via the official 1Password SDK, in-process, no `op` CLI needed). Service accounts can only read **shared** vaults, not your Private vault.
+2. **`op` CLI session** — if you're signed into the 1Password desktop app (`op signin`), claudish uses that session (interactive, Touch ID). This is the zero-setup path on a laptop.
+
+If a config value or env var starts with `op://` and neither auth method works, claudish **fails with a clear message** rather than running with a missing key. If no `op://` reference is present, claudish never touches 1Password (zero overhead for non-users).
+
+> **About the authorization prompt:** When claudish reads a secret via the `op` CLI session, the 1Password desktop app shows an authorization prompt. By design, 1Password labels that prompt with the **requesting process** — i.e. your terminal (`tmux`, `iTerm`, etc.) — not "claudish". This is a 1Password behavior that no app can override; the prompt always names the process, never the integration. claudish *is* identified as `claudish` in 1Password's **activity/audit log**, just not in the live prompt. To avoid the prompt entirely (e.g. CI, or if the terminal name bothers you), use a `OP_SERVICE_ACCOUNT_TOKEN` — the service-account path authenticates directly against the 1Password API with **no desktop prompt at all**.
+
+### Single references
+
+Point any API key at a 1Password field:
+
+```json
+{
+  "apiKeys": {
+    "OPENROUTER_API_KEY": "op://Shared/OpenRouter/credential",
+    "OPENAI_API_KEY": "op://Shared/OpenAI/api-key"
+  }
+}
+```
+
+A `${VAR}` in a custom-endpoint `apiKey` and an `op://...` value are both resolved the same way. Multiple references are resolved in a single batch (one auth prompt).
+
+### Glob import — many keys from one item
+
+If you keep all your provider keys in one 1Password item (each field named after its env var, e.g. `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`), import them all with one entry. Add a top-level `onepassword` array of glob paths:
+
+```json
+{
+  "onepassword": [
+    "op://Jack/AI LLM keys/*/*_API_KEY"
+  ]
+}
+```
+
+The glob position mirrors the `op://` path structure:
+
+| Pattern | Imports |
+|---------|---------|
+| `op://Vault/Item/*` | all **top-level** (sectionless) fields |
+| `op://Vault/Item/*_API_KEY` | top-level fields ending in `_API_KEY` |
+| `op://Vault/Item/Section/*` | all fields in `Section` |
+| `op://Vault/Item/*/*_API_KEY` | `*_API_KEY` fields across **all** sections |
+| `op://Vault/Item/M*/*` | all fields in sections starting with `M` |
+
+Each matched **field label becomes the env var name** (trimmed of whitespace). Labels that aren't valid env var names (e.g. `Customer Key`) are skipped with a warning. Only matched fields are decrypted — claudish lists field names first, then fetches values only for the ones you import.
+
+Preview what a glob would import **without revealing any secret values**:
+
+```bash
+claudish op --list "op://Jack/AI LLM keys/*/*_API_KEY"
+#   OPENROUTER_API_KEY   ✓  (section: Open router)
+#   ANTHROPIC_API_KEY    ✓  (section: Claude)
+#   Customer Key         ✗  skipped (not a valid env var name)
+#   9 importable, 1 skipped
+```
+
+Or run a one-off session with keys loaded inline, no config needed:
+
+```bash
+claudish op "op://Jack/AI LLM keys/*/*_API_KEY" --model openrouter@deepseek/deepseek-r1 "task"
+```
+
+### Finding the path
+
+In the 1Password app, hover a field → its menu → **Copy Secret Reference** gives `op://Vault/Item/[Section/]Field`. For a glob, you only need the vault and item names (visible in the sidebar and title) plus `/*` — claudish discovers the fields. The `claudish op --list` preview confirms a glob before you commit it to config.
+
+### 1Password Environments
+
+[1Password Environments](https://www.1password.dev/environments) (named sets of env vars) load via `--op-env <id>`, where `<id>` is the Environment ID copied from the desktop app (Developer → View Environments → Manage environment → Copy environment ID):
+
+```bash
+claudish --op-env <environment-id> --model openrouter@... "task"
+```
+
+Environment values are the **highest-priority source** (they override config and shell env). Requires the `op` CLI **≥ 2.35 (beta)** — the latest stable `op` (2.34.0) does not yet include the `op environment` command.
+
+### Zero-code alternative
+
+You can also wrap claudish with `op run` (no config changes needed), using an env file of `op://` references:
+
+```bash
+op run --env-file=.env -- claudish --model openrouter@... "task"
+```
+
 ## Model Routing (v4.0.0+)
 
 Claudish uses **`provider@model[:concurrency]`** syntax for explicit routing, plus **smart auto-detection** for native providers:
@@ -463,6 +558,8 @@ claudish --model ollama@llama3.2:3 "code review"  # 3 concurrent requests
 | `kimi@`, `moon@` | Kimi Direct | `MOONSHOT_API_KEY` | `kimi@kimi-k2` |
 | `glm@`, `zhipu@` | GLM Direct | `ZHIPU_API_KEY` | `glm@glm-4` |
 | `zai@` | Z.AI Direct | `ZAI_API_KEY` | `zai@glm-4` |
+| `sakana@`, `fugu@` | Sakana Fugu | `SAKANA_API_KEY` | `fugu@fugu-ultra` |
+| `sc@` | Sakana Fugu Subscription | `SAKANA_CODING_API_KEY` | `sc@fugu-ultra` |
 | `llama@`, `lc@`, `meta@` | OllamaCloud | `OLLAMA_API_KEY` | `llama@llama-3.1-70b` |
 | `oc@` | OllamaCloud | `OLLAMA_API_KEY` | `oc@llama-3.1-70b` |
 | `zen@` | OpenCode Zen (free/paid) | `OPENCODE_API_KEY` _(optional)_ | `zen@gpt-5-nano` |
@@ -487,6 +584,7 @@ When no provider is specified, Claudish auto-detects from model name:
 | `abab-*`, `minimax/*` | MiniMax Direct | `abab-6.5` |
 | `kimi-*`, `moonshot-*` | Kimi Direct | `kimi-k2` |
 | `glm-*`, `zhipu/*` | GLM Direct | `glm-4` |
+| `fugu-*`, `sakana/*` | Sakana Fugu | `fugu-ultra` |
 | `poe:*` | Poe | `poe:GPT-4o` |
 | `claude-*`, `anthropic/*` | Native Anthropic | `claude-sonnet-4` |
 | **Unknown `vendor/model`** | **Error** | Use `openrouter@vendor/model` |
@@ -520,6 +618,45 @@ claudish --model ollama@llama3.2:0 "fast"       # No limit (bypass queue)
 claudish --model openrouter@qwen/qwen-2.5 "task"
 claudish --model or@mistralai/mistral-large "analysis"
 ```
+
+### Default provider (v7.0.0+)
+
+The routing priority for bare model names (no `provider@` prefix) is configurable. By default, Claudish tries LiteLLM (if configured), then OpenRouter. Override this with `defaultProvider`:
+
+```bash
+# Set default provider globally
+claudish config set defaultProvider openrouter
+
+# Or via env var
+export CLAUDISH_DEFAULT_PROVIDER=openrouter
+
+# Or per-invocation
+claudish --default-provider litellm --model minimax-m2.5 "task"
+```
+
+Precedence: `--default-provider` flag > `CLAUDISH_DEFAULT_PROVIDER` env var > config file `defaultProvider` > legacy LiteLLM auto-promotion > `OPENROUTER_API_KEY` detection > hardcoded `"openrouter"`.
+
+Explicit `provider@model` syntax always bypasses `defaultProvider` and routes directly.
+
+### Custom endpoints (v7.0.0+)
+
+Register your own OpenAI-compatible endpoints in `~/.claudish/config.json`. See [Settings Reference](docs/settings-reference.md) for the full schema.
+
+```json
+{
+  "customEndpoints": {
+    "my-vllm": {
+      "kind": "simple",
+      "url": "http://gpu-box:8000/v1",
+      "format": "openai",
+      "apiKey": "none"
+    }
+  },
+  "defaultProvider": "my-vllm"
+}
+```
+
+Then route to it with: `claudish --model my-vllm@llama3 "task"`
 
 ### Legacy Syntax (Deprecated)
 
@@ -561,7 +698,7 @@ List all models:
 ```bash
 claudish --models              # List all OpenRouter models
 claudish --models gemini       # Search for specific models
-claudish --top-models          # Show curated recommendations
+claudish --models-top          # Show curated recommendations
 ```
 
 ## Claude Code Flag Passthrough (NEW in v5.3.0)
@@ -757,7 +894,7 @@ claudish "debug issue" --verbose
 claudish "analyze code" --cwd /path/to/project
 
 # Multiple flags
-claudish --model openai/gpt-5.3-codex "task" --verbose --debug
+claudish --model openai/gpt-5.3-codex "task" --verbose --debug-claudish
 ```
 
 ### Monitor Mode
@@ -766,14 +903,14 @@ claudish --model openai/gpt-5.3-codex "task" --verbose --debug
 
 ```bash
 # Enable monitor mode (requires real Anthropic API key)
-claudish --monitor --debug "implement a feature"
+claudish --monitor --debug-claudish "implement a feature"
 ```
 
 **What Monitor Mode Does:**
 - ✅ **Proxies to REAL Anthropic API** (not OpenRouter) - Uses your actual Anthropic API key
 - ✅ **Logs ALL traffic** - Captures complete requests and responses
 - ✅ **Both streaming and JSON** - Logs SSE streams and JSON responses
-- ✅ **Debug logs to file** - Saves to `logs/claudish_*.log` when `--debug` is used
+- ✅ **Debug logs to file** - Saves to `logs/claudish_*.log` when `--debug-claudish` is used
 - ✅ **Pass-through proxy** - No translation, forwards as-is to Anthropic
 
 **When to use Monitor Mode:**
@@ -787,8 +924,8 @@ claudish --monitor --debug "implement a feature"
 # Monitor mode requires a REAL Anthropic API key (not placeholder)
 export ANTHROPIC_API_KEY='sk-ant-api03-...'
 
-# Use with --debug to save logs to file
-claudish --monitor --debug "your task"
+# Use with --debug-claudish to save logs to file
+claudish --monitor --debug-claudish "your task"
 
 # Logs are saved to: logs/claudish_TIMESTAMP.log
 ```
@@ -818,7 +955,7 @@ data: {"type":"content_block_start",...}
 === End Streaming Response ===
 ```
 
-**Note:** Monitor mode charges your Anthropic account (not OpenRouter). Use `--debug` flag to save logs for analysis.
+**Note:** Monitor mode charges your Anthropic account (not OpenRouter). Use `--debug-claudish` flag to save logs for analysis.
 
 ### Output Modes
 

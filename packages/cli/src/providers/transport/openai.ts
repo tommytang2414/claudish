@@ -6,16 +6,16 @@
  * Includes 30-second timeout with detailed error reporting.
  */
 
-import type { ProviderTransport, StreamFormat } from "./types.js";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
 import { log } from "../../logger.js";
+import type { ProviderTransport, StreamFormat } from "./types.js";
 
 export class OpenAIProviderTransport implements ProviderTransport {
   readonly name: string;
   readonly displayName: string;
   readonly streamFormat: StreamFormat;
 
-  private provider: RemoteProvider;
+  protected provider: RemoteProvider;
   private apiKey: string;
   private modelName: string;
 
@@ -42,17 +42,23 @@ export class OpenAIProviderTransport implements ProviderTransport {
   async getHeaders(): Promise<Record<string, string>> {
     const headers: Record<string, string> = {};
     if (this.apiKey) {
-      headers["Authorization"] = `Bearer ${this.apiKey}`;
+      headers.Authorization = `Bearer ${this.apiKey}`;
     }
     return headers;
   }
 
   /**
-   * Override fetch with 30-second timeout, 429 retry with exponential backoff,
-   * and detailed error handling.
+   * Override fetch with 30-second timeout and bounded 429 retry. The retry
+   * budget is intentionally tight (~3s worst case) so probe deadlines and
+   * user-perceived latency stay reasonable — long retry chains on rate
+   * limits are worse UX than honest failures.
+   *
+   * Terminal 429s (billing/balance errors) are detected by body sniff and
+   * skip the retry chain entirely: retrying a balance error wastes wall
+   * clock and lies about endpoint health.
    */
   async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
-    const maxRetries = 5;
+    const maxRetries = 2;
     let lastResponse: Response | null = null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -60,17 +66,28 @@ export class OpenAIProviderTransport implements ProviderTransport {
         const response = await fetchFn();
 
         if (response.status === 429 && attempt < maxRetries) {
+          // Sniff body for terminal billing/quota errors. Clone first so the
+          // caller still gets a readable body if we return this response.
+          const bodyText = await response
+            .clone()
+            .text()
+            .catch(() => "");
+          if (isTerminal429(bodyText)) {
+            log(`[${this.displayName}] 429 is terminal (billing/quota), not retrying`);
+            return response;
+          }
           lastResponse = response;
-          // Parse Retry-After header if present
           const retryAfter = response.headers.get("Retry-After");
           let delayMs: number;
           if (retryAfter && !Number.isNaN(Number(retryAfter))) {
-            delayMs = Math.min(Number(retryAfter) * 1000, 30000);
+            delayMs = Math.min(Number(retryAfter) * 1000, 2000);
           } else {
-            // Exponential backoff: 2s, 4s, 8s, 16s, 30s
-            delayMs = Math.min(2000 * Math.pow(2, attempt), 30000);
+            // 500ms, 1000ms — quick recovery without blowing probe budget
+            delayMs = 500 * (attempt + 1);
           }
-          log(`[${this.displayName}] 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${(delayMs / 1000).toFixed(1)}s`);
+          log(
+            `[${this.displayName}] 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${(delayMs / 1000).toFixed(1)}s`
+          );
           await new Promise((resolve) => setTimeout(resolve, delayMs));
           continue;
         }
@@ -101,6 +118,35 @@ export class OpenAIProviderTransport implements ProviderTransport {
     if (name === "openai") return "OpenAI";
     return name.charAt(0).toUpperCase() + name.slice(1);
   }
+}
+
+/**
+ * Detect 429 response bodies that indicate a non-retryable condition —
+ * billing/balance errors that won't resolve no matter how long we wait.
+ * Conservative: only matches well-known patterns, falls through to retry
+ * for anything ambiguous.
+ *
+ * Examples caught:
+ *   - GLM/Zhipu: code 1113, "Insufficient balance or no resource package"
+ *   - OpenAI:    "You exceeded your current quota"
+ *   - Many:     "insufficient_quota", "billing_not_active", "out of credits"
+ */
+export function isTerminal429(body: string): boolean {
+  if (!body) return false;
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("insufficient balance") ||
+    lower.includes("insufficient_balance") ||
+    lower.includes("insufficient_quota") ||
+    lower.includes("insufficient quota") ||
+    lower.includes("billing_not_active") ||
+    lower.includes("billing not active") ||
+    lower.includes("quota_exceeded") ||
+    lower.includes("exceeded your current quota") ||
+    lower.includes("out of credits") ||
+    lower.includes('"code":"1113"') ||
+    lower.includes('"code":1113')
+  );
 }
 
 export class OpenAITimeoutError extends Error {

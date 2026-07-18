@@ -11,11 +11,17 @@
  * - Provider-specific error messages
  */
 
-import type { ProviderTransport, StreamFormat } from "./types.js";
-import type { LocalProvider as LocalProviderConfig } from "../../providers/provider-registry.js";
+import { Agent } from "undici";
+import { credentials } from "../../auth/credentials/authority.js";
 import { LocalModelQueue } from "../../handlers/shared/local-queue.js";
 import { log } from "../../logger.js";
-import { Agent } from "undici";
+import type { LocalProvider as LocalProviderConfig } from "../../providers/provider-registry.js";
+import {
+  discoverViaLMStudio,
+  discoverViaOllama,
+  discoverViaOpenAIModels,
+} from "./probe-discovery.js";
+import type { ProviderTransport, StreamFormat } from "./types.js";
 
 // Custom undici agent with long timeouts for local LLM inference
 // Default undici headersTimeout is 30s which is too short for prompt processing
@@ -56,8 +62,8 @@ export class LocalTransport implements ProviderTransport {
     // Check for env var override of context window
     const envContextWindow = process.env.CLAUDISH_CONTEXT_WINDOW;
     if (envContextWindow) {
-      const parsed = parseInt(envContextWindow, 10);
-      if (!isNaN(parsed) && parsed > 0) {
+      const parsed = Number.parseInt(envContextWindow, 10);
+      if (!Number.isNaN(parsed) && parsed > 0) {
         this._contextWindow = parsed;
         log(`[${this.displayName}] Context window from env: ${this._contextWindow}`);
       }
@@ -75,7 +81,52 @@ export class LocalTransport implements ProviderTransport {
   }
 
   async getHeaders(): Promise<Record<string, string>> {
-    return {};
+    // Local providers default to no auth. When the deployment requires it
+    // (LM Studio "Reachable on local network", vLLM --api-key, remote Ollama
+    // behind a reverse proxy), the user sets <PROVIDER>_API_KEY. For the four
+    // known local providers the bearer token resolves through the credential
+    // authority (env → config → op://) — the single source of truth. A "custom"
+    // local endpoint (not registered in the authority) keeps its config.apiKey.
+    if (this.config.name && this.config.name !== "custom") {
+      const auth = await credentials.getRequestAuth(this.config.name, { model: "" });
+      if (auth.headers.Authorization || auth.headers["x-api-key"]) {
+        return { ...auth.headers };
+      }
+    }
+    const headers: Record<string, string> = {};
+    if (this.config.apiKey) {
+      headers.Authorization = `Bearer ${this.config.apiKey}`;
+    }
+    return headers;
+  }
+
+  async discoverProbeModel(exclude?: ReadonlySet<string>) {
+    // Each local server gets the richest discovery surface it exposes:
+    //   - Ollama: /api/ps (loaded) + /api/tags (all with size).
+    //   - LM Studio: /api/v0/models with per-model loaded state, so we can
+    //     pick a loaded model and avoid the "model loading error" 400 that
+    //     happens when LM Studio fails to JIT-load a downloaded-but-cold
+    //     model. Falls back to /v1/models if /api/v0 isn't available.
+    //   - vLLM / MLX: plain /v1/models — no loaded-state distinction.
+    const cacheKey = {
+      key: `${this.config.name}:${this.config.baseUrl}`,
+      displayName: this.displayName,
+      exclude,
+    };
+    if (this.config.name === "ollama") {
+      return discoverViaOllama(this.config.baseUrl, {
+        ...cacheKey,
+        key: `ollama:${this.config.baseUrl}`,
+      });
+    }
+    if (this.config.name === "lmstudio") {
+      return discoverViaLMStudio(this.config.baseUrl, await this.getHeaders(), cacheKey);
+    }
+    return discoverViaOpenAIModels(
+      `${this.config.baseUrl}/v1/models`,
+      await this.getHeaders(),
+      cacheKey
+    );
   }
 
   getRequestInit(): Record<string, any> {
@@ -218,9 +269,9 @@ export class LocalTransport implements ProviderTransport {
 
         const ctxFromParams = data.parameters?.match(/num_ctx\s+(\d+)/)?.[1];
         if (ctxFromInfo) {
-          this._contextWindow = parseInt(String(ctxFromInfo), 10);
+          this._contextWindow = Number.parseInt(String(ctxFromInfo), 10);
         } else if (ctxFromParams) {
-          this._contextWindow = parseInt(ctxFromParams, 10);
+          this._contextWindow = Number.parseInt(ctxFromParams, 10);
         } else {
           log(`[${this.displayName}] No context info found, using default: ${this._contextWindow}`);
         }

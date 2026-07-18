@@ -3,7 +3,7 @@
 // Per-session state machine that detects events from stdout output patterns
 // and dispatches notifications via a callback.
 
-import type { SignalState, SignalData, SignalCallback } from "./types.js";
+import type { SignalCallback, SignalData, SignalState } from "./types.js";
 
 /** How long to wait after last output before declaring "waiting_for_input". */
 const QUIET_PERIOD_MS = 2000;
@@ -33,7 +33,7 @@ export class SignalWatcher {
   constructor(
     private sessionId: string,
     private callback: SignalCallback,
-    private quietPeriodMs = QUIET_PERIOD_MS,
+    private quietPeriodMs = QUIET_PERIOD_MS
   ) {}
 
   /** Current state. */
@@ -125,7 +125,9 @@ export class SignalWatcher {
       const match = text.match(pattern);
       if (match) {
         // Extract tool name from match
-        const nameMatch = match[0].match(/\b(Read|Write|Edit|Bash|Glob|Grep|Agent|Skill|WebSearch|WebFetch|Tool:\s*\w+)\b/);
+        const nameMatch = match[0].match(
+          /\b(Read|Write|Edit|Bash|Glob|Grep|Agent|Skill|WebSearch|WebFetch|Tool:\s*\w+)\b/
+        );
         return nameMatch ? nameMatch[1].replace("Tool: ", "") : "unknown";
       }
     }

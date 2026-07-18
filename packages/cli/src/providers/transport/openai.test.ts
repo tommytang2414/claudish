@@ -1,13 +1,13 @@
-import { describe, test, expect } from "bun:test";
-import { OpenAIProviderTransport } from "./openai.js";
+import { describe, expect, test } from "bun:test";
 import type { RemoteProvider } from "../../handlers/shared/remote-provider-types.js";
+import { OpenAIProviderTransport } from "./openai.js";
 
 const mockProvider: RemoteProvider = {
   name: "opencode-zen",
-  displayName: "Zen",
   baseUrl: "https://opencode.ai/zen",
   apiPath: "/v1/chat/completions",
-  transport: "openai",
+  apiKeyEnvVar: "OPENCODE_API_KEY",
+  prefixes: ["zen@"],
 };
 
 describe("OpenAIProviderTransport 429 retry (#66)", () => {
@@ -61,8 +61,8 @@ describe("OpenAIProviderTransport 429 retry (#66)", () => {
     });
 
     expect(response.status).toBe(429);
-    expect(callCount).toBe(6); // 1 initial + 5 retries
-  }, 120000);
+    expect(callCount).toBe(3); // 1 initial + 2 retries (bounded budget)
+  }, 10000);
 
   test("does not retry non-429 errors", async () => {
     const transport = new OpenAIProviderTransport(mockProvider, "minimax-m2.5-free", "test-key");
@@ -75,5 +75,67 @@ describe("OpenAIProviderTransport 429 retry (#66)", () => {
 
     expect(response.status).toBe(400);
     expect(callCount).toBe(1); // No retry
+  });
+
+  test("skips retry on terminal 429 (billing/balance)", async () => {
+    const transport = new OpenAIProviderTransport(mockProvider, "minimax-m2.5-free", "test-key");
+    let callCount = 0;
+    const startTime = Date.now();
+
+    // GLM-style insufficient-balance error
+    const body = JSON.stringify({
+      error: {
+        code: "1113",
+        message: "Insufficient balance or no resource package. Please recharge.",
+      },
+    });
+    const response = await transport.enqueueRequest(() => {
+      callCount++;
+      return Promise.resolve(new Response(body, { status: 429 }));
+    });
+
+    const elapsed = Date.now() - startTime;
+    expect(response.status).toBe(429);
+    expect(callCount).toBe(1); // No retry
+    expect(elapsed).toBeLessThan(500); // No backoff sleep
+  });
+});
+
+describe("isTerminal429", () => {
+  test("detects insufficient balance variants", async () => {
+    const { isTerminal429 } = await import("./openai.js");
+    expect(isTerminal429('{"error":"Insufficient balance"}')).toBe(true);
+    expect(isTerminal429('{"error":"insufficient_balance"}')).toBe(true);
+    expect(isTerminal429('{"error":"insufficient_quota"}')).toBe(true);
+    expect(isTerminal429('{"error":"You exceeded your current quota"}')).toBe(true);
+    expect(isTerminal429('{"code":"1113"}')).toBe(true);
+    expect(isTerminal429('{"code":1113}')).toBe(true);
+  });
+
+  test("retries unknown 429 bodies", async () => {
+    const { isTerminal429 } = await import("./openai.js");
+    expect(isTerminal429('{"error":"rate limit exceeded"}')).toBe(false);
+    expect(isTerminal429('{"error":"too many requests"}')).toBe(false);
+    expect(isTerminal429("")).toBe(false);
+  });
+
+  test("matches the real OpenAI insufficient_quota body (composed-handler remaps it to a visible 400)", async () => {
+    const { isTerminal429 } = await import("./openai.js");
+    // Exact shape OpenAI returns on a billing/quota failure. composed-handler
+    // remaps this 429 → 400 invalid_request_error so Claude Code surfaces the
+    // message instead of silently retrying.
+    const realBody = JSON.stringify({
+      error: {
+        message: "You exceeded your current quota, please check your plan and billing details.",
+        type: "insufficient_quota",
+        code: "insufficient_quota",
+      },
+    });
+    expect(isTerminal429(realBody)).toBe(true);
+    // A genuine transient rate-limit must still be retried (not remapped).
+    const transient = JSON.stringify({
+      error: { message: "Rate limit reached for requests", code: "rate_limit_exceeded" },
+    });
+    expect(isTerminal429(transient)).toBe(false);
   });
 });

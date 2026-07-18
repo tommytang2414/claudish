@@ -6,20 +6,20 @@
 //
 // Spawn pattern mirrors team-orchestrator.ts (line 202).
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, writeFileSync, createWriteStream } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createWriteStream, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { ScrollbackBuffer } from "./scrollback-buffer.js";
 import { SignalWatcher } from "./signal-watcher.js";
 import type {
-  SessionInfo,
-  SessionStatus,
-  SessionCreateOptions,
-  SessionManagerOptions,
   ChannelEvent,
+  SessionCreateOptions,
+  SessionInfo,
+  SessionManagerOptions,
+  SessionStatus,
 } from "./types.js";
 
 interface SessionEntry {
@@ -72,14 +72,7 @@ export class SessionManager {
     }
 
     // Build spawn args — mirrors team-orchestrator pattern
-    const args = [
-      "--model",
-      opts.model,
-      "-y",
-      "--stdin",
-      "--quiet",
-      ...(opts.claudishFlags ?? []),
-    ];
+    const args = ["--model", opts.model, "-y", "--stdin", "--quiet", ...(opts.claudishFlags ?? [])];
 
     const proc = spawn("claudish", args, {
       cwd: opts.cwd ?? process.cwd(),
@@ -101,6 +94,7 @@ export class SessionManager {
           model: entry.info.model,
           content: data.content ?? "",
           elapsedSeconds: entry.info.elapsedSeconds,
+          createdAt: entry.info.startedAt,
           extraMeta: {
             ...(data.toolName ? { tool: data.toolName } : {}),
             ...(data.toolCount ? { tool_count: String(data.toolCount) } : {}),
@@ -177,11 +171,7 @@ export class SessionManager {
       }
 
       // Write meta.json
-      writeFileSync(
-        join(sessionDir, "meta.json"),
-        JSON.stringify(entry.info, null, 2),
-        "utf-8"
-      );
+      writeFileSync(join(sessionDir, "meta.json"), JSON.stringify(entry.info, null, 2), "utf-8");
 
       this.cleanupSigint();
     });
@@ -226,7 +216,7 @@ export class SessionManager {
     if (!inputStates.includes(entry.info.status)) return false;
 
     try {
-      entry.process.stdin?.write(text + "\n");
+      entry.process.stdin?.write(`${text}\n`);
       return true;
     } catch {
       return false;
@@ -323,7 +313,7 @@ export class SessionManager {
   /** Shut down all active sessions. */
   async shutdownAll(): Promise<void> {
     const promises: Promise<void>[] = [];
-    for (const [id, entry] of this.sessions) {
+    for (const [, entry] of this.sessions) {
       if (!entry.process.killed) {
         entry.process.kill("SIGTERM");
         promises.push(

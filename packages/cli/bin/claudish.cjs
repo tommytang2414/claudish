@@ -4,8 +4,8 @@
 // Claudish uses Bun-specific APIs (bun:ffi for TUI, Bun.spawn, etc.)
 // so it cannot run under Node.js directly.
 
-const { execFileSync, execSync } = require("child_process");
-const { resolve } = require("path");
+const { execFileSync, execSync } = require("node:child_process");
+const { resolve } = require("node:path");
 
 function findBun() {
   const isWin = process.platform === "win32";
@@ -16,10 +16,8 @@ function findBun() {
     if (path) return path;
   } catch {}
   // Common install locations
-  const candidates = isWin ? [
-    (process.env.USERPROFILE || process.env.HOME) + "\\.bun\\bin\\bun.exe"
-  ] : [
-    process.env.HOME + "/.bun/bin/bun",
+  const candidates = [
+    `${process.env.HOME}/.bun/bin/bun`,
     "/usr/local/bin/bun",
     "/opt/homebrew/bin/bun",
   ];
@@ -49,7 +47,7 @@ Learn more: https://bun.sh`);
 // Exec into bun with the real entry point
 const entry = resolve(__dirname, "..", "dist", "index.js");
 try {
-  const result = require("child_process").spawnSync(bun, [entry, ...process.argv.slice(2)], {
+  const result = require("node:child_process").spawnSync(bun, [entry, ...process.argv.slice(2)], {
     stdio: "inherit",
     env: process.env,
   });

@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials, using the priority chain: LiteLLM → OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
+Claudish is a proxy tool that wraps Claude Code with support for non-Anthropic AI providers. It intercepts Claude Code's API calls and reroutes them to providers like OpenRouter, Google Gemini, OpenAI, MiniMax, Kimi, GLM, and local models (Ollama, LM Studio, vLLM, MLX). Configuration is layered: CLI flags override environment variables, which override profile settings from config files. The routing syntax uses `provider@model[:concurrency]` (v4.0+, preferred) or the legacy `prefix/model` format (still supported, deprecated). Auto-routing selects a provider automatically based on available credentials. The priority chain is configurable via `defaultProvider` (v7.0.0+). The default chain (when no `defaultProvider` is set and only `OPENROUTER_API_KEY` is present) is: OpenCode Zen → provider subscription plan → native API → OpenRouter fallback. When `LITELLM_BASE_URL` + `LITELLM_API_KEY` are set without explicit `defaultProvider`, legacy auto-promotion puts LiteLLM first. Configuration files live at `~/.claudish/config.json` (global) and `.claudish.json` (local/project); local always takes precedence.
 
 ---
 
@@ -20,6 +20,7 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
 | `--model` | `-m` | string | none (prompts interactively) | Model to use. Accepts `provider@model` syntax, legacy `prefix/model`, or bare model name for auto-detection |
+| `--default-provider` | | string | none | Default provider for auto-routing (v7.0.0+). Overrides env var and config file. Valid: built-in provider names or custom endpoint names |
 | `--model-opus` | | string | none | Model for Opus role (planning, complex tasks) |
 | `--model-sonnet` | | string | none | Model for Sonnet role (default coding) |
 | `--model-haiku` | | string | none | Model for Haiku role (fast tasks, background) |
@@ -29,7 +30,7 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 | `--no-auto-approve` | | boolean | | Explicitly enable permission prompts (overrides -y) |
 | `--dangerous` | | boolean | false | Pass `--dangerouslyDisableSandbox` to Claude Code |
 | `--interactive` | `-i` | boolean | auto | Interactive mode (default when no prompt argument given) |
-| `--debug` | `-d` | boolean | false | Enable debug logging to `logs/claudish_*.log`; also sets `--log-level debug` unless overridden |
+| `--debug-claudish` | `-d` | boolean | false | Enable debug logging to `logs/claudish_*.log`; also sets `--log-level debug` unless overridden |
 | `--log-level` | | string | `"info"` | Log verbosity: `debug` (full content), `info` (truncated content), `minimal` (labels only) |
 | `--quiet` | `-q` | boolean | auto | Suppress `[claudish]` log messages (default in single-shot mode) |
 | `--verbose` | `-v` | boolean | auto | Show `[claudish]` messages (default in interactive mode) |
@@ -37,13 +38,13 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 | `--monitor` | | boolean | false | Proxy to real Anthropic API and log all traffic (uses Claude Code's native auth) |
 | `--stdin` | | boolean | false | Read prompt from stdin instead of positional arguments |
 | `--free` | | boolean | false | Show only free models in interactive model selector |
-| `--profile` | `-p` | string | default profile | Named profile for model mapping |
-| `--cost-tracker` | | boolean | false | Enable cost tracking; also enables monitor mode |
-| `--audit-costs` | | action | | Show cost analysis report and exit |
-| `--reset-costs` | | action | | Reset accumulated cost statistics and exit |
-| `--models` / `--list-models` | `-s` / `--search` | action | | List ALL models (from OpenRouter + LiteLLM + local Ollama) or fuzzy-search by query |
-| `--top-models` | | action | | List curated recommended models and exit |
-| `--force-update` | | boolean | false | Force refresh of model catalog cache (used with `--models` or `--top-models`) |
+| `--profile` | | string | default profile | Named profile for model mapping |
+| `--cost-track` | | boolean | false | Enable cost tracking; also enables monitor mode |
+| `--cost-audit` | | action | | Show cost analysis report and exit |
+| `--cost-reset` | | action | | Reset accumulated cost statistics and exit |
+| `--models` | `-s` / `--models-search` | action | | List ALL models (from OpenRouter + LiteLLM + local Ollama) or fuzzy-search by query |
+| `--models-top` | | action | | List curated recommended models and exit |
+| `--models-refresh` | | boolean | false | Force refresh of model catalog cache (used with `--models` or `--models-top`) |
 | `--summarize-tools` | | boolean | false | Summarize tool descriptions to reduce prompt size for local/small models |
 | `--version` | | action | | Show version and exit |
 | `--help` | `-h` | action | | Show help message and exit |
@@ -64,7 +65,7 @@ All flags recognized by `parseArgs()` in `packages/cli/src/cli.ts`.
 
 **`--json` implies `--quiet`**: When `--json` is set, `config.quiet` is forced to `true` regardless of other flags.
 
-**`--cost-tracker` enables monitor mode**: Setting `--cost-tracker` automatically sets `config.monitor = true` if it is not already set.
+**`--cost-track` enables monitor mode**: Setting `--cost-track` automatically sets `config.monitor = true` if it is not already set.
 
 ---
 
@@ -102,6 +103,7 @@ Claudish automatically loads `.env` from the current working directory at startu
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
+| `CLAUDISH_DEFAULT_PROVIDER` | Default provider for auto-routing (v7.0.0+); overrides config file `defaultProvider` | none |
 | `CLAUDISH_MODEL` | Default model (higher priority than `ANTHROPIC_MODEL`) | none |
 | `CLAUDISH_PORT` | Default proxy port | random (3000–9000) |
 | `CLAUDISH_CONTEXT_WINDOW` | Override context window size for local models (integer) | auto-detected |
@@ -152,6 +154,8 @@ Claudish automatically loads `.env` from the current working directory at startu
 | `ZHIPU_API_KEY` | GLM/Zhipu direct API (`glm@`, `zhipu@`) | `GLM_API_KEY` | https://open.bigmodel.cn/ |
 | `GLM_CODING_API_KEY` | GLM Coding Plan at Z.AI (`gc@`) | `ZAI_CODING_API_KEY` | https://z.ai/subscribe |
 | `ZAI_API_KEY` | Z.AI Anthropic-compatible API (`zai@`) | | https://z.ai/ |
+| `SAKANA_API_KEY` | Sakana Fugu API / token plan (`sakana@`, `fugu@`) | | https://console.sakana.ai/get-started |
+| `SAKANA_CODING_API_KEY` | Sakana Fugu Subscription (`sc@`) | `SAKANA_API_KEY` | https://console.sakana.ai/get-started |
 | `OLLAMA_API_KEY` | OllamaCloud hosted API (`oc@`, `llama@`, `lc@`, `meta@`) | | https://ollama.com/account |
 | `OPENCODE_API_KEY` | OpenCode Zen (`zen@`); optional for free models (falls back to `"public"` bearer) | | https://opencode.ai/ |
 | `XAI_API_KEY` | xAI / Grok (direct API, detected in model selector) | | https://x.ai/ |
@@ -217,6 +221,7 @@ These are only needed if you want to use your own Google Cloud OAuth application
 {
   "version": "1.0.0",
   "defaultProfile": "default",
+  "defaultProvider": "openrouter",
   "profiles": {
     "default": {
       "name": "default",
@@ -240,6 +245,14 @@ These are only needed if you want to use your own Google Cloud OAuth application
     "kimi-*": ["kc", "kimi", "openrouter"],
     "glm-*": ["gc", "glm", "openrouter"],
     "*": ["litellm", "openrouter"]
+  },
+  "customEndpoints": {
+    "my-vllm": {
+      "kind": "simple",
+      "url": "http://gpu-box:8000",
+      "format": "openai",
+      "apiKey": "${VLLM_API_KEY}"
+    }
   }
 }
 ```
@@ -248,6 +261,8 @@ These are only needed if you want to use your own Google Cloud OAuth application
 
 - **`version`**: Config schema version string (currently `"1.0.0"`).
 - **`defaultProfile`**: Name of the profile to use when `--profile` is not specified.
+- **`defaultProvider`** (v7.0.0+): Default provider for auto-routing. Accepts built-in provider names (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name. See Section 6.1 for precedence. Absent means use legacy auto-detection.
+- **`customEndpoints`** (v7.0.0+): Named map of custom endpoint definitions. See Section 7.5 for schema.
 - **`profiles`**: Map of profile name to profile object. Each profile has:
   - **`name`**: Profile identifier (matches the map key).
   - **`description`**: Optional human-readable description.
@@ -276,11 +291,11 @@ Same schema as `~/.claudish/config.json`. Placed in the project root directory (
 | File | Purpose | Auto-updated |
 |------|---------|-------------|
 | `config.json` | Global config: profiles, telemetry, routing | Manual (via `claudish profile` commands) |
-| `all-models.json` | Cached full model catalog from OpenRouter | Every 2 days, or on `--force-update` |
+| `all-models.json` | Cached full model catalog from OpenRouter | Every 2 days, or on `--models-refresh` |
 | `litellm-models-{hash}.json` | Cached LiteLLM model list per server (hash = SHA-256 of `LITELLM_BASE_URL`) | On each LiteLLM model fetch |
 | `kimi-oauth.json` | Kimi OAuth credentials (access + refresh tokens) | On `claudish --kimi-login` |
 | `gemini-oauth.json` | Gemini Code Assist OAuth credentials | On `claudish --gemini-login` |
-| `logs/` | Debug log files (created when `--debug` is used) | Per session |
+| `logs/` | Debug log files (created when `--debug-claudish` is used) | Per session |
 
 ---
 
@@ -318,6 +333,8 @@ Provider part is **case-insensitive**. Shortcuts are resolved to canonical provi
 | `glm`, `zhipu` | `glm` | GLM/Zhipu direct API (`ZHIPU_API_KEY` or `GLM_API_KEY`) |
 | `gc` | `glm-coding` | GLM Coding Plan at Z.AI (`GLM_CODING_API_KEY` or `ZAI_CODING_API_KEY`) |
 | `zai` | `zai` | Z.AI Anthropic-compatible API (`ZAI_API_KEY`) |
+| `sakana`, `fugu` | `sakana` | Sakana Fugu API / token plan (`SAKANA_API_KEY`) |
+| `sc` | `sakana-coding` | Sakana Fugu Subscription (`SAKANA_CODING_API_KEY` or `SAKANA_API_KEY`) |
 | `oc`, `llama`, `lc`, `meta` | `ollamacloud` | OllamaCloud hosted API (`OLLAMA_API_KEY`) |
 | `zen` | `opencode-zen` | OpenCode Zen (`OPENCODE_API_KEY`; optional for free models) |
 | `zengo`, `zgo` | `opencode-zen-go` | OpenCode Zen Go subscription plan |
@@ -348,6 +365,7 @@ When no `provider@` prefix is given, Claudish detects the provider from the mode
 | `moonshot/*` or `moonshot-*` or `kimi-*` | Kimi | |
 | `zhipu/*` or `glm-*` or `chatglm-*` | GLM | |
 | `z-ai/*` or `zai/*` | Z.AI | |
+| `fugu*` or `sakana/*` | Sakana Fugu | |
 | `ollamacloud/*` or `meta-llama/*` or `llama-*` or `llama3*` | OllamaCloud | |
 | `qwen*` | Auto-routed (no direct API) | Falls to OpenRouter or LiteLLM |
 | `poe:*` | Poe | Literal `poe:` prefix |
@@ -373,6 +391,8 @@ The old `prefix/model` format works but emits a deprecation warning suggesting t
 | `glm/`, `zhipu/` | GLM | `glm@` |
 | `gc/` | GLM Coding | `gc@` |
 | `zai/` | Z.AI | `zai@` |
+| `sakana/`, `fugu/` | Sakana Fugu | `sakana@`, `fugu@` |
+| `sc/` | Sakana Subscription | `sc@` |
 | `oc/` | OllamaCloud | `oc@` |
 | `zen/` | OpenCode Zen | `zen@` |
 | `zengo/`, `zgo/` | OpenCode Zen Go | `zengo@` |
@@ -397,19 +417,46 @@ https://localhost:8080/model
 
 ## 6. Auto-Routing Priority Chain
 
-When a model name has no explicit provider prefix and does not match a native pattern that maps to a provider with credentials, Claudish uses this priority chain (implemented in `auto-route.ts` / `getFallbackChain()`):
+When a model name has no explicit provider prefix and does not match a native pattern that maps to a provider with credentials, Claudish builds a fallback chain (implemented in `auto-route.ts` / `getFallbackChain()`).
 
-1. **LiteLLM** — if `LITELLM_BASE_URL` and `LITELLM_API_KEY` are set, always added to chain first (cache may be stale; proxy resolves dynamically).
-2. **OpenCode Zen** — if `OPENCODE_API_KEY` is set.
-3. **Provider subscription/coding plan** — if the native provider has a subscription alternative and credentials exist:
+### 6.1 Default Provider (v7.0.0+)
+
+The fallback chain is **configurable** via the `defaultProvider` setting. Set it in any of these locations:
+
+| Method | Example |
+|--------|---------|
+| Config file | `"defaultProvider": "litellm"` in `~/.claudish/config.json` |
+| Env var | `CLAUDISH_DEFAULT_PROVIDER=openrouter` |
+| CLI flag | `claudish --default-provider google "task"` |
+
+**Precedence** (highest to lowest):
+1. CLI flag `--default-provider`
+2. `CLAUDISH_DEFAULT_PROVIDER` env var
+3. `defaultProvider` in config file
+4. Legacy LITELLM auto-promotion (if `LITELLM_BASE_URL` + `LITELLM_API_KEY` set without explicit `defaultProvider`)
+5. `OPENROUTER_API_KEY` present → OpenRouter
+6. Hardcoded `"openrouter"`
+
+Valid values: any built-in provider name (`"openrouter"`, `"litellm"`, `"openai"`, `"anthropic"`, `"google"`) or a custom endpoint name from `customEndpoints`.
+
+### 6.2 Default chain (no `defaultProvider` set)
+
+When `defaultProvider` is absent and only `OPENROUTER_API_KEY` is present:
+
+1. **OpenCode Zen** — if `OPENCODE_API_KEY` is set.
+2. **Provider subscription/coding plan** — if the native provider has a subscription alternative and credentials exist:
    - `kimi` → Kimi Coding Plan (`kc@kimi-for-coding`) if `KIMI_CODING_API_KEY` or OAuth present.
    - `minimax` → MiniMax Coding Plan (`mmc@`) if `MINIMAX_CODING_API_KEY` present.
    - `glm` → GLM Coding Plan at Z.AI (`gc@`) if `GLM_CODING_API_KEY` or `ZAI_CODING_API_KEY` present.
    - `google` → Gemini Code Assist (`go@`) if OAuth credentials present.
-4. **Native provider API** — if the detected native provider has an API key or OAuth credentials.
-5. **OpenRouter** — if `OPENROUTER_API_KEY` is set (universal fallback).
+3. **Native provider API** — if the detected native provider has an API key or OAuth credentials.
+4. **OpenRouter** — if `OPENROUTER_API_KEY` is set (universal fallback).
 
-If none of the above applies, Claudish returns an error with instructions on how to authenticate.
+### 6.3 Legacy LiteLLM auto-promotion
+
+When `LITELLM_BASE_URL` and `LITELLM_API_KEY` are set but `defaultProvider` is absent, LiteLLM is added to the chain first (before OpenCode Zen). Claudish emits a one-shot stderr hint recommending you set `defaultProvider: "litellm"` explicitly. This preserves backward compatibility with pre-v7.0.0 behavior.
+
+If none of the chain entries have valid credentials, Claudish returns an error with instructions on how to authenticate.
 
 ---
 
@@ -443,11 +490,128 @@ Each entry in the routing chain array is a string. Format options:
 
 Provider shortcuts (same as `@` syntax) are resolved in entries. LiteLLM entries automatically use the model catalog resolver to find the vendor-prefixed model name.
 
+### Catch-All Synthesis from `defaultProvider` (v7.0.0+)
+
+When `defaultProvider` is set and no explicit `routing["*"]` catch-all exists in the config, Claudish synthesizes `routing["*"] = [<defaultProvider>]` at config load time. An explicit `routing["*"]` always takes precedence over the synthesized one.
+
+```json
+{
+  "defaultProvider": "litellm",
+  "routing": {
+    "kimi-*": ["kc", "kimi", "or"]
+  }
+}
+```
+
+The above is equivalent to:
+
+```json
+{
+  "routing": {
+    "kimi-*": ["kc", "kimi", "or"],
+    "*": ["litellm"]
+  }
+}
+```
+
 ### Validation
 
 Claudish warns at load time if:
 - A pattern has multiple `*` wildcards (only single `*` is supported).
 - A rule's entry list is empty (the pattern would have no fallback).
+
+---
+
+## 7.5 Custom Endpoints (v7.0.0+)
+
+Define named custom endpoints in `~/.claudish/config.json` (or `.claudish.json`) under the `customEndpoints` key. Each endpoint becomes a provider prefix usable with `@` syntax.
+
+### Simple endpoint
+
+For OpenAI- or Anthropic-compatible servers:
+
+```json
+{
+  "customEndpoints": {
+    "my-vllm": {
+      "kind": "simple",
+      "url": "http://gpu-box:8000",
+      "format": "openai",
+      "apiKey": "${VLLM_API_KEY}",
+      "modelPrefix": "my-org/",
+      "models": ["llama3.1-70b", "qwen2.5-72b"]
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `kind` | `"simple"` | yes | Discriminator |
+| `url` | string | yes | Base URL of the server |
+| `format` | `"openai"` or `"anthropic"` | yes | Wire format |
+| `apiKey` | string | no | API key; supports `${VAR}` env expansion |
+| `modelPrefix` | string | no | Prepended to model name before sending to API |
+| `models` | string[] | no | Restrict to listed models; omit to allow any |
+
+Usage: `claudish --model my-vllm@llama3.1-70b "task"`
+
+### Complex endpoint
+
+Full control over transport, auth, headers, and stream format:
+
+```json
+{
+  "customEndpoints": {
+    "corp-proxy": {
+      "kind": "complex",
+      "displayName": "Corporate LLM Proxy",
+      "transport": "openai",
+      "baseUrl": "https://llm.corp.internal",
+      "apiPath": "/api/v2/chat/completions",
+      "apiKey": "${CORP_LLM_KEY}",
+      "authScheme": "X-Api-Key",
+      "headers": { "X-Team": "platform" },
+      "streamFormat": "openai-sse",
+      "modelPrefix": "",
+      "models": ["gpt-4o", "claude-sonnet"]
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `kind` | `"complex"` | yes | Discriminator |
+| `displayName` | string | no | Human-readable name (shown in logs) |
+| `transport` | string | yes | Transport type (e.g., `"openai"`, `"anthropic"`) |
+| `baseUrl` | string | yes | Server base URL |
+| `apiPath` | string | no | Custom API path (overrides default for transport) |
+| `apiKey` | string | no | API key; supports `${VAR}` env expansion |
+| `authScheme` | string | no | Auth header scheme (default: `Bearer`; use `X-Api-Key` for header-name auth) |
+| `headers` | object | no | Additional HTTP headers |
+| `streamFormat` | string | no | Stream parser override (e.g., `"openai-sse"`, `"anthropic-sse"`) |
+| `modelPrefix` | string | no | Prepended to model name |
+| `models` | string[] | no | Restrict to listed models |
+
+### Environment variable expansion
+
+The `apiKey` field supports `${VAR_NAME}` syntax. Claudish expands it from `process.env` at startup. This avoids hardcoding secrets in config files:
+
+```json
+"apiKey": "${MY_CUSTOM_API_KEY}"
+```
+
+### Validation
+
+Claudish validates all `customEndpoints` entries with Zod at proxy startup. Invalid entries:
+- Emit a warning to stderr with the validation error
+- Are skipped (not registered)
+- Do not prevent the proxy from starting
+
+### Runtime registration
+
+Each valid custom endpoint calls `registerRuntimeProvider()` (injects into the provider resolver) and `registerRuntimeProfile()` (injects into the transport layer). The endpoint name becomes a valid provider shortcut immediately.
 
 ---
 
@@ -503,14 +667,14 @@ For local Qwen models, setting `CLAUDISH_QWEN_NO_THINK=1` prepends `/no_think` t
 | Path | Purpose | Auto-update Trigger |
 |------|---------|---------------------|
 | `~/.claudish/config.json` | Global settings, profiles, telemetry, routing | Profile/telemetry commands |
-| `~/.claudish/all-models.json` | Full OpenRouter model catalog | Every 2 days; or `--force-update` |
+| `~/.claudish/all-models.json` | Full OpenRouter model catalog | Every 2 days; or `--models-refresh` |
 | `~/.claudish/litellm-models-{hash}.json` | LiteLLM model list (one file per unique `LITELLM_BASE_URL`) | On each LiteLLM model list fetch |
 | `~/.claudish/kimi-oauth.json` | Kimi OAuth access + refresh tokens | `claudish --kimi-login` |
 | `~/.claudish/gemini-oauth.json` | Gemini Code Assist OAuth tokens | `claudish --gemini-login` |
 | `.claudish.json` | Local/project config | Profile commands with `--local` |
 | `.env` | Environment variables (auto-loaded at startup) | Manual |
 
-Cache files can be force-refreshed with `claudish --models --force-update` or `claudish --top-models --force-update`. The `--force-update` flag deletes `all-models.json`, `pricing-cache.json`, and all `litellm-models-*.json` files before fetching fresh data.
+Cache files can be force-refreshed with `claudish --models --models-refresh` or `claudish --models-top --models-refresh`. The `--models-refresh` flag deletes `all-models.json`, `pricing-cache.json`, and all `litellm-models-*.json` files before fetching fresh data.
 
 ---
 
@@ -578,7 +742,7 @@ claudish --model-opus g@gemini-3-pro --model-sonnet oai@gpt-5.3
 claudish -y --dangerous --model g@gemini-2.0-flash "task"
 
 # Debug
-claudish --debug --model g@gemini-2.0-flash "task"
+claudish --debug-claudish --model g@gemini-2.0-flash "task"
 
 # Profile management
 claudish init
@@ -589,7 +753,7 @@ claudish profile use myprofile --global
 # Model discovery
 claudish --models               # all models
 claudish --models gemini        # search
-claudish --top-models           # curated list
+claudish --models-top           # curated list
 claudish --models --json        # JSON output
 
 # OAuth login
@@ -603,4 +767,4 @@ claudish telemetry off
 
 ---
 
-*This document was generated from direct codebase analysis of Claudish v5.10.0 source at `packages/cli/src/`. Key files: `cli.ts`, `config.ts`, `model-parser.ts`, `provider-resolver.ts`, `auto-route.ts`, `remote-provider-registry.ts`, `profile-config.ts`, `routing-rules.ts`.*
+*This document was generated from direct codebase analysis of Claudish source at `packages/cli/src/`. Last updated for v7.0.0 (default provider, custom endpoints, routing rules catch-all synthesis). Key files: `cli.ts`, `config.ts`, `model-parser.ts`, `provider-resolver.ts`, `auto-route.ts`, `remote-provider-registry.ts`, `profile-config.ts`, `routing-rules.ts`.*

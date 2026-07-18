@@ -1,0 +1,14 @@
+{
+  "name": "@claudish/magmux-linux-x64",
+  "version": "6.7.0",
+  "description": "magmux binary for Linux x64",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "main": "bin/magmux",
+  "files": ["bin/"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MadAppGang/claudish"
+  }
+}

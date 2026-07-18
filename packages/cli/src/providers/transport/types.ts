@@ -91,7 +91,49 @@ export interface ProviderTransport {
   getContextWindow?(): number;
 
   /**
+   * Active model name after fallback (e.g., capacity exhaustion triggered a model switch).
+   * If set, the composed handler writes this to the token file so the status line
+   * shows the actual model being used, not the originally requested one.
+   */
+  getActiveModelName?(): string | undefined;
+
+  /**
+   * Get quota remaining fraction (0-1) for a specific model.
+   * Used by Code Assist to surface per-model quota in the status bar.
+   */
+  getQuotaRemaining?(modelName: string): Promise<number | undefined>;
+
+  /**
    * Optional cleanup on shutdown.
    */
   shutdown?(): Promise<void>;
+
+  /**
+   * Discover a probe-friendly model by asking the endpoint itself.
+   *
+   * For self-hosted or user-deployed providers (LiteLLM, Ollama, LM Studio,
+   * vLLM, MLX, OllamaCloud) the cloud catalog at /probeModels can't know
+   * what's available — each deployment has its own model list. These
+   * transports query the endpoint's `GET /v1/models` (or `/api/tags`) and
+   * pick the smallest/cheapest model for a 1-token probe.
+   *
+   * Returns `{ model, reason? }`. When model is null, `reason` carries a
+   * human-actionable diagnostic (e.g. "server not running at http://...",
+   * "endpoint reachable but /v1/models is empty"). The TUI surfaces this
+   * to the user so they know whether to start the server, load a model,
+   * or check config.
+   *
+   * Called only when the cloud catalog has no entry for this provider, so
+   * implementations don't need to gate on whether the catalog has data.
+   *
+   * @param exclude  Models already tried in this probe round. Discovery
+   *                 returns the next-best candidate not in this set, so
+   *                 the probe loop can fall through transient model errors
+   *                 (e.g. LM Studio "model loading error" for a not-loaded
+   *                 model — the next candidate might be already loaded).
+   */
+  discoverProbeModel?(exclude?: ReadonlySet<string>): Promise<{
+    model: string | null;
+    reason?: string;
+  }>;
 }

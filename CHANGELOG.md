@@ -2,6 +2,906 @@
 
 All notable changes to [Claudish](https://github.com/MadAppGang/claudish).
 
+## [7.15.0] - 2026-07-17
+
+### Documentation
+
+- update CHANGELOG.md for v7.13.0([`c6d92bb`](https://github.com/MadAppGang/claudish/commit/c6d92bbfcac45ff93d929652a29d06c00e0281c1))
+
+### New Features
+
+- v7.15.0 — global/persistent debug mode (CLAUDISH_DEBUG + config "debug")([`23f9f78`](https://github.com/MadAppGang/claudish/commit/23f9f78c4e817f7d0032e2fde85239e8d3720ffb))
+
+## [7.14.0] - 2026-07-15
+
+### New Features
+
+- v7.14.0 — pass OpenAI reasoning items back across turns (Responses/Codex)([`9090d3e`](https://github.com/MadAppGang/claudish/commit/9090d3e5fdf76a36e515fe828c79d7622ce168cc))
+
+## [7.13.0] - 2026-07-15
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.7([`14dcf8c`](https://github.com/MadAppGang/claudish/commit/14dcf8ccd82bdac6f46a80a5db7376791df3636a))
+
+### New Features
+
+- v7.13.0 — rename --log-debug to --debug-claudish([`61ec374`](https://github.com/MadAppGang/claudish/commit/61ec374df98c81d1c3c3d2759a47729e9affcc12))
+
+## [7.12.7] - 2026-07-15
+
+### Bug Fixes
+
+- v7.12.7 — a turn cut off by max_output_tokens is no longer reported as a completed tool call([`dc0bca4`](https://github.com/MadAppGang/claudish/commit/dc0bca46e6698406c6065377a20fffa41b32a116))
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.6([`1745d3c`](https://github.com/MadAppGang/claudish/commit/1745d3c8a9072255d0c0c672aad7b0b680e0ae83))
+
+## [7.12.6] - 2026-07-15
+
+### Bug Fixes
+
+- v7.12.6 — claudish update no longer blames the network for its own timeout([`1c31fa9`](https://github.com/MadAppGang/claudish/commit/1c31fa9b3928388849e947e067753d5aa038c584))
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.5([`8983215`](https://github.com/MadAppGang/claudish/commit/8983215fa6a70ebc1e59c0d0498648efc9659ff3))
+
+## [7.12.5] - 2026-07-15
+
+### Bug Fixes
+
+- v7.12.5 — OpenAI/Codex Responses parser: no duplicate tools, thinking blocks, tool_result images([`0d57fc7`](https://github.com/MadAppGang/claudish/commit/0d57fc7d59c02f69903647be1c884be87499f5f3))
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.3([`4dde453`](https://github.com/MadAppGang/claudish/commit/4dde4537739e110150a59c6b6bdbffcd1ac51af7))
+
+## [7.12.4] - 2026-07-14
+
+### Bug Fixes
+
+- v7.12.4 — single-shot stream-json is machine-clean (verbose forwarding, stderr chatter, no first-run prompt)([`d620bca`](https://github.com/MadAppGang/claudish/commit/d620bca90aa5af68c89e9dc5d4353aae2977ba66))
+
+## [7.12.3] - 2026-07-13
+
+### Bug Fixes
+
+- v7.12.3 — route gpt-5.6 family via /v1/responses on oai@, native max effort, RequestMeta trace([`4679748`](https://github.com/MadAppGang/claudish/commit/4679748cfba493a5130bed8a1dd9cc583f645b9d))
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.2([`5070f99`](https://github.com/MadAppGang/claudish/commit/5070f997725d9f4dca7ce89cfdf4c299fc0f2c5f))
+
+## [7.12.2] - 2026-07-12
+
+### Bug Fixes
+
+- v7.12.2 — 1Password glob import drops keys on recurring field titles([`8bb4f9a`](https://github.com/MadAppGang/claudish/commit/8bb4f9a4226dd34fd825e5ce4f12931aaa06fe69))
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.1([`c6e831d`](https://github.com/MadAppGang/claudish/commit/c6e831dceb8b145e9a7792bee730d845292c7823))
+
+## [7.12.1] - 2026-07-06
+
+### Documentation
+
+- update CHANGELOG.md for v7.12.0([`e2a1dae`](https://github.com/MadAppGang/claudish/commit/e2a1dae31dc7cafa02742cb50a40ee9a5bc2032d))
+
+### Other Changes
+
+- v7.12.1 — test suite cleanup (theater/implementation-test cull)([`e80c8bf`](https://github.com/MadAppGang/claudish/commit/e80c8bfed22baf6a05c02fb67ffa1d6f7c7e4826))
+
+## [7.12.0] - 2026-07-05
+
+### Documentation
+
+- update CHANGELOG.md for v7.11.0([`511da8e`](https://github.com/MadAppGang/claudish/commit/511da8eb9bed519fb6f20f2cd0ed6d8bd8d3692e))
+
+### New Features
+
+- v7.12.0 — forced-auth hardening, async credential layer, startup tracing([`69083af`](https://github.com/MadAppGang/claudish/commit/69083af1d53353de439e9aa41cf471df936fef06))
+
+## [7.11.0] - 2026-06-30
+
+### Bug Fixes
+
+- rename sakana-coding → sakana-subscription, use SAKANA_SUBSCRIPTION_API_KEY *(sakana)* ([`b78e6ea`](https://github.com/MadAppGang/claudish/commit/b78e6ea4e5512a2a90f2a6dc5f9536ec0d9b7f1d))
+- subscription (sc@) uses its own key, not the API-usage key *(sakana)* ([`84a7a95`](https://github.com/MadAppGang/claudish/commit/84a7a95854eb869e848f24b596ac5011886413a0))
+- subscription (sc@) must use its own key, not the pay-as-you-go key *(sakana)* ([`7a18c83`](https://github.com/MadAppGang/claudish/commit/7a18c83f9f8374cf495949c018a626d60d3fe711))
+- surface provider errors + fail loud on explicit-spec missing credential *(routing)* ([`bbb448f`](https://github.com/MadAppGang/claudish/commit/bbb448f6bd6fc9e52a4506498b28a9ded1f5d13e))
+
+### Documentation
+
+- update CHANGELOG.md for v7.10.0([`26385ff`](https://github.com/MadAppGang/claudish/commit/26385ff590ccc3c943043eff5a78cdf5a59f66e1))
+
+### New Features
+
+- v7.11.0 — reasoning-effort mapping across all providers([`a517ccc`](https://github.com/MadAppGang/claudish/commit/a517ccc0d41a1d1906aa73614ec7148c602251a0))
+
+### Other Changes
+
+- clean tsc + biome — zero type/lint errors across the codebase([`bc2ead4`](https://github.com/MadAppGang/claudish/commit/bc2ead461b354bc0fbe2296bf4433ae095cccb85))
+
+## [7.10.0] - 2026-06-28
+
+### Documentation
+
+- update CHANGELOG.md for v7.8.4([`62cf646`](https://github.com/MadAppGang/claudish/commit/62cf646a465d7d11e012d8dc4c9ef17c20ddad9b))
+
+### New Features
+
+- v7.10.0 — effort mapping, tool cap, error surfacing, op-run TTY, served-by picker([`964efc6`](https://github.com/MadAppGang/claudish/commit/964efc61499f3a2e3eabd19dbe6f847120aaa2bd))
+- v7.9.0 — add Sakana AI Fugu provider (sakana@/fugu@ API, sc@ subscription)([`a786b79`](https://github.com/MadAppGang/claudish/commit/a786b790b17050c28489d17aef5bffe490201900))
+
+### Refactoring
+
+- close all credential-layer bypasses — one authority for every signer *(credentials)* ([`1339c04`](https://github.com/MadAppGang/claudish/commit/1339c04de00c58d7c2ac9e0ffadd1a3fbffc7791))
+- unify key management under one async credential layer *(credentials)* ([`7389502`](https://github.com/MadAppGang/claudish/commit/73895020b1861e818c1ab228c1124e26cbaef85c))
+
+## [7.8.4] - 2026-06-28
+
+### Bug Fixes
+
+- v7.8.4 — OAuth login takes effect without relaunch([`9158bba`](https://github.com/MadAppGang/claudish/commit/9158bba42afb22e8331bdc64e2c08836e373fc4e))
+
+### Documentation
+
+- update CHANGELOG.md for v7.8.3([`6c11933`](https://github.com/MadAppGang/claudish/commit/6c119333765d1e4846cc52f7409099da0fe06e67))
+
+## [7.8.3] - 2026-06-27
+
+### Bug Fixes
+
+- v7.8.3 — local server off / no chat model is 'unavailable', not FAIL([`c9331e0`](https://github.com/MadAppGang/claudish/commit/c9331e02cd24ab4c52617f4013ac5202741a77fa))
+- v7.8.2 — running local shown 'running' was filed under 'not configured'([`3dc57f4`](https://github.com/MadAppGang/claudish/commit/3dc57f4adc4352c2143400bb244cedf484db121e))
+
+### Documentation
+
+- update CHANGELOG.md for v7.8.2([`2e3136c`](https://github.com/MadAppGang/claudish/commit/2e3136cbecef961c1b73feee0c2a6bdb068e6aab))
+- update CHANGELOG.md for v7.8.1([`a31b0ca`](https://github.com/MadAppGang/claudish/commit/a31b0caca7715af7e5c9f34f6ad69961cd98d106))
+
+## [7.8.1] - 2026-06-27
+
+### Bug Fixes
+
+- v7.8.1 — credential-authority regressions + config Providers fixes([`3f8806e`](https://github.com/MadAppGang/claudish/commit/3f8806ed7b2dc97b63d29b4a139429fddae8a2ee))
+
+### Documentation
+
+- update CHANGELOG.md for v7.8.0([`a26551d`](https://github.com/MadAppGang/claudish/commit/a26551d0e04c3e63b0cfe36cb60e76b779d3d75e))
+
+## [7.8.0] - 2026-06-27
+
+### Bug Fixes
+
+- seed WASM cache from nearby copy (fixes ENOENT core_bg.wasm) *(onepassword)* ([`5a11962`](https://github.com/MadAppGang/claudish/commit/5a11962109fcb362aeee2d7a0956f6c58dcd3b2c))
+- resolve 1Password keys up front when opening the config TUI (step 2) *(config)* ([`0ce68c7`](https://github.com/MadAppGang/claudish/commit/0ce68c7c9d8a9579d9cd303d5e33339dd47dd130))
+
+### Documentation
+
+- update CHANGELOG.md for v7.7.4([`24b07ea`](https://github.com/MadAppGang/claudish/commit/24b07ea99f44a1d4a8c622b1ce93a31333528c68))
+
+### New Features
+
+- add CredentialProvider authority (step 1 — pure addition) *(credentials)* ([`c5364e6`](https://github.com/MadAppGang/claudish/commit/c5364e66388b1a8fb6ac614233741af1044e3bc5))
+
+### Other Changes
+
+- v7.8.0 — unified credential authority + flag-consistency rename([`7bf44f1`](https://github.com/MadAppGang/claudish/commit/7bf44f11ec818401992956f34cfc0173edd83c52))
+
+### Refactoring
+
+- consistent flag naming + colorized, validated --help *(cli)* ([`7ec5407`](https://github.com/MadAppGang/claudish/commit/7ec5407afa3403df7c98f541cd1449fc6a3024fb))
+- OAuth transports delegate to the authority, stop reading files (step 5) *(credentials)* ([`217b60e`](https://github.com/MadAppGang/claudish/commit/217b60e2892eb1f3b018504757c5dea4a09c26a8))
+- resolve construction-path api key via the authority (step 4) *(credentials)* ([`c58939b`](https://github.com/MadAppGang/claudish/commit/c58939b34fdae972bd52c44001bcd8e69333377c))
+- route the readiness oracle through the authority (step 3) *(credentials)* ([`dc8ebac`](https://github.com/MadAppGang/claudish/commit/dc8ebac65f3f7cba178c2d8bcb92be3b8074a73b))
+
+## [7.7.4] - 2026-06-26
+
+### Bug Fixes
+
+- v7.7.4 — per-credential 1Password resolution (only when a routed model needs a missing key)([`07ce107`](https://github.com/MadAppGang/claudish/commit/07ce107afbb17c00b9326b7937b13e2ed5d0579b))
+- resolve config secrets at point-of-need, not top of runCli *(onepassword)* ([`7ed6a16`](https://github.com/MadAppGang/claudish/commit/7ed6a16e5c85556154036bd5ed6a18e42bbd6982))
+
+### Documentation
+
+- update CHANGELOG.md for v7.7.3([`47f822e`](https://github.com/MadAppGang/claudish/commit/47f822e68b727f0a958da7dc07a53eb7b33d7728))
+
+## [7.7.3] - 2026-06-25
+
+### Bug Fixes
+
+- v7.7.3 — resolve config 1Password secrets only on the model-routing path([`39e8f4d`](https://github.com/MadAppGang/claudish/commit/39e8f4d48ac21239fff6a9ace99de78792b370d9))
+
+### Documentation
+
+- update CHANGELOG.md for v7.7.2([`0ff1130`](https://github.com/MadAppGang/claudish/commit/0ff11301027a6c7e4069c43515c2fbb05128ab0a))
+
+## [7.7.2] - 2026-06-25
+
+### Bug Fixes
+
+- v7.7.2 — skip 1Password resolution on help/version + silence expected field-skip noise([`59f8bb1`](https://github.com/MadAppGang/claudish/commit/59f8bb1c4fa63b4758fcb14bfb0bb9e71ba2f227))
+
+### Documentation
+
+- update CHANGELOG.md for v7.7.1([`aea380b`](https://github.com/MadAppGang/claudish/commit/aea380bca49a6a866424505c4dcdce90cd4fc87a))
+
+## [7.7.1] - 2026-06-25
+
+### Bug Fixes
+
+- v7.7.1 — on-demand 1Password WASM fetch (fixes ENOENT core_bg.wasm in compiled binary)([`f70ebd1`](https://github.com/MadAppGang/claudish/commit/f70ebd141576d7aa2fc8ac7057749c7ec8577b79))
+
+### Documentation
+
+- update CHANGELOG.md for v7.7.0([`08ed721`](https://github.com/MadAppGang/claudish/commit/08ed7219b66c8f8343349e5b01572de3a6d1d277))
+- update CHANGELOG.md for v7.6.0([`9539933`](https://github.com/MadAppGang/claudish/commit/95399332be45ab19c96737ee07fe1b4d97465742))
+
+### New Features
+
+- v7.7.0 — 1Password config TUI tab + probe-cache self-heal([`0a91277`](https://github.com/MadAppGang/claudish/commit/0a91277d8022da3a5f474684e78845a46edb8b18))
+
+## [7.6.0] - 2026-06-22
+
+### Documentation
+
+- update CHANGELOG.md for v7.5.0([`cd1a1a4`](https://github.com/MadAppGang/claudish/commit/cd1a1a44335381c49179455545aaa76b2dc00ed5))
+
+### New Features
+
+- v7.6.0 — native 1Password integration (SDK-based)([`20686fb`](https://github.com/MadAppGang/claudish/commit/20686fbe061f554dcf29efc0e6c4cc7256403401))
+
+## [7.5.0] - 2026-06-10
+
+### Documentation
+
+- add Claude Desktop gateway handoff + routing-alignment report *(serve)* ([`4bb28e5`](https://github.com/MadAppGang/claudish/commit/4bb28e5c88cd1d96002a3a5bb5b55a20f720d540))
+- update CHANGELOG.md for v7.4.0([`15489ec`](https://github.com/MadAppGang/claudish/commit/15489ec715b6f7e5f765982ff19d62ebb741065e))
+
+### New Features
+
+- v7.5.0 — claudish serve gateway for Claude Desktop + provider slug alignment([`22df65f`](https://github.com/MadAppGang/claudish/commit/22df65f68abbb095f9d4144b1a212ce77d06c46a))
+- claudish serve gateway for Claude Desktop custom models *(serve)* ([`f266cea`](https://github.com/MadAppGang/claudish/commit/f266cea6e6bd4df18566a8eff6c9232fddc2cb52))
+
+### Other Changes
+
+- drop stale .claudemem/ ignore entry([`c435db8`](https://github.com/MadAppGang/claudish/commit/c435db834b8e4241a03b5b46aa075b1c8aaffb8e))
+
+### Refactoring
+
+- canonical slug rename xai→x-ai, zai→z-ai *(providers)* ([`2c87378`](https://github.com/MadAppGang/claudish/commit/2c873782a6ca7df5a86cae8247c1bff250b6481d))
+- drop live-phase pipeline-step indicator *(probe)* ([`859cc53`](https://github.com/MadAppGang/claudish/commit/859cc534480ac1ceb8a4eb689d46f493370a1b98))
+
+## [7.4.0] - 2026-06-03
+
+### Bug Fixes
+
+- route `internal` to native Claude Code passthrough *(probe)* ([`7ac5e20`](https://github.com/MadAppGang/claudish/commit/7ac5e20258703b6da6f2ed8b4098faaab192ce56))
+
+### Documentation
+
+- update CHANGELOG.md for v7.3.0([`fd6fbba`](https://github.com/MadAppGang/claudish/commit/fd6fbba738ef7e3e65de640f8183d8316194e83c))
+
+### New Features
+
+- add Leaderboard (winners) tab, clean exit *(probe)* ([`9887586`](https://github.com/MadAppGang/claudish/commit/988758681b98cf99d0f085a06b81504e58d01474))
+
+### Other Changes
+
+- release v7.4.0 — probe Leaderboard tab + internal native route([`f5518cf`](https://github.com/MadAppGang/claudish/commit/f5518cf7d9054c2b7e1ab49aa9961a99c07edba3))
+
+## [7.3.0] - 2026-06-03
+
+### Bug Fixes
+
+- bound tok/s, absolute throughput color, details heading *(probe)* ([`dc5d7e8`](https://github.com/MadAppGang/claudish/commit/dc5d7e809fade4781e738b963f9a187aacd5f25f))
+
+### Documentation
+
+- update CHANGELOG.md for v7.2.0([`96bad24`](https://github.com/MadAppGang/claudish/commit/96bad24f15c4b08e8a61db9ef57247891cec9e8d))
+
+### New Features
+
+- stay-in-TUI tabbed results + routing advisor *(probe)* ([`701a593`](https://github.com/MadAppGang/claudish/commit/701a593baea0ae19c323dc1089a08545bf08b4ac))
+- two-row header, package version, profile wizard cursor handling *(tui)* ([`d07ac4e`](https://github.com/MadAppGang/claudish/commit/d07ac4e87980cb3ff9631615e3f3fe6cf7c9de4d))
+- show winning provider in leaderboard *(probe)* ([`bbffaa5`](https://github.com/MadAppGang/claudish/commit/bbffaa5d86cd11d9c0e40c11b134e74c9039b678))
+- rich timing TUI — leaderboard, vivid bars, mouse + key scroll *(probe)* ([`6d1077c`](https://github.com/MadAppGang/claudish/commit/6d1077cb0a70ea3f41a007271aeb614311ffbad1))
+- footer hotkey chips + provider list scroll-into-view *(tui)* ([`8796ff6`](https://github.com/MadAppGang/claudish/commit/8796ff60b054f91ba9778baf02ef6a66945f8b8c))
+
+### Other Changes
+
+- release v7.3.0 — interactive tabbed probe results + routing advisor([`9e9ba5d`](https://github.com/MadAppGang/claudish/commit/9e9ba5deee9743ec6daafa7ff348e866dcb2399c))
+
+### Refactoring
+
+- monochrome two-tone footer chips *(tui)* ([`a3b18e7`](https://github.com/MadAppGang/claudish/commit/a3b18e744015fa15e84004e4260b036a0aef9f94))
+
+## [7.2.0] - 2026-05-29
+
+### Bug Fixes
+
+- probe failures across providers — verified end-to-end *(tui)* ([`ca5ef98`](https://github.com/MadAppGang/claudish/commit/ca5ef98cf3d2410f71d178d298ccc0d2f18f59ec))
+- claude-sonnet-4-6 (current Sonnet), not 4-5 *(tui)* ([`d11ad2d`](https://github.com/MadAppGang/claudish/commit/d11ad2d535d882953f113636f5460bf654c6ce2e))
+- use current claude-sonnet-4-5 as testModel for Anthropic-compat coding plans *(tui)* ([`ceb27bd`](https://github.com/MadAppGang/claudish/commit/ceb27bd0f425bb8a3b5b5b1368714a3cc2c8459f))
+- Anthropic-compat coding plans accept Claude model names, not native *(tui)* ([`4c4bde0`](https://github.com/MadAppGang/claudish/commit/4c4bde0975473418ddb0a497b3d57b3ac86189f2))
+- `t` on unconfigured provider doesn't fake a failure *(tui)* ([`c3aaea8`](https://github.com/MadAppGang/claudish/commit/c3aaea89d413b874d60a9b70cb6de5819c82f430))
+- pin AUTH legend to bottom of Providers panel *(tui)* ([`df9323f`](https://github.com/MadAppGang/claudish/commit/df9323fd26960b9440d405b523211138f8fdf30c))
+- OAuth wins over env for OAuth-capable providers *(tui)* ([`59283ad`](https://github.com/MadAppGang/claudish/commit/59283ad5f71898b3d083312bbbe7096be131aa59))
+- test-all skips providers without a key *(tui)* ([`98e1355`](https://github.com/MadAppGang/claudish/commit/98e1355e715dbf87806490f4f851f342207544bc))
+- scope picker readable, prune empty .claudish.json *(tui)* ([`bbfc7a7`](https://github.com/MadAppGang/claudish/commit/bbfc7a70d1464cb1e7f8c792c9c3a95caa3429d3))
+- walk up to find .claudish.json in parent directories *(config)* ([`5630b4c`](https://github.com/MadAppGang/claudish/commit/5630b4cb59c61359a6e437663a8eeb1af5ed840e))
+- make rule matching case-insensitive *(routing)* ([`253bda6`](https://github.com/MadAppGang/claudish/commit/253bda6b5e9f16a41eb2f732c6b0c6695a712054))
+- treat defaultProvider == built-in as built-in in routing tab *(tui)* ([`c80a787`](https://github.com/MadAppGang/claudish/commit/c80a78779194b58f50643449c36a5465a434786a))
+
+### Documentation
+
+- update CHANGELOG.md for v7.1.2([`980ea08`](https://github.com/MadAppGang/claudish/commit/980ea089288070c7da99308d9fdae191ff44ffe7))
+
+### New Features
+
+- catalog-driven probes + endpoint self-discovery + multi-candidate retry *(tui)* ([`432efc1`](https://github.com/MadAppGang/claudish/commit/432efc1a746cb613b08f0f636768bed998b21679))
+- multi-source key display, inline test errors, key scramble animation *(tui)* ([`4b32c6a`](https://github.com/MadAppGang/claudish/commit/4b32c6ae8ea3c7789b04f2044c377d29d8d0f3b0))
+- return to TUI after login (child process for OAuth flow) *(tui)* ([`c4c670a`](https://github.com/MadAppGang/claudish/commit/c4c670a080a64d15466cf0640be7b3dbd5909861))
+- `l` actually launches login (TUI exits, login runs, exit) *(tui)* ([`14482b3`](https://github.com/MadAppGang/claudish/commit/14482b3bb144c0ba61fdcef3d8f54b86c8466440))
+- emoji AUTH icons + legend at bottom *(tui)* ([`ae007ce`](https://github.com/MadAppGang/claudish/commit/ae007cebfdc99cf661a11c33e9ed99d81a12a544))
+- AUTH column shows oauth alongside set key *(tui)* ([`0813824`](https://github.com/MadAppGang/claudish/commit/0813824ab6f32af4ff0c8621c3c3c7f6c64c9773))
+- AUTH column as single pill, muted colors *(tui)* ([`b16c6c3`](https://github.com/MadAppGang/claudish/commit/b16c6c37f8a69b6fd6bf5cb12eb8614d313e8d87))
+- AUTH column as bg-pill tags *(tui)* ([`a0be986`](https://github.com/MadAppGang/claudish/commit/a0be986b8e91f4cfff1503d0925f7b9666839311))
+- Providers AUTH capability slots + dynamic footer *(tui)* ([`dea4e21`](https://github.com/MadAppGang/claudish/commit/dea4e21494cab230f9eef9485ea6427cb84cd983))
+- Providers tab column alignment + OAuth indicator *(tui)* ([`5b71e2d`](https://github.com/MadAppGang/claudish/commit/5b71e2d19e5f5133e85a464569da8d7412f161a5))
+- OAuth login hint on Providers tab + footer width fix *(tui)* ([`d602667`](https://github.com/MadAppGang/claudish/commit/d602667015df95473de5b0bbcf1bb9dc80b6d939))
+- restore parallel test-all on Providers tab *(tui)* ([`57ee4d7`](https://github.com/MadAppGang/claudish/commit/57ee4d760bd1d1ecf357b73f0b6288f03de8a4e7))
+- compact Rules header *(tui)* ([`60c21f8`](https://github.com/MadAppGang/claudish/commit/60c21f889ac437c0d9790449646ca4a53eeed09c))
+- redesign Routing Legend panel as 2x2 table *(tui)* ([`236872e`](https://github.com/MadAppGang/claudish/commit/236872e4d09a27acbce25662e66c00c5d85fe771))
+- scope picker as navigable menu (arrows + Enter) *(tui)* ([`31541dc`](https://github.com/MadAppGang/claudish/commit/31541dcb003e3342737ea47d64fbe7f3609672a9))
+- show all routing rules per scope, no shadowing *(tui)* ([`4bb788b`](https://github.com/MadAppGang/claudish/commit/4bb788b3f1bb386f36eb2124749b9608f264b9e6))
+- project-scope routing rules with g/p picker *(tui)* ([`7ed9f91`](https://github.com/MadAppGang/claudish/commit/7ed9f91eeac4233bb41787250584e9e61c3f52d5))
+- scrollable rules table and chain selector *(tui)* ([`f1be9a9`](https://github.com/MadAppGang/claudish/commit/f1be9a92301ea7eafad8458d8d5d580a38234296))
+- show built-in routing rules in Routing tab *(tui)* ([`35dcda2`](https://github.com/MadAppGang/claudish/commit/35dcda25fc3f5d34c6750836ad15bac731c178b1))
+
+### Other Changes
+
+- release v7.2.0 — catalog-driven TUI probes + endpoint self-discovery([`7f5f534`](https://github.com/MadAppGang/claudish/commit/7f5f534441852a7658fb2adcba090e7df6fbc953))
+
+### Refactoring
+
+- unify provider testing via probeLink + proxy *(tui)* ([`3f0b35f`](https://github.com/MadAppGang/claudish/commit/3f0b35f5d295ee3bacd16ceed9a592d4e58caf25))
+- extract useProfileWizard hook *(tui)* ([`b3b34ff`](https://github.com/MadAppGang/claudish/commit/b3b34ffce37e3faf4cae86c4d5f117debdabd852))
+- extract useRouteProbe hook *(tui)* ([`9efd707`](https://github.com/MadAppGang/claudish/commit/9efd7078d6632082222cce186bf00b561234d1e2))
+- extract render closures into components/ *(tui)* ([`be27b8e`](https://github.com/MadAppGang/claudish/commit/be27b8e584922b7d7797c0e95c97a3242d57acba))
+
+## [7.1.2] - 2026-05-09
+
+### Bug Fixes
+
+- gate sync resolver on isFreshEnough TTL *(model-loader)* ([`067f27d`](https://github.com/MadAppGang/claudish/commit/067f27dd87417297f8ea9df5e7e15dbd4f6bf166))
+
+### Documentation
+
+- update CHANGELOG.md for v7.1.1([`c51ee70`](https://github.com/MadAppGang/claudish/commit/c51ee70ede43cd59f301d2c736cba74417c6e851))
+
+### Other Changes
+
+- release v7.1.2 — gate sync resolver on isFreshEnough TTL([`d769982`](https://github.com/MadAppGang/claudish/commit/d7699828a89b89852d57d1e3b7c8f0675f54ed20))
+
+## [7.1.1] - 2026-05-09
+
+### Documentation
+
+- update CHANGELOG.md for v7.1.0([`0bad75e`](https://github.com/MadAppGang/claudish/commit/0bad75e127c60495184ad9bedd3c993b2f5a0dad))
+
+### New Features
+
+- SEP-1686 forward-compat + diagnostics + roadmap (#119) *(channel)* ([`2312750`](https://github.com/MadAppGang/claudish/commit/2312750522bc7de7df5a6cd096515cc0b2c83a62))
+
+### Other Changes
+
+- release v7.1.1 — drop CLAUDISH_GEMINI_HELP_FALLBACK env var([`22720b9`](https://github.com/MadAppGang/claudish/commit/22720b997f7e3df01767f659df18cd64537728e5))
+
+## [7.1.0] - 2026-05-09
+
+### Bug Fixes
+
+- externalize @opentui/* so dist bundle loads native platform binary *(packaging)* ([`0beb77a`](https://github.com/MadAppGang/claudish/commit/0beb77a59baa1089b8fa0fa3925e1621c846df42))
+- return 400 on count_tokens with missing model *(proxy)* ([`7d3f4f3`](https://github.com/MadAppGang/claudish/commit/7d3f4f366476e0e5bc8f0cf1de5ca23cd7c9afcf))
+- rewrite model selector on CatalogClient, fix empty Zen list *(picker)* ([`5c6e9bf`](https://github.com/MadAppGang/claudish/commit/5c6e9bfe1f3825795365ed9693e14ed9c8816af8))
+
+### Documentation
+
+- update CHANGELOG.md for v7.0.3([`a944199`](https://github.com/MadAppGang/claudish/commit/a9441999085fedeb56b066060ff2d6e4adf36142))
+
+### New Features
+
+- sort all model lists by releaseDate (newest first) + show date *(picker)* ([`1bdafe9`](https://github.com/MadAppGang/claudish/commit/1bdafe9bac2313522d65513598b7abe7f10f43be))
+- wire defaultProvider as final fallback + truthful TUI render *(routing)* ([`9ec6eab`](https://github.com/MadAppGang/claudish/commit/9ec6eab892488091ad58733f8438d88a5a311ad9))
+- add catalog-query.ts read-only accessors *(catalog)* ([`8afff4f`](https://github.com/MadAppGang/claudish/commit/8afff4f047486aa438cf71acec940d267ab2b44f))
+- warm catalog before proxy startup (Option D) *(launcher)* ([`77d26ae`](https://github.com/MadAppGang/claudish/commit/77d26ae38cb8ddeeb6ffb88fbe4954703b00f622))
+- add refreshCatalog() returning RefreshOutcome to resolver interface *(catalog)* ([`9ba5dfc`](https://github.com/MadAppGang/claudish/commit/9ba5dfc208d92f1655531449542c5960700a548f))
+- default routing rules + route() over user-rewritable schema *(routing)* ([`ceec76a`](https://github.com/MadAppGang/claudish/commit/ceec76a1c04232a501b0708d7717d7e5240df462))
+- introduce CatalogClient and unify Firebase cache TTL *(catalog)* ([`0d9e1e9`](https://github.com/MadAppGang/claudish/commit/0d9e1e92a37e2a5aa3124dd3fb0586c9d0e50d80))
+
+### Other Changes
+
+- release v7.1.0([`d6c0483`](https://github.com/MadAppGang/claudish/commit/d6c048373e3058d66b11b46e7a3e6e1ddc59578b))
+- fix writeFileSync import, tsconfig, claudeArgs strict-null *(types)* ([`27a60ba`](https://github.com/MadAppGang/claudish/commit/27a60ba45676e0685a1634e0644f9a774539c302))
+- delete static-fallback.ts (OPENROUTER_VENDOR_MAP) *(catalog)* ([`ba650d5`](https://github.com/MadAppGang/claudish/commit/ba650d51d11ec7a2fbaa37ea326bca1566720ca2))
+- plumb --force-update + --skip-models-update into ClaudishConfig *(cli)* ([`3849727`](https://github.com/MadAppGang/claudish/commit/3849727034487d133d5d23930e41e124c8114f28))
+- extract landing page and model-update script to models-index repo([`57c1e53`](https://github.com/MadAppGang/claudish/commit/57c1e53767d22c3f890e8a5464be4caea1f2f346))
+
+### Refactoring
+
+- apply Phase 5 quality follow-ups (M1, M2, L1-L3) *(catalog)* ([`a0035f3`](https://github.com/MadAppGang/claudish/commit/a0035f3de3beb54b95007120692bc9184977d71f))
+- replace gpt-5.4 probe + gemini help-text hardcodes *(quota)* ([`617f83c`](https://github.com/MadAppGang/claudish/commit/617f83c3928cdd0d6e5801619a673d2cca0f1c0b))
+- delete PROVIDER_TO_OR_PREFIX, route pricing through aggregators[] *(cleanup)* ([`8d60d5f`](https://github.com/MadAppGang/claudish/commit/8d60d5fe440438ccb05c0738a4860a5d89636183))
+- replace haiku/sonnet/opus tier map + VISION_MODEL with catalog lookups *(cleanup)* ([`06519a9`](https://github.com/MadAppGang/claudish/commit/06519a9601f31a932168b0f91f687d6e3ce032d4))
+- delete direct-provider catalog code, bundled fallback, legacy routing([`029d8fd`](https://github.com/MadAppGang/claudish/commit/029d8fd07eddb1bcf56f61c03274f04688815ba9))
+- extend ModelDoc with aggregators, vendors, availableInPlans *(model-loader)* ([`2ec025f`](https://github.com/MadAppGang/claudish/commit/2ec025fbc60406c8d46216f88ec97cbc3a3aef04))
+- dedupe CODE_ASSIST_FALLBACK_CHAIN *(gemini)* ([`eb91bed`](https://github.com/MadAppGang/claudish/commit/eb91bed628e98871a8fcba90cc2c8f4ea9e93ec2))
+- finalize Firebase migration, remove static MODEL_CATALOG *(catalog)* ([`3edc60f`](https://github.com/MadAppGang/claudish/commit/3edc60fac7b88bf51569be389c37e9c5c32152fb))
+
+## [7.0.3] - 2026-04-21
+
+### Bug Fixes
+
+- inherit parent CWD so models can access the repo *(team)* ([`00a692a`](https://github.com/MadAppGang/claudish/commit/00a692a7c698cbd09a0320df65123d771d73fbf5))
+- align OAuth flow with opencode for successful ChatGPT login *(codex)* ([`ceb5074`](https://github.com/MadAppGang/claudish/commit/ceb50743981b026c01e621649c71e9170c305041))
+- detect in-stream error payloads from anthropic-compat providers (#106) *(anthropic-sse)* ([`9deb528`](https://github.com/MadAppGang/claudish/commit/9deb5286ecf0829e71a5d1de149dcc83a4b3ab8d))
+- back interactive model picker with Firebase catalog([`b5f0e49`](https://github.com/MadAppGang/claudish/commit/b5f0e49caba6740367bc345346e31b08cf4d6bbe))
+
+### Documentation
+
+- update CHANGELOG.md for v7.0.1([`0ee1c1e`](https://github.com/MadAppGang/claudish/commit/0ee1c1e66c16149ebd202f5723a0ae160d748f6b))
+
+### New Features
+
+- --advisor flag for multi-model advisor tool replacement *(advisor)* ([`460bfd0`](https://github.com/MadAppGang/claudish/commit/460bfd01e166392e9b1693678b469735302d5068))
+- enable OAuth authentication for ChatGPT Plus/Pro subscriptions *(codex)* ([`7098992`](https://github.com/MadAppGang/claudish/commit/709899215ba16afaa296fca2eb37afbad159b6b3))
+
+### Other Changes
+
+- release v7.0.3([`e898715`](https://github.com/MadAppGang/claudish/commit/e8987155ea634ddb84505832bfe9592c1316ddb3))
+
+## [7.0.1] - 2026-04-16
+
+### Bug Fixes
+
+- filter thinking blocks from MiniMax SSE to prevent leaking internal reasoning *(minimax)* ([`bd9bd85`](https://github.com/MadAppGang/claudish/commit/bd9bd85b122c5fbade05b619e5571cc5109a96fa))
+- address edge cases in PR #103 interactive-mode detection([`8932edf`](https://github.com/MadAppGang/claudish/commit/8932edfb733ebcd602154d3487db142804cc5e1e))
+- default to interactive mode when only flags are passed (no prompt) (#103)([`cba30c9`](https://github.com/MadAppGang/claudish/commit/cba30c936b0afa82920b9e1e8c05a61dbaad0842))
+- rewrite parser for restructured pricing page *(google-scraper)* ([`473d539`](https://github.com/MadAppGang/claudish/commit/473d539bb3ffa954735ccfb7e9e8bafe9fc29fda))
+
+### Documentation
+
+- update all documentation for v7.0.0 release([`297a797`](https://github.com/MadAppGang/claudish/commit/297a797d70bfb8b2f4bd90e77beeb71d9ef67911))
+- update CHANGELOG.md for v7.0.0([`75fce0a`](https://github.com/MadAppGang/claudish/commit/75fce0a2d54e5a12b6ee6b992d59dad2b4bfa36a))
+
+### Refactoring
+
+- move model catalog system to models-index repo([`cb75290`](https://github.com/MadAppGang/claudish/commit/cb75290e836acc0059b13ee69ab7c177dc553e3e))
+
+## [7.0.0] - 2026-04-16
+
+### Documentation
+
+- update CHANGELOG.md for v6.14.0([`8f18ec2`](https://github.com/MadAppGang/claudish/commit/8f18ec21e67babcebab862f49e2dade859d1f44c))
+
+### New Features
+
+- v7.0.0 — configurable default provider, custom endpoints([`c5ae212`](https://github.com/MadAppGang/claudish/commit/c5ae2127aee0f27d3d226958490741460f7a88e2))
+
+### Other Changes
+
+- add opt-in advisor-tool swap module *(experiment)* ([`fda7852`](https://github.com/MadAppGang/claudish/commit/fda78525727262baf75e5a99f298e77244915ebc))
+
+## [6.14.0] - 2026-04-15
+
+### New Features
+
+- v6.14.0 — Firebase-only catalog, semantic search, --list-providers([`95684ae`](https://github.com/MadAppGang/claudish/commit/95684ae540a4cdc049a7a6cee19dfa41d6790cf7))
+
+## [6.13.3] - 2026-04-15
+
+### Bug Fixes
+
+- gate consent prompt while Claude Code owns TTY (#85, #88, #99) *(telemetry)* ([`72f4460`](https://github.com/MadAppGang/claudish/commit/72f4460958a85a4c2c85179b3bfbed8013aecd15))
+
+### Documentation
+
+- reflect ?catalog=top100, slim PublicModel projection, search fix *(api)* ([`bdcef63`](https://github.com/MadAppGang/claudish/commit/bdcef63d9f5444753c34cd0af3ce1f979ba76298))
+- update CHANGELOG.md for v6.13.2([`688e483`](https://github.com/MadAppGang/claudish/commit/688e4833774e2cb5efc37ea7e12800e1b8d1bec7))
+
+### New Features
+
+- slim public API — strip internal provenance from responses *(firebase)* ([`d21c2c9`](https://github.com/MadAppGang/claudish/commit/d21c2c9f4f1002fc321a83e4401506f77acf94ce))
+- add ?catalog=top100 endpoint + fix search ordering bug *(firebase)* ([`f71f9ef`](https://github.com/MadAppGang/claudish/commit/f71f9eff6eaf0f308980ef947bb0977332eb99ef))
+
+### Other Changes
+
+- v6.13.3 — fix interactive stdin race (#85, #88, #99) *(release)* ([`ec01715`](https://github.com/MadAppGang/claudish/commit/ec0171581b09fe3cf33362c7a5e7fa4c43b57020))
+
+### Refactoring
+
+- align manual trigger alert paths with scheduled cron *(catalog)* ([`16379d9`](https://github.com/MadAppGang/claudish/commit/16379d9941844b80c3593b6b8ff7d8efb53d1475))
+
+## [6.13.2] - 2026-04-15
+
+### Bug Fixes
+
+- stream format priority — explicit adapter wins over model dialect *(#102)* ([`a0b15a9`](https://github.com/MadAppGang/claudish/commit/a0b15a97e0586d2fea09c98bdf7fb4591ee6fd82))
+- thread Slack webhook as parameter, not process.env *(recommender)* ([`0fddebd`](https://github.com/MadAppGang/claudish/commit/0fddebd69db249bb627be2d34d0eb6370d3ac677))
+- centralize all-models.json through v2 helpers *(cache)* ([`157c580`](https://github.com/MadAppGang/claudish/commit/157c580e46f9ec144eecea2721a182b1ce29a736))
+- #102 GLM stream parser + structural prevention + #85/88/99 stdin cleanup([`f876e79`](https://github.com/MadAppGang/claudish/commit/f876e7916979cbae1db7ba5bdf57f19d4b37ebb3))
+
+### Documentation
+
+- update API reference for recommender v2.0 (S1-S7 refactor)([`a68735f`](https://github.com/MadAppGang/claudish/commit/a68735f5b12ef09c2790ecae29a8d80bea563cbe))
+- update CHANGELOG.md for v6.13.1([`ae86f4f`](https://github.com/MadAppGang/claudish/commit/ae86f4f0f18b2f1d16a577ef6b413228e3a162f4))
+
+### New Features
+
+- v6.13.2 — fix #102 GLM/Z.AI 0-byte output + #85/88/99 stdin cleanup([`c959d0e`](https://github.com/MadAppGang/claudish/commit/c959d0e37dce1ce9d7317bcdfaafcdd4d6ade419))
+- add aggregators[] field to ModelDoc and slim catalog *(firebase)* ([`8a08535`](https://github.com/MadAppGang/claudish/commit/8a08535ceb3fa941e9859adea0926e804728425b))
+- runtime-registered custom endpoints *(providers)* ([`1451aea`](https://github.com/MadAppGang/claudish/commit/1451aea57448417e44d64e1a7d2ccf2d7a8ee789))
+- demote LiteLLM from hardcoded priority *(routing)* ([`5a0d294`](https://github.com/MadAppGang/claudish/commit/5a0d294f63203e068da5e4e241dd56d9ea509964))
+- add defaultProvider key + customEndpoints schemas *(config)* ([`12ff0b1`](https://github.com/MadAppGang/claudish/commit/12ff0b110cedef365dd6146550f0afb2f3af573c))
+
+## [6.13.1] - 2026-04-14
+
+### Bug Fixes
+
+- reject category headings as model IDs *(google-scraper)* ([`0582413`](https://github.com/MadAppGang/claudish/commit/058241372fe2263654ad9f165ceb9ed523cf5613))
+- set en-US locale headers on every page *(browserbase)* ([`ed93c11`](https://github.com/MadAppGang/claudish/commit/ed93c1180f22aa6a1484c3905aa1cb3b1eac4f50))
+- retry up to 3 times on empty response *(qwen-scraper)* ([`4fb6716`](https://github.com/MadAppGang/claudish/commit/4fb6716d87a87ee80fb51f4cd80be646184df682))
+
+### Documentation
+
+- update CHANGELOG.md for v6.13.0([`f66d397`](https://github.com/MadAppGang/claudish/commit/f66d397fcc69d7f014e4b7b78c7d4c23b935b23b))
+
+### New Features
+
+- v6.13.1 — magmux IPC integration + e2e tests([`26c7a29`](https://github.com/MadAppGang/claudish/commit/26c7a29efda8c1171c36abeae93ef84627bb825e))
+
+### Other Changes
+
+- gitignore local dev test scripts in firebase/functions([`a0776f0`](https://github.com/MadAppGang/claudish/commit/a0776f0490246829791d80636e1b7fb3b52ded23))
+
+### Refactoring
+
+- delegate all lifecycle tracking to magmux *(team-grid)* ([`168c814`](https://github.com/MadAppGang/claudish/commit/168c814db601da2976b48dd752dea5a319bd2bba))
+
+## [6.13.0] - 2026-04-14
+
+### Bug Fixes
+
+- restore scroll+click that actually triggers render *(qwen-scraper)* ([`42a17d8`](https://github.com/MadAppGang/claudish/commit/42a17d8c24be0d220c20637ca6b2a883f2aa2cfe))
+- wait for JS-rendered content, not a blind setTimeout *(browserbase)* ([`8e273f6`](https://github.com/MadAppGang/claudish/commit/8e273f6a715ea95d2e39d2bf7026d48e98ce08df))
+- click International tab before scraping *(qwen-scraper)* ([`b04861e`](https://github.com/MadAppGang/claudish/commit/b04861e48adf7b967a6fa23b215af705120b6180))
+- diff gate ignores category recategorization *(recommender)* ([`c174797`](https://github.com/MadAppGang/claudish/commit/c17479761e10d3f33b564c3e567cc337cd25baa0))
+- parseVersion strips parameter-count suffixes *(recommender)* ([`32d3307`](https://github.com/MadAppGang/claudish/commit/32d33072f753e11d891ac4214cdff407d4772443))
+- date-stamp handling + missing provider aliases *(firebase/recommender)* ([`760b6db`](https://github.com/MadAppGang/claudish/commit/760b6dbd45ff9be8052734db4ef9fcfe841e3798))
+- fix 6 cron output issues — vendor prefix, model selection, timeouts *(recommender)* ([`6ba9043`](https://github.com/MadAppGang/claudish/commit/6ba90430281193bfadf991f43cf4408621064511))
+
+### Documentation
+
+- add API reference for Firebase endpoints, MCP tools, and schemas([`5f38f08`](https://github.com/MadAppGang/claudish/commit/5f38f08ceeb5182a6dcec23ecbc8c0fd8e20c322))
+- update CHANGELOG.md for v6.12.3([`a39970f`](https://github.com/MadAppGang/claudish/commit/a39970fae6f188df954542730bf533abf522c00e))
+
+### New Features
+
+- interactive TUI with bordered result cards *(probe)* ([`22865e7`](https://github.com/MadAppGang/claudish/commit/22865e77be0c65a1b8f9a97b84c33ff84f74340a))
+- lexical modality fallback in isCodingCandidate *(firebase/recommender)* ([`cdcafc6`](https://github.com/MadAppGang/claudish/commit/cdcafc6733a86cb0046fe2990483e08dd900dfa6))
+- deterministic version-aware picker *(firebase/recommender)* ([`1eb5808`](https://github.com/MadAppGang/claudish/commit/1eb580831785283dab5e12d3d2c8bd20f8cda891))
+- pre-publish diff gate and provider-drop alerts *(firebase/recommender)* ([`42c2b82`](https://github.com/MadAppGang/claudish/commit/42c2b825fe5d8e33936aa104e36c82ce76ecaf9d))
+- add one-off cleanupStalePrefixedDocs migration endpoint *(cleanup)* ([`a6fdbbf`](https://github.com/MadAppGang/claudish/commit/a6fdbbf7f1ca3bb4b64f0fc5f733aff2c2a61982))
+- --probe sends real 1-token requests to validate each provider([`f843f3e`](https://github.com/MadAppGang/claudish/commit/f843f3e1ed0e553e9303e9bb2f44ae459436dcf4))
+
+### Other Changes
+
+- clean up unused symbols after S1-S7 refactor *(firebase)* ([`be07e5a`](https://github.com/MadAppGang/claudish/commit/be07e5ac3f26e9a33a6ff0fc6ac70f271cc41a16))
+
+### Refactoring
+
+- remove tab-click, rely on en-US locale *(qwen-scraper)* ([`00b2bc1`](https://github.com/MadAppGang/claudish/commit/00b2bc147d2a0333f648f1e65a87c84fa3d5e998))
+- install schema gate at RawModel ingress *(firebase/recommender)* ([`656e37a`](https://github.com/MadAppGang/claudish/commit/656e37a5a156ab061a8627aea77d84156c3a5164))
+
+## [6.12.3] - 2026-04-11
+
+### Bug Fixes
+
+- make codesign verification non-fatal for Bun binaries([`2cfbccb`](https://github.com/MadAppGang/claudish/commit/2cfbccb727058b7b55119daf7945242f743e0bc9))
+- Qwen pricing scraper, stale doc cleanup, xAI alias fix([`0468eae`](https://github.com/MadAppGang/claudish/commit/0468eaed19fa57e62f30ba66debc080a9f832144))
+- stale doc cleanup + xAI alias resolution for correct model IDs([`343e619`](https://github.com/MadAppGang/claudish/commit/343e61952b26ba5e23accac5a61a98b4a811ea8e))
+
+### Documentation
+
+- update CHANGELOG.md for v6.12.2([`9e89555`](https://github.com/MadAppGang/claudish/commit/9e895558e81449660f096c47d0d35e9f195f60c2))
+
+### New Features
+
+- v6.12.3 — Browserbase integration for JS-rendered pricing pages([`b2e2ccc`](https://github.com/MadAppGang/claudish/commit/b2e2ccc01a841320955f2c0ae78b86f8211d8b68))
+- add Qwen pricing scraper from Alibaba Cloud Model Studio docs([`f9fe44d`](https://github.com/MadAppGang/claudish/commit/f9fe44d3e7054847696759953ed456380a52eeea))
+
+### Other Changes
+
+- add gitignore for magmux binaries and team session dirs([`89291a3`](https://github.com/MadAppGang/claudish/commit/89291a31cb1785bdc9e4d7d4db1f3722c7efad61))
+
+### Refactoring
+
+- remove local magmux source, use upstream releases([`e1f8dd1`](https://github.com/MadAppGang/claudish/commit/e1f8dd1556d33d220385dfb4df2ff2894178f386))
+
+## [6.12.2] - 2026-04-10
+
+### Bug Fixes
+
+- v6.12.2 — team orchestrator race conditions and test hardening([`302e3f3`](https://github.com/MadAppGang/claudish/commit/302e3f372f0be1961175ea217b07e576a3262e2c))
+- use official pricing from provider docs, not aggregator prices([`0e8bc48`](https://github.com/MadAppGang/claudish/commit/0e8bc480790d92763b49f5cc99f619b8d370fa53))
+
+### Documentation
+
+- update CHANGELOG.md for v6.12.1([`21c5fc0`](https://github.com/MadAppGang/claudish/commit/21c5fc07cca05040097f18f5c9e7dcac92280767))
+
+## [6.12.1] - 2026-04-10
+
+### Bug Fixes
+
+- v6.12.1 — fix xAI pricing conversion (was 100x too low)([`871e957`](https://github.com/MadAppGang/claudish/commit/871e95727fc18bf55963819c2b081a7f5ef952f9))
+- close remaining race conditions in team-orchestrator *(team)* ([`832cbb7`](https://github.com/MadAppGang/claudish/commit/832cbb7e96e01eaca8564cdb42db400a2026a8e3))
+
+### Documentation
+
+- update CHANGELOG.md for v6.12.0([`107e843`](https://github.com/MadAppGang/claudish/commit/107e8439cea41cc248677714c4d14e97ed1fafb6))
+
+## [6.12.0] - 2026-04-09
+
+### Documentation
+
+- update CHANGELOG.md for v6.11.1([`d89cddd`](https://github.com/MadAppGang/claudish/commit/d89cdddd5ad2004356e7727ad0898e7ef39bc0e7))
+
+### New Features
+
+- v6.12.0 — new API collectors, error report ingest, auto-recommender, team timeout fix([`e940c79`](https://github.com/MadAppGang/claudish/commit/e940c79a60fa3ab74dbf98ac6e0f657b6f9063ef))
+
+## [6.11.1] - 2026-04-08
+
+### Bug Fixes
+
+- v6.11.1 — fix OAuth login in bundled dist, model catalog improvements([`73cff9c`](https://github.com/MadAppGang/claudish/commit/73cff9caa24818935fce2304c77756c7f13639b9))
+
+### Documentation
+
+- update CHANGELOG.md for v6.11.0([`f6a4ce0`](https://github.com/MadAppGang/claudish/commit/f6a4ce09af964a2df6f1dee5f83fc0ddd26f7a04))
+
+## [6.11.0] - 2026-04-07
+
+### Bug Fixes
+
+- remove uncommitted warmRecommendedModels import that breaks CI([`b4265ff`](https://github.com/MadAppGang/claudish/commit/b4265ff66e0c52eac57c513eee15a0f65e39dd3a))
+
+### Documentation
+
+- update CHANGELOG.md for v6.10.1([`8233ae5`](https://github.com/MadAppGang/claudish/commit/8233ae5cfc20c2e802b1239856c2337ec9d65c57))
+
+### New Features
+
+- v6.11.0 — Anthropic error format, SSE pings, web search detection([`a249eb4`](https://github.com/MadAppGang/claudish/commit/a249eb4a2e86ec2b3a023a2183d7a3a7b76fb0a7))
+
+## [6.10.1] - 2026-04-07
+
+### Documentation
+
+- update CHANGELOG.md for v6.10.0([`aaf24f2`](https://github.com/MadAppGang/claudish/commit/aaf24f21df44867cf42770202d0d7ee0a0cd0033))
+
+### New Features
+
+- v6.10.1 — auto-update with changelog, single version source of truth([`de889eb`](https://github.com/MadAppGang/claudish/commit/de889eb6609145bb1a40643101b70236576be1e3))
+
+## [6.10.0] - 2026-04-07
+
+### Documentation
+
+- update CHANGELOG.md for v6.9.1([`714b1b5`](https://github.com/MadAppGang/claudish/commit/714b1b5166662ea3aac3087faad51be0e896fd25))
+
+### New Features
+
+- v6.10.0 — Codex subscription OAuth, unified login/logout, quota registry([`a2dd1ea`](https://github.com/MadAppGang/claudish/commit/a2dd1ea156b96da16ac8021702edf614ce9ebe3d))
+
+## [6.9.1] - 2026-04-06
+
+### Documentation
+
+- update CHANGELOG.md for v6.9.0([`3075035`](https://github.com/MadAppGang/claudish/commit/3075035e28ffc425917f3ccc0680f27f9b860693))
+
+### Other Changes
+
+- bump to v6.9.1 — verify magmux npm publishing([`3384f03`](https://github.com/MadAppGang/claudish/commit/3384f034facf1da80cef0061da7ed4e2d3b5815b))
+
+## [6.9.0] - 2026-04-06
+
+### Documentation
+
+- update CHANGELOG.md for v6.8.1([`9b376b6`](https://github.com/MadAppGang/claudish/commit/9b376b6eb588441bcaf165764c41052303598bc2))
+
+### New Features
+
+- v6.9.0 — model catalog overhaul, team grid mode, Slack alerts([`de0b815`](https://github.com/MadAppGang/claudish/commit/de0b81554206fc3072f6e74549a3699220c2862e))
+
+## [6.8.1] - 2026-04-06
+
+### Documentation
+
+- update CHANGELOG.md for v6.8.0([`d72520d`](https://github.com/MadAppGang/claudish/commit/d72520db1264cf6799a9c470f5fc94d1e86fe3a3))
+
+### New Features
+
+- platform-specific magmux npm packages + stripped binaries([`efd6bba`](https://github.com/MadAppGang/claudish/commit/efd6bba4dd71f3ae34e9868501d10941a10b9258))
+
+### Other Changes
+
+- bump to v6.8.1 — platform-specific magmux packages([`a03e995`](https://github.com/MadAppGang/claudish/commit/a03e99558e06c1bae0bdfb485d471716b1bbe785))
+
+## [6.8.0] - 2026-04-06
+
+### Documentation
+
+- update CHANGELOG.md for v6.7.0([`57d6ae5`](https://github.com/MadAppGang/claudish/commit/57d6ae522dc11f9d3c9c08e0c78fca12817f745b))
+
+### New Features
+
+- v6.8.0 — add DeepSeek as native direct API provider([`a833000`](https://github.com/MadAppGang/claudish/commit/a833000d59d3a4ce5d610201bf967ea867dd9ead))
+
+## [6.7.0] - 2026-04-06
+
+### Documentation
+
+- update CHANGELOG.md for v6.6.3([`dd7e6fb`](https://github.com/MadAppGang/claudish/commit/dd7e6fbe9d47df1ba63d4bfc30436ddbd7429c31))
+
+### New Features
+
+- v6.7.0 — replace mtm with magmux, improve catalog resolver, add OAuth manager([`6759005`](https://github.com/MadAppGang/claudish/commit/675900567be9f139aece1f674ed8f6880843bd89))
+
+## [6.6.3] - 2026-04-06
+
+### Bug Fixes
+
+- handle magmux artifact names in release file preparation *(ci)* ([`c8aca08`](https://github.com/MadAppGang/claudish/commit/c8aca08575f3265c869ca85b7b79f04dad83f2a3))
+- v6.6.3 — reject sentinel model names in team orchestrator([`e485263`](https://github.com/MadAppGang/claudish/commit/e485263cfdd99aeda77b195fb7de572274c355ce))
+- reject sentinel model names in team orchestrator *(team)* ([`91ee9a8`](https://github.com/MadAppGang/claudish/commit/91ee9a811fb821dbd1f01214cdbfd977017ed96f))
+
+### Documentation
+
+- update CHANGELOG.md for v6.6.2([`4c071a6`](https://github.com/MadAppGang/claudish/commit/4c071a69e105daf92fb2967392b0637d1129074c))
+
+## [6.6.2] - 2026-04-06
+
+### Bug Fixes
+
+- use Node 24 + always-auth for npm OIDC trusted publishing *(ci)* ([`9cfb12a`](https://github.com/MadAppGang/claudish/commit/9cfb12a86d21961fe01ec07894a144ac2af49230))
+- remove FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 from publish-npm *(ci)* ([`f44750d`](https://github.com/MadAppGang/claudish/commit/f44750df739616e942418ef4b9bc22124e89ccde))
+- use Node 20 for npm publish — Node 22.22.2 npm is broken *(ci)* ([`0414155`](https://github.com/MadAppGang/claudish/commit/0414155ef090a8a2cd1ed3cb5b40d6d417c9ecfd))
+- use npm@11 for OIDC publish compatibility *(ci)* ([`f0a746e`](https://github.com/MadAppGang/claudish/commit/f0a746edb08219210f0628d0a119f4fdd14791a3))
+- v6.6.2 — Gemini image translation, CI npm fix([`bba0327`](https://github.com/MadAppGang/claudish/commit/bba03275bbfaf9cb8448eff00723d800d2094341))
+
+### Documentation
+
+- update CHANGELOG.md for v6.6.2([`dba5006`](https://github.com/MadAppGang/claudish/commit/dba5006456b9d9d6dc16e7581b95c206c9b71dce))
+- update CHANGELOG.md for v6.6.2([`84a403b`](https://github.com/MadAppGang/claudish/commit/84a403b8c27326ea975668d5ae5ce6e22ddd7863))
+- update CHANGELOG.md for v6.6.2([`ade7e09`](https://github.com/MadAppGang/claudish/commit/ade7e0933686c4f045916d52bc1780f4d511f25b))
+- update CHANGELOG.md for v6.6.2([`fe30c6b`](https://github.com/MadAppGang/claudish/commit/fe30c6b56f0243da48c726baca7b0f6544d154f8))
+- update CHANGELOG.md for v6.6.1([`5fd634b`](https://github.com/MadAppGang/claudish/commit/5fd634b40022fd2b8d332372db9091a1ab5119b5))
+
+## [6.6.1] - 2026-04-06
+
+### Bug Fixes
+
+- v6.6.1 — OpenAI schema compatibility for bare object MCP tools([`8fe7373`](https://github.com/MadAppGang/claudish/commit/8fe73736d7f3a5d07ede283e407e7a5889f9a1ca))
+- ensure properties:{} on bare object schemas for OpenAI compatibility([`99d3e73`](https://github.com/MadAppGang/claudish/commit/99d3e732f82e776a4d3d809666f95233c206fb55))
+- quota bar without pill bg — add lowercase color codes to magmux([`d029001`](https://github.com/MadAppGang/claudish/commit/d0290013c04248ee593b88388fa257827b694f5e))
+
+### Documentation
+
+- update CHANGELOG.md for v6.6.0([`2bf5e9a`](https://github.com/MadAppGang/claudish/commit/2bf5e9a6b962e4b1bc15afc46702a62f10f4c9c0))
+
+## [6.6.0] - 2026-04-01
+
+### Bug Fixes
+
+- cleaner status bar — remove ok pill, provider as plain text, mini quota bar([`a9ad5be`](https://github.com/MadAppGang/claudish/commit/a9ad5be2098dad03932b5e31e439553f93436f09))
+
+### Documentation
+
+- update CHANGELOG.md for v6.6.0([`5d186cb`](https://github.com/MadAppGang/claudish/commit/5d186cb84dfe695938c6e7f3d75a8e3d5b888798))
+- update CHANGELOG.md for v6.5.3([`76e4df5`](https://github.com/MadAppGang/claudish/commit/76e4df586c651289b17196366cd4f5711a320058))
+
+### New Features
+
+- magmux v0.3.0 — grid mode, status bar, socket IPC, tint overlays([`4bbbce2`](https://github.com/MadAppGang/claudish/commit/4bbbce21f341405009ee06baac0a66e7c3c7245d))
+
+## [6.5.3] - 2026-04-01
+
+### Bug Fixes
+
+- quota display in status bar — strip provider prefix, await fetch, rewrite token file([`b026b2f`](https://github.com/MadAppGang/claudish/commit/b026b2ff3d2a3b95530f3136e125971177315508))
+
+### Documentation
+
+- update CHANGELOG.md for v6.5.2([`67d4181`](https://github.com/MadAppGang/claudish/commit/67d418143f2ee718ee425ce7a26d6f32fb3e2f8d))
+
+### Other Changes
+
+- bump to v6.5.3([`1eafee8`](https://github.com/MadAppGang/claudish/commit/1eafee81943eb2d45ee552de3184935f8365205a))
+
+## [6.5.2] - 2026-04-01
+
+### Bug Fixes
+
+- poll token file for provider/quota in magmux status bar([`15adbb4`](https://github.com/MadAppGang/claudish/commit/15adbb488a85d9b8827ad4b4dc1bb776c8c52647))
+
+### Documentation
+
+- update CHANGELOG.md for v6.5.1([`6f31af7`](https://github.com/MadAppGang/claudish/commit/6f31af73460921abcc3d6a896c48f30b0dd36538))
+
+### Other Changes
+
+- bump to v6.5.2([`7b5a267`](https://github.com/MadAppGang/claudish/commit/7b5a2678339b79af1a73c8e18a3bd28de27aca06))
+
+## [6.5.1] - 2026-04-01
+
+### Bug Fixes
+
+- show provider name and quota in claudish status bar([`eb8693c`](https://github.com/MadAppGang/claudish/commit/eb8693c9b60ed3e6e7f007c7061f51918a07733d))
+
+### Documentation
+
+- update CHANGELOG.md for v6.5.0([`ad801f6`](https://github.com/MadAppGang/claudish/commit/ad801f66c7862212752442b455677857301367f2))
+
+### Other Changes
+
+- bump to v6.5.1([`9ed4074`](https://github.com/MadAppGang/claudish/commit/9ed40745d52c7a278faa7a00a15680a2fddfebd7))
+
+## [6.5.0] - 2026-04-01
+
+### Bug Fixes
+
+- magmux set TERM=screen-256color (root cause of all VT issues)([`488cf7e`](https://github.com/MadAppGang/claudish/commit/488cf7e99a18321bdabb146b58e0f81ac39d5321))
+- magmux handle Kitty keyboard protocol CSI sequences([`b4b02ff`](https://github.com/MadAppGang/claudish/commit/b4b02ff56261ca01067451dfc12de184f783090c))
+- magmux filter CSI intermediate bytes to prevent SGR corruption([`ea6e723`](https://github.com/MadAppGang/claudish/commit/ea6e72339ed2a5a88ef123ba96998d5629c9c61a))
+- magmux suppress underline SGR + fix border rendering order([`a1b20b0`](https://github.com/MadAppGang/claudish/commit/a1b20b0f61a0a6638681fe41781784e6eb70e8c9))
+
+### Documentation
+
+- MTM-to-magmux migration guide for claudish developers([`c296671`](https://github.com/MadAppGang/claudish/commit/c2966716e423e4b38efc8728df908825952e00c4))
+- add magmux usage guide to claudish documentation([`6ea796d`](https://github.com/MadAppGang/claudish/commit/6ea796dba3f0c5faa31a2f51315e281ab605ce66))
+- update CHANGELOG.md for v6.4.6([`84674f5`](https://github.com/MadAppGang/claudish/commit/84674f5c8b6f05a92940531c300f3549091bc9a3))
+
+### New Features
+
+- v6.5.0 — Gemini Code Assist overhaul, auth commands, quota CLI, Codex OAuth([`f9b1c54`](https://github.com/MadAppGang/claudish/commit/f9b1c54682d16cf8684d3ec8ce4b4201cddef59d))
+- magmux VT parser — implement tmux-equivalent escape sequence coverage([`c8abea2`](https://github.com/MadAppGang/claudish/commit/c8abea2f2023119f62c7e10def176ffdd87d938f))
+- team grid mode — mtm-based multi-model visual display([`3da53f1`](https://github.com/MadAppGang/claudish/commit/3da53f196c90c2790d009af39ea1cf8573e9cc91))
+
+### Performance
+
+- magmux dirty-flag rendering — skip redraws when nothing changed([`7fb0eb3`](https://github.com/MadAppGang/claudish/commit/7fb0eb34e8d69c673c4e649beb5070e1b30e6fde))
+
+## [6.4.6] - 2026-03-30
+
+### Bug Fixes
+
+- v6.4.6 - subcommand routing broken when shell alias prepends flags([`3d40667`](https://github.com/MadAppGang/claudish/commit/3d406677606b9c31b1cc638f017964e5edb2138f))
+
+### Documentation
+
+- update CHANGELOG.md for v6.4.5([`9751770`](https://github.com/MadAppGang/claudish/commit/975177019310c5a07f0fe38b0878e5d101e9aee1))
+
+### New Features
+
+- magmux - Go terminal multiplexer replacing C MTM implementation([`4e436e9`](https://github.com/MadAppGang/claudish/commit/4e436e9380b4c104072fab2cd880154270b9a70c))
+- add plugin defaults endpoint for Magus plugin system([`c43d927`](https://github.com/MadAppGang/claudish/commit/c43d9277fca41ffbc28013102094187a90a97103))
+
 ## [6.4.5] - 2026-03-28
 
 ### Bug Fixes

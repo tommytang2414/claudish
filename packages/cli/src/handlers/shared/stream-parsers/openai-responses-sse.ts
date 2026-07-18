@@ -12,7 +12,12 @@
  */
 
 import type { Context } from "hono";
-import { log, getLogLevel } from "../../../logger.js";
+import {
+  type CachedReasoningItem,
+  rememberReasoningForCall,
+} from "../../../adapters/reasoning-cache.js";
+import { getLogLevel, log } from "../../../logger.js";
+import { wrapAnthropicError } from "../anthropic-error.js";
 
 export function createResponsesStreamHandler(
   c: Context,
@@ -25,27 +30,50 @@ export function createResponsesStreamHandler(
 ): Response {
   const reader = response.body?.getReader();
   if (!reader) {
-    return c.json({ error: "No response body" }, 500) as any;
+    return c.json(wrapAnthropicError(500, "No response body"), 500) as any;
   }
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
   let buffer = "";
-  let blockIndex = 0;
+  // Monotonic content-block index. Every block (thinking, text, tool_use) takes
+  // the next index — Claude's SSE contract requires contiguous indices, and a
+  // block index must never be reused once its block is closed.
+  let curIdx = 0;
+  let textIdx = -1;
+  let reasoningIdx = -1;
+  // OpenAI splits a reasoning summary into parts (summary_index 0, 1, 2, …),
+  // each a bolded section. The paragraph break between parts is structural —
+  // it is NOT in the text deltas — so tracking the index lets us re-insert it,
+  // otherwise "**A**" + "**B**" render as one smashed "**A****B**".
+  let lastSummaryIndex = -1;
+  // Set when OpenAI reports the response was cut short (response.incomplete).
+  // Must reach the client as a truthful stop_reason: when the model runs out of
+  // output budget mid-tool-call, OpenAI still emits the partial arguments, and
+  // claiming stop_reason "tool_use" tells the client to execute a tool whose
+  // JSON is truncated.
+  let incompleteReason: string | null = null;
+  // Reasoning items seen since the last function call. OpenAI emits them just
+  // before the call they informed; we hand them to the cache keyed by that call
+  // so the next request can replay them (see reasoning-cache.ts).
+  let pendingReasoning: CachedReasoningItem[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
-  let hasTextContent = false;
   let hasToolUse = false;
   let lastActivity = Date.now();
   let pingInterval: ReturnType<typeof setInterval> | null = null;
   let isClosed = false;
 
-  // Track function calls being streamed
-  const functionCalls: Map<
-    string,
-    { name: string; arguments: string; index: number; claudeId?: string }
-  > = new Map();
+  type FnCall = { name: string; arguments: string; index: number; claudeId?: string };
+
+  // Track function calls being streamed. Keyed by BOTH call_id and item_id, so
+  // the same FnCall object appears under two keys — never derive a count from
+  // this map's size; use openToolBlocks / hasToolUse instead.
+  const functionCalls: Map<string, FnCall> = new Map();
+
+  // Tool blocks that have been started but not yet stopped, in emission order.
+  const openToolBlocks = new Set<FnCall>();
 
   const stream = new ReadableStream({
     start: async (controller) => {
@@ -53,6 +81,25 @@ export function createResponsesStreamHandler(
         if (!isClosed) {
           controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
         }
+      };
+
+      const closeReasoning = () => {
+        if (reasoningIdx >= 0) {
+          send("content_block_stop", { type: "content_block_stop", index: reasoningIdx });
+          reasoningIdx = -1;
+        }
+      };
+      const closeText = () => {
+        if (textIdx >= 0) {
+          send("content_block_stop", { type: "content_block_stop", index: textIdx });
+          textIdx = -1;
+        }
+      };
+      const closeTools = () => {
+        for (const fnCall of openToolBlocks) {
+          send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
+        }
+        openToolBlocks.clear();
       };
 
       send("message_start", {
@@ -92,6 +139,12 @@ export function createResponsesStreamHandler(
             const data = line.slice(6);
             if (data === "[DONE]") continue;
 
+            // Raw capture, greppable into test fixtures — same contract as
+            // [SSE:openai] / [SSE:anthropic] in the sibling parsers.
+            if (getLogLevel() === "debug") {
+              log(`[SSE:responses] ${data.substring(0, 300)}`);
+            }
+
             try {
               const event = JSON.parse(data);
 
@@ -100,17 +153,18 @@ export function createResponsesStreamHandler(
               }
 
               if (event.type === "response.output_text.delta") {
-                if (!hasTextContent) {
+                closeReasoning();
+                if (textIdx < 0) {
+                  textIdx = curIdx++;
                   send("content_block_start", {
                     type: "content_block_start",
-                    index: blockIndex,
+                    index: textIdx,
                     content_block: { type: "text", text: "" },
                   });
-                  hasTextContent = true;
                 }
                 send("content_block_delta", {
                   type: "content_block_delta",
-                  index: blockIndex,
+                  index: textIdx,
                   delta: { type: "text_delta", text: event.delta || "" },
                 });
               } else if (event.type === "response.output_item.added") {
@@ -122,12 +176,14 @@ export function createResponsesStreamHandler(
                     : `toolu_${openaiCallId.replace(/^fc_/, "")}`;
                   const rawFnName = event.item.name || "";
                   const fnName = opts.toolNameMap?.get(rawFnName) || rawFnName;
-                  const fnIndex = blockIndex + functionCalls.size + (hasTextContent ? 1 : 0);
 
-                  const fnCallData = {
+                  closeReasoning();
+                  closeText();
+
+                  const fnCallData: FnCall = {
                     name: fnName,
                     arguments: "",
-                    index: fnIndex,
+                    index: curIdx++,
                     claudeId: callId,
                   };
 
@@ -135,32 +191,50 @@ export function createResponsesStreamHandler(
                   if (itemId && itemId !== openaiCallId) {
                     functionCalls.set(itemId, fnCallData);
                   }
+                  openToolBlocks.add(fnCallData);
 
-                  if (hasTextContent && !hasToolUse) {
-                    send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                    blockIndex++;
+                  // Bind the reasoning that led to this call, keyed by the id the
+                  // client will echo back, so the next request can replay it.
+                  if (pendingReasoning.length > 0) {
+                    rememberReasoningForCall(callId, pendingReasoning);
+                    pendingReasoning = [];
                   }
 
                   send("content_block_start", {
                     type: "content_block_start",
-                    index: fnIndex,
+                    index: fnCallData.index,
                     content_block: { type: "tool_use", id: callId, name: fnName, input: {} },
                   });
                   hasToolUse = true;
                 }
               } else if (event.type === "response.reasoning_summary_text.delta") {
-                if (!hasTextContent) {
+                // Reasoning is the model's chain of thought, not its answer — it
+                // belongs in a thinking block, or Claude Code renders it as the reply.
+                const summaryIndex =
+                  typeof event.summary_index === "number" ? event.summary_index : 0;
+                if (reasoningIdx < 0) {
+                  closeText();
+                  reasoningIdx = curIdx++;
+                  lastSummaryIndex = summaryIndex;
                   send("content_block_start", {
                     type: "content_block_start",
-                    index: blockIndex,
-                    content_block: { type: "text", text: "" },
+                    index: reasoningIdx,
+                    content_block: { type: "thinking", thinking: "" },
                   });
-                  hasTextContent = true;
+                } else if (summaryIndex !== lastSummaryIndex) {
+                  // New summary section — restore the paragraph break OpenAI
+                  // represents structurally rather than in the text stream.
+                  lastSummaryIndex = summaryIndex;
+                  send("content_block_delta", {
+                    type: "content_block_delta",
+                    index: reasoningIdx,
+                    delta: { type: "thinking_delta", thinking: "\n\n" },
+                  });
                 }
                 send("content_block_delta", {
                   type: "content_block_delta",
-                  index: blockIndex,
-                  delta: { type: "text_delta", text: event.delta || "" },
+                  index: reasoningIdx,
+                  delta: { type: "thinking_delta", thinking: event.delta || "" },
                 });
               } else if (event.type === "response.function_call_arguments.delta") {
                 const callId = event.call_id || event.item_id;
@@ -174,15 +248,30 @@ export function createResponsesStreamHandler(
                   });
                 }
               } else if (event.type === "response.output_item.done") {
+                if (event.item?.type === "reasoning" && event.item.encrypted_content) {
+                  // Keep the item verbatim (minus the id, which the Responses API
+                  // does not require on replay and which buildPayload strips).
+                  pendingReasoning.push({
+                    type: "reasoning",
+                    content: event.item.content ?? [],
+                    encrypted_content: event.item.encrypted_content,
+                    summary: event.item.summary ?? [],
+                  });
+                }
                 if (event.item?.type === "function_call") {
                   const callId = event.item.call_id || event.item.id;
                   const fnCall = functionCalls.get(callId) || functionCalls.get(event.item.id);
-                  if (fnCall) {
+                  if (fnCall && openToolBlocks.has(fnCall)) {
                     send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
+                    openToolBlocks.delete(fnCall);
                   }
                 }
               } else if (event.type === "response.incomplete") {
-                log(`[ResponsesSSE] Response incomplete: ${event.reason || "unknown"}`);
+                // The reason lives at response.incomplete_details.reason — reading
+                // event.reason always yielded "unknown".
+                incompleteReason =
+                  event.response?.incomplete_details?.reason ?? event.reason ?? "unknown";
+                log(`[ResponsesSSE] Response incomplete: ${incompleteReason}`);
                 if (event.response?.usage) {
                   inputTokens = event.response.usage.input_tokens || inputTokens;
                   outputTokens = event.response.usage.output_tokens || outputTokens;
@@ -201,15 +290,11 @@ export function createResponsesStreamHandler(
                 const errCode = err.code || event.code || "";
                 log(`[ResponsesSSE] API error: ${errCode} - ${errMsg}`);
 
-                if (hasTextContent) {
-                  send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-                  hasTextContent = false;
-                }
-                for (const [, fnCall] of functionCalls) {
-                  send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
-                }
+                closeReasoning();
+                closeText();
+                closeTools();
 
-                const errorIdx = blockIndex + functionCalls.size + (hasToolUse ? 1 : 0);
+                const errorIdx = curIdx++;
                 send("content_block_start", {
                   type: "content_block_start",
                   index: errorIdx,
@@ -248,11 +333,27 @@ export function createResponsesStreamHandler(
           pingInterval = null;
         }
 
-        if (hasTextContent) {
-          send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-        }
+        closeReasoning();
+        closeText();
+        closeTools();
 
-        const stopReason = hasToolUse ? "tool_use" : "end_turn";
+        // A truncated turn must NOT be reported as a finished tool call. OpenAI
+        // emits the partial function_call arguments it managed to produce, so
+        // "tool_use" makes the client execute a tool with malformed JSON
+        // (InputValidationError). Anthropic's contract for a cut-off turn is
+        // stop_reason "max_tokens" — the client then discards the partial block.
+        const stopReason = incompleteReason
+          ? incompleteReason === "content_filter"
+            ? "refusal"
+            : "max_tokens"
+          : hasToolUse
+            ? "tool_use"
+            : "end_turn";
+        if (incompleteReason) {
+          log(
+            `[ResponsesSSE] Truncated response (${incompleteReason}) → stop_reason=${stopReason}`
+          );
+        }
         send("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
@@ -272,14 +373,11 @@ export function createResponsesStreamHandler(
 
         if (!isClosed) {
           try {
-            if (hasTextContent) {
-              send("content_block_stop", { type: "content_block_stop", index: blockIndex });
-            }
-            for (const [, fnCall] of functionCalls) {
-              send("content_block_stop", { type: "content_block_stop", index: fnCall.index });
-            }
+            closeReasoning();
+            closeText();
+            closeTools();
 
-            const errorIdx = blockIndex + functionCalls.size + (hasToolUse ? 1 : 0);
+            const errorIdx = curIdx++;
             send("content_block_start", {
               type: "content_block_start",
               index: errorIdx,

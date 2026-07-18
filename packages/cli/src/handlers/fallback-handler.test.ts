@@ -12,7 +12,7 @@
  * Run: bun test packages/cli/src/handlers/fallback-handler.test.ts
  */
 
-import { describe, test, expect, afterAll } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createProxyServer } from "../proxy-server.js";
 import type { ProxyServer } from "../types.js";
 
@@ -53,7 +53,7 @@ afterAll(async () => {
 async function sendMessage(
   port: number,
   model: string,
-  prompt: string = "Say hello in 5 words"
+  prompt = "Say hello in 5 words"
 ): Promise<{ ok: boolean; status: number; body: any }> {
   const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
     method: "POST",
@@ -74,7 +74,7 @@ async function sendMessage(
     const text = await res.text();
     const lines = text.split("\n");
     let lastData: any = null;
-    let textParts: string[] = [];
+    const textParts: string[] = [];
     let hasError = false;
     let errorData: any = null;
 
@@ -119,25 +119,25 @@ async function sendMessage(
         _raw_sse: true,
       };
       return { ok: true, status: res.status, body };
-    } else if (hasError && errorData) {
+    }
+    if (hasError && errorData) {
       return { ok: false, status: res.status, body: errorData };
-    } else if (lastData?.type === "message_stop" || lastData?.type === "message_delta") {
+    }
+    if (lastData?.type === "message_stop" || lastData?.type === "message_delta") {
       // Anthropic SSE completed but no text extracted — treat as success (empty response)
       body = { content: [{ type: "text", text: "" }], _raw_sse: true };
       return { ok: true, status: res.status, body };
-    } else {
-      body = lastData || { _raw_text: text.slice(0, 500) };
-      return { ok: false, status: res.status, body };
     }
-  } else {
-    // JSON response
-    try {
-      body = await res.json();
-    } catch {
-      body = { _raw_text: await res.text() };
-    }
-    return { ok: res.ok, status: res.status, body };
+    body = lastData || { _raw_text: text.slice(0, 500) };
+    return { ok: false, status: res.status, body };
   }
+  // JSON response
+  try {
+    body = await res.json();
+  } catch {
+    body = { _raw_text: await res.text() };
+  }
+  return { ok: res.ok, status: res.status, body };
 }
 
 /** Check if any fallback-capable env vars are set */
@@ -157,125 +157,82 @@ function hasAnyCredentials(): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Group 1: Fallback chain construction (unit, no API calls)
+// (Group 1 — unit tests of getFallbackChain — removed in commit 5 of the
+// model-catalog and routing redesign. The fallback chain construction logic
+// moved from auto-route.ts (now ~50 lines) into routing-rules.ts route()
+// + DEFAULT_ROUTING_RULES. Equivalent matrix coverage lives in
+// providers/routing-rules.test.ts and providers/default-routing-rules.test.ts.)
 // ---------------------------------------------------------------------------
-
-describe("Group 1: Fallback chain construction", () => {
-  const { getFallbackChain } = require("../providers/auto-route.js");
-
-  test("chain includes all configured providers in priority order", () => {
-    const chain = getFallbackChain("minimax-m2.5", "minimax");
-    if (!hasAnyCredentials()) return;
-
-    expect(chain.length).toBeGreaterThan(0);
-
-    // Verify ordering: LiteLLM < Zen Go < Subscription < Native < OpenRouter
-    const providerOrder = chain.map((r: any) => r.provider);
-    const litellmIdx = providerOrder.indexOf("litellm");
-    const zenIdx = providerOrder.indexOf("opencode-zen-go");
-    const subIdx = providerOrder.indexOf("minimax-coding");
-    const nativeIdx = providerOrder.indexOf("minimax");
-    const orIdx = providerOrder.indexOf("openrouter");
-
-    if (litellmIdx >= 0 && zenIdx >= 0) expect(litellmIdx).toBeLessThan(zenIdx);
-    if (zenIdx >= 0 && subIdx >= 0) expect(zenIdx).toBeLessThan(subIdx);
-    if (subIdx >= 0 && nativeIdx >= 0) expect(subIdx).toBeLessThan(nativeIdx);
-    if (nativeIdx >= 0 && orIdx >= 0) expect(nativeIdx).toBeLessThan(orIdx);
-  });
-
-  test("kimi model includes subscription alternative with translated model name", () => {
-    const chain = getFallbackChain("kimi-k2.5", "kimi");
-    const sub = chain.find((r: any) => r.provider === "kimi-coding");
-    if (!sub) return;
-    expect(sub.modelSpec).toContain("kimi-for-coding");
-  });
-
-  test("google model includes gemini-codeassist subscription alternative", () => {
-    const chain = getFallbackChain("gemini-2.0-flash", "google");
-    const sub = chain.find((r: any) => r.provider === "gemini-codeassist");
-    if (!sub) return;
-    expect(sub.modelSpec).toContain("gemini-2.0-flash");
-  });
-
-  test("unknown provider gets LiteLLM and OpenRouter but NOT Zen (model not in catalog)", () => {
-    const chain = getFallbackChain("some-unknown-model", "unknown");
-    const providers = chain.map((r: any) => r.provider);
-
-    expect(providers).not.toContain("unknown");
-
-    // Zen Go is filtered out — "some-unknown-model" won't be in the Zen catalog
-    expect(providers).not.toContain("opencode-zen-go");
-    expect(providers).not.toContain("opencode-zen");
-
-    if (process.env.LITELLM_BASE_URL && process.env.LITELLM_API_KEY) {
-      expect(providers).toContain("litellm");
-    }
-    if (process.env.OPENROUTER_API_KEY) {
-      expect(providers).toContain("openrouter");
-    }
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Group 2: Real API — fallback produces a valid response or structured error
 // ---------------------------------------------------------------------------
 
 describe("Group 2: Real API — fallback response structure", () => {
-  test("minimax-m2.5 without prefix returns success or structured fallback error", async () => {
-    if (!hasAnyCredentials()) return;
-    const port = await ensureProxy();
+  test.skipIf(!hasAnyCredentials())(
+    "minimax-m2.5 without prefix returns success or structured fallback error",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "minimax-m2.5");
+      const { ok, body } = await sendMessage(port, "minimax-m2.5");
 
-    if (ok) {
-      // Some provider in the chain succeeded
-      expect(body.content).toBeDefined();
-      expect(body.content.length).toBeGreaterThan(0);
-    } else if (body.error?.type === "all_providers_failed") {
-      // All providers failed — structured fallback error
-      expect(body.error.attempts).toBeInstanceOf(Array);
-      expect(body.error.attempts.length).toBeGreaterThan(0);
+      if (ok) {
+        // Some provider in the chain succeeded
+        expect(body.content).toBeDefined();
+        expect(body.content.length).toBeGreaterThan(0);
+      } else if (body.error?.type === "all_providers_failed") {
+        // All providers failed — structured fallback error
+        expect(body.error.attempts).toBeInstanceOf(Array);
+        expect(body.error.attempts.length).toBeGreaterThan(0);
 
-      for (const attempt of body.error.attempts) {
-        expect(attempt.provider).toBeDefined();
-        expect(typeof attempt.status).toBe("number");
-        expect(attempt.error).toBeDefined();
+        for (const attempt of body.error.attempts) {
+          expect(attempt.provider).toBeDefined();
+          expect(typeof attempt.status).toBe("number");
+          expect(attempt.error).toBeDefined();
+        }
+      } else {
+        // Single-provider error or raw SSE error — just verify it's not silently swallowed
+        expect(body).toBeDefined();
       }
-    } else {
-      // Single-provider error or raw SSE error — just verify it's not silently swallowed
-      expect(body).toBeDefined();
-    }
-  }, 30_000);
+    },
+    30_000
+  );
 
-  test("gemini-2.0-flash without prefix returns success or structured fallback error", async () => {
-    if (!hasAnyCredentials()) return;
-    const port = await ensureProxy();
+  test.skipIf(!hasAnyCredentials())(
+    "glm-5-turbo without prefix returns success or structured fallback error",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "gemini-2.0-flash");
+      const { ok, body } = await sendMessage(port, "glm-5-turbo");
 
-    if (ok) {
-      expect(body.content).toBeDefined();
-    } else if (body.error?.type === "all_providers_failed") {
-      expect(body.error.attempts.length).toBeGreaterThan(0);
-    } else {
-      expect(body).toBeDefined();
-    }
-  }, 30_000);
+      if (ok) {
+        expect(body.content).toBeDefined();
+      } else if (body.error?.type === "all_providers_failed") {
+        expect(body.error.attempts.length).toBeGreaterThan(0);
+      } else {
+        expect(body).toBeDefined();
+      }
+    },
+    30_000
+  );
 
-  test("kimi-k2.5 without prefix returns success or structured fallback error", async () => {
-    if (!hasAnyCredentials()) return;
-    const port = await ensureProxy();
+  test.skipIf(!hasAnyCredentials())(
+    "kimi-k2.5 without prefix returns success or structured fallback error",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "kimi-k2.5");
+      const { ok, body } = await sendMessage(port, "kimi-k2.5");
 
-    if (ok) {
-      expect(body.content).toBeDefined();
-    } else if (body.error?.type === "all_providers_failed") {
-      expect(body.error.attempts.length).toBeGreaterThan(0);
-    } else {
-      expect(body).toBeDefined();
-    }
-  }, 30_000);
+      if (ok) {
+        expect(body.content).toBeDefined();
+      } else if (body.error?.type === "all_providers_failed") {
+        expect(body.error.attempts.length).toBeGreaterThan(0);
+      } else {
+        expect(body).toBeDefined();
+      }
+    },
+    30_000
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -283,52 +240,58 @@ describe("Group 2: Real API — fallback response structure", () => {
 // ---------------------------------------------------------------------------
 
 describe("Group 3: Real API — multi-provider fallback in action", () => {
-  test("bare model tries multiple providers and either succeeds or returns an error", async () => {
-    if (!hasAnyCredentials()) return;
-    const port = await ensureProxy();
+  test.skipIf(!hasAnyCredentials())(
+    "bare model tries multiple providers and either succeeds or returns an error",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "minimax-m2.5");
+      const { ok, body } = await sendMessage(port, "minimax-m2.5");
 
-    if (ok) {
-      // Fallback chain found a working provider
-      expect(body.content).toBeDefined();
-      expect(body.content.length).toBeGreaterThan(0);
-    } else if (body.type === "message_stop" || body._raw_sse) {
-      // SSE stream completed (Anthropic-compat provider responded) but no text was
-      // extracted by the test helper. The fallback chain DID succeed at HTTP level —
-      // the response was just too short or used a format the test parser doesn't cover.
-      // This is still a valid outcome — the provider accepted the request.
-      expect(body).toBeDefined();
-    } else {
-      // Real error — must have a structured error
-      expect(body.error).toBeDefined();
-      if (body.error.type === "all_providers_failed") {
-        expect(body.error.attempts.length).toBeGreaterThanOrEqual(1);
-        for (const attempt of body.error.attempts) {
-          expect(attempt.provider).toBeDefined();
-          expect(typeof attempt.status).toBe("number");
-        }
+      if (ok) {
+        // Fallback chain found a working provider
+        expect(body.content).toBeDefined();
+        expect(body.content.length).toBeGreaterThan(0);
+      } else if (body.type === "message_stop" || body._raw_sse) {
+        // SSE stream completed (Anthropic-compat provider responded) but no text was
+        // extracted by the test helper. The fallback chain DID succeed at HTTP level —
+        // the response was just too short or used a format the test parser doesn't cover.
+        // This is still a valid outcome — the provider accepted the request.
+        expect(body).toBeDefined();
       } else {
-        // Single-provider error (non-retryable) — must have type and message
-        expect(body.error.type).toBeDefined();
-        expect(body.error.message).toBeDefined();
+        // Real error — must have a structured error
+        expect(body.error).toBeDefined();
+        if (body.error.type === "all_providers_failed") {
+          expect(body.error.attempts.length).toBeGreaterThanOrEqual(1);
+          for (const attempt of body.error.attempts) {
+            expect(attempt.provider).toBeDefined();
+            expect(typeof attempt.status).toBe("number");
+          }
+        } else {
+          // Single-provider error (non-retryable) — must have type and message
+          expect(body.error.type).toBeDefined();
+          expect(body.error.message).toBeDefined();
+        }
       }
-    }
-  }, 30_000);
+    },
+    30_000
+  );
 
-  test("completely unknown model fails with a structured error", async () => {
-    if (!hasAnyCredentials()) return;
-    const port = await ensureProxy();
+  test.skipIf(!hasAnyCredentials())(
+    "completely unknown model fails with a structured error",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "nonexistent-model-xyz-999");
+      const { ok, body } = await sendMessage(port, "nonexistent-model-xyz-999");
 
-    // Unknown model should NOT succeed
-    expect(ok).toBe(false);
-    // Must return some structured error — either fallback chain or single provider
-    expect(body.error).toBeDefined();
-    expect(body.error.type).toBeDefined();
-    expect(body.error.message).toBeDefined();
-  }, 30_000);
+      // Unknown model should NOT succeed
+      expect(ok).toBe(false);
+      // Must return some structured error — either fallback chain or single provider
+      expect(body.error).toBeDefined();
+      expect(body.error.type).toBeDefined();
+      expect(body.error.message).toBeDefined();
+    },
+    30_000
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -336,35 +299,41 @@ describe("Group 3: Real API — multi-provider fallback in action", () => {
 // ---------------------------------------------------------------------------
 
 describe("Group 4: Real API — explicit provider skips fallback", () => {
-  test("mm@minimax-m2.5 (explicit) does NOT use fallback chain", async () => {
-    if (!process.env.MINIMAX_API_KEY) return;
-    const port = await ensureProxy();
+  test.skipIf(!process.env.MINIMAX_API_KEY)(
+    "mm@minimax-m2.5 (explicit) does NOT use fallback chain",
+    async () => {
+      const port = await ensureProxy();
 
-    const result = await sendMessage(port, "mm@minimax-m2.5");
+      const result = await sendMessage(port, "mm@minimax-m2.5");
 
-    // Explicit provider must NOT trigger fallback chain
-    if (!result.ok && result.body.error?.type === "all_providers_failed") {
-      throw new Error(
-        `Explicit provider mm@ triggered fallback chain with ${result.body.error.attempts.length} attempts — should go direct to MiniMax only`
-      );
-    }
-    // Either succeeds (direct MiniMax) or returns a single-provider error (not wrapped in fallback)
-  }, 30_000);
+      // Explicit provider must NOT trigger fallback chain
+      if (!result.ok && result.body.error?.type === "all_providers_failed") {
+        throw new Error(
+          `Explicit provider mm@ triggered fallback chain with ${result.body.error.attempts.length} attempts — should go direct to MiniMax only`
+        );
+      }
+      // Either succeeds (direct MiniMax) or returns a single-provider error (not wrapped in fallback)
+    },
+    30_000
+  );
 
-  test("or@minimax/minimax-m2.5 (explicit OpenRouter) goes direct", async () => {
-    if (!process.env.OPENROUTER_API_KEY) return;
-    const port = await ensureProxy();
+  test.skipIf(!process.env.OPENROUTER_API_KEY)(
+    "or@minimax/minimax-m2.5 (explicit OpenRouter) goes direct",
+    async () => {
+      const port = await ensureProxy();
 
-    const { ok, body } = await sendMessage(port, "or@minimax/minimax-m2.5");
+      const { ok, body } = await sendMessage(port, "or@minimax/minimax-m2.5");
 
-    if (ok) {
-      expect(body.content).toBeDefined();
-      expect(body.content.length).toBeGreaterThan(0);
-    } else {
-      // Explicit routing error must NOT be a fallback chain error
-      expect(body.error?.type).not.toBe("all_providers_failed");
-    }
-  }, 30_000);
+      if (ok) {
+        expect(body.content).toBeDefined();
+        expect(body.content.length).toBeGreaterThan(0);
+      } else {
+        // Explicit routing error must NOT be a fallback chain error
+        expect(body.error?.type).not.toBe("all_providers_failed");
+      }
+    },
+    30_000
+  );
 });
 
 // ---------------------------------------------------------------------------

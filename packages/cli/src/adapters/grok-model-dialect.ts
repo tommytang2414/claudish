@@ -10,14 +10,20 @@
  * This dialect translates that to Claude Code's expected tool_calls format.
  */
 
-import { BaseAPIFormat, AdapterResult, ToolCall, matchesModelFamily } from "./base-api-format.js";
 import { log } from "../logger.js";
+import {
+  type AdapterResult,
+  BaseAPIFormat,
+  type EffortLevel,
+  type ToolCall,
+  matchesModelFamily,
+} from "./base-api-format.js";
 import { lookupModel } from "./model-catalog.js";
 
 export class GrokModelDialect extends BaseAPIFormat {
-  private xmlBuffer: string = "";
+  private xmlBuffer = "";
 
-  processTextContent(textContent: string, accumulatedText: string): AdapterResult {
+  processTextContent(textContent: string, _accumulatedText: string): AdapterResult {
     // Accumulate text to handle XML split across multiple chunks
     this.xmlBuffer += textContent;
 
@@ -78,32 +84,88 @@ export class GrokModelDialect extends BaseAPIFormat {
   }
 
   /**
-   * Handle request preparation - specifically for mapping reasoning parameters
+   * Handle request preparation — map Claude Code's effort to xAI
+   * `reasoning_effort`, gated per model via an ALLOWLIST. Grok rejects the param
+   * with HTTP 400 on models that don't accept it, and naming is NOT a reliable
+   * signal (live-verified 2026-07: grok-4.3 accepts it but grok-4.20 — same
+   * dot-decimal shape — rejects it). So we SET the param only for models known
+   * to accept it and STRIP for everything else (unknown/new models fail safe:
+   * they run without effort rather than 400 on every request). See
+   * effortToReasoningEffort.
    */
   override prepareRequest(request: any, originalRequest: any): any {
-    const modelId = this.modelId || "";
+    const effort = this.resolveEffortLevel(originalRequest);
 
-    if (originalRequest.thinking) {
-      // Only Grok 3 Mini supports reasoning_effort
-      const supportsReasoningEffort = modelId.includes("mini");
-
-      if (supportsReasoningEffort) {
-        // Map budget to reasoning_effort (supported: low, high)
-        // using 20k as threshold based on typical extensive reasoning
-        const { budget_tokens } = originalRequest.thinking;
-        const effort = budget_tokens >= 20000 ? "high" : "low";
-
-        request.reasoning_effort = effort;
-        log(`[GrokModelDialect] Mapped budget ${budget_tokens} -> reasoning_effort: ${effort}`);
+    if (effort) {
+      const value = this.effortToReasoningEffort(effort);
+      if (value) {
+        request.reasoning_effort = value;
+        log(`[GrokModelDialect] reasoning_effort -> ${value} (from ${effort}) for ${this.modelId}`);
       } else {
-        log(`[GrokModelDialect] Model ${modelId} does not support reasoning params. Stripping.`);
+        log(
+          `[GrokModelDialect] Model ${this.modelId} does not accept reasoning_effort — stripping.`
+        );
+        if (request.reasoning_effort !== undefined) delete request.reasoning_effort;
       }
-
-      // Always remove raw thinking object for Grok to avoid API errors
-      delete request.thinking;
     }
 
+    // Always remove raw thinking object for Grok to avoid API errors.
+    if (request.thinking) delete request.thinking;
+
     return request;
+  }
+
+  /**
+   * Map a canonical effort level to a Grok `reasoning_effort` value, or
+   * undefined when this model does NOT accept the param (→ strip).
+   *
+   * ALLOWLIST (fail-safe): only models KNOWN to accept reasoning_effort get it.
+   * Live-verified 2026-07 against api.x.ai/v1/models — of the current chat
+   * lineup ONLY grok-4.3 accepts it; grok-build-0.1 / grok-code-fast-1,
+   * grok-4.20(-0309)(-reasoning), and every *-non-reasoning id 400 with
+   * "does not support parameter reasoningEffort". Naming is NOT a reliable
+   * signal (grok-4.20 matches grok-4.x yet rejects), so we enumerate accepting
+   * families rather than guess. legacy grok-3-mini and grok-*-fast-reasoning are
+   * kept on the allowlist (historically accepting; not in today's live list).
+   * Anything else STRIPS → an unknown/new model runs without effort instead of
+   * 400-ing every request.
+   */
+  private effortToReasoningEffort(effort: EffortLevel): string | undefined {
+    const model = this.modelId.toLowerCase();
+
+    const isMini = model.includes("mini"); // grok-3-mini (legacy): low|high
+    const isGrok43 = /grok-4\.3(\b|[-.]|$)/.test(model); // grok-4.3 (live: accepts)
+    const isFastReasoning = model.includes("fast-reasoning"); // grok-*-fast-reasoning family
+
+    if (!(isMini || isGrok43 || isFastReasoning)) {
+      return undefined; // not on the allowlist → strip
+    }
+
+    // grok-3-mini tier: low | high only.
+    if (isMini) {
+      switch (effort) {
+        case "high":
+        case "xhigh":
+        case "max":
+          return "high";
+        default:
+          // none/minimal/low/medium → low (mini has no none/medium).
+          return "low";
+      }
+    }
+
+    // grok-4.3 / fast-reasoning tier: none | low | medium | high.
+    switch (effort) {
+      case "none":
+        return "none";
+      case "minimal":
+      case "low":
+        return "low";
+      case "medium":
+        return "medium";
+      default:
+        return "high";
+    }
   }
 
   /**
@@ -114,7 +176,8 @@ export class GrokModelDialect extends BaseAPIFormat {
     const params: Record<string, any> = {};
     const paramPattern = /<xai:parameter name="([^"]+)">([^<]*)<\/xai:parameter>/g;
 
-    let match;
+    let match: RegExpExecArray | null;
+    // biome-ignore lint/suspicious/noAssignInExpressions: canonical RegExp.exec() iteration idiom
     while ((match = paramPattern.exec(xmlContent)) !== null) {
       const paramName = match[1];
       const paramValue = match[2];
@@ -140,7 +203,7 @@ export class GrokModelDialect extends BaseAPIFormat {
   }
 
   override getContextWindow(): number {
-    return lookupModel(this.modelId)?.contextWindow ?? 131_072;
+    return lookupModel(this.modelId)?.contextWindow ?? 0;
   }
 
   /**

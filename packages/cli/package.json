@@ -1,6 +1,6 @@
 {
   "name": "claudish",
-  "version": "6.4.5",
+  "version": "7.15.0",
   "description": "Run Claude Code with any model - OpenRouter, Ollama, LM Studio & local models",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,8 +13,8 @@
     "dev:grok": "bun run src/index.ts --interactive --model x-ai/grok-code-fast-1",
     "dev:grok:debug": "bun run src/index.ts --interactive --debug --log-level info --model x-ai/grok-code-fast-1",
     "dev:info": "bun run src/index.ts --interactive --monitor",
-    "build": "bun build src/index.ts --outdir dist --target bun && chmod +x dist/index.js",
-    "build:binary": "bun build src/index.ts --compile --outfile claudish",
+    "build": "bun run scripts/generate-version.ts && bun build src/index.ts --outdir dist --target bun --external '@opentui/core' --external '@opentui/core-*' --external '@opentui/react' --external react --external 'react/*' && chmod +x dist/index.js",
+    "build:binary": "bun run scripts/generate-version.ts && bun build src/index.ts --compile --outfile claudish",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
@@ -22,13 +22,15 @@
     "smoke": "bun run scripts/smoke-test.ts"
   },
   "dependencies": {
+    "@1password/sdk": "0.4.1-beta.1",
     "@inquirer/prompts": "^8.0.1",
     "@inquirer/search": "^4.0.1",
     "@modelcontextprotocol/sdk": "^1.27.0",
     "@opentui/core": "^0.1.87",
     "@opentui/react": "^0.1.87",
     "dotenv": "^17.2.3",
-    "react": "^19.2.4"
+    "react": "^19.2.4",
+    "zod": "^4.1.13"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
@@ -37,7 +39,7 @@
     "bun-types": "^1.3.6",
     "typescript": "^5.9.3"
   },
-  "files": ["dist/", "bin/", "native/mtm/mtm-*", "AI_AGENT_GUIDE.md", "recommended-models.json", "skills/"],
+  "files": ["dist/", "bin/", "native/mtm/mtm-*", "AI_AGENT_GUIDE.md", "skills/"],
   "engines": {
     "node": ">=18.0.0",
     "bun": ">=1.0.0"
@@ -53,6 +55,12 @@
     "model-context-protocol",
     "ai"
   ],
+  "optionalDependencies": {
+    "@claudish/magmux-darwin-arm64": "6.7.0",
+    "@claudish/magmux-darwin-x64": "6.7.0",
+    "@claudish/magmux-linux-arm64": "6.7.0",
+    "@claudish/magmux-linux-x64": "6.7.0"
+  },
   "author": "Jack Rudenko <i@madappgang.com>",
   "license": "MIT",
   "repository": {

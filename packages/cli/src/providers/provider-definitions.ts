@@ -10,9 +10,8 @@
  */
 
 import type { RemoteProvider } from "../handlers/shared/remote-provider-types.js";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
+import { getEndpoint as getConfigEndpoint } from "../profile-config.js";
+import { getRuntimeProviders } from "./runtime-providers.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,6 +72,13 @@ export interface ProviderDefinition {
   legacyPrefixes: Array<{ prefix: string; stripPrefix: boolean }>;
   /** Native model patterns for auto-detection (when no provider prefix) */
   nativeModelPatterns?: Array<{ pattern: RegExp }>;
+  /**
+   * Single fixed model this provider serves. When set, the interactive picker
+   * skips the model prompt entirely and auto-selects this model — used by
+   * single-model subscription endpoints (e.g. Kimi Coding only serves
+   * `kimi-for-coding`). Leave unset for multi-model providers.
+   */
+  fixedModel?: string;
   /** Provider capabilities */
   capabilities?: ProviderCapabilities;
   /** Custom HTTP headers to include with requests */
@@ -81,6 +87,15 @@ export interface ProviderDefinition {
   publicKeyFallback?: string;
   /** OAuth credential file under ~/.claudish/ to check as fallback */
   oauthFallback?: string;
+  /**
+   * Slug for `claudish login {slug}` if this provider supports OAuth.
+   * Multiple catalog entries can share a slug — e.g. `google` and
+   * `gemini-codeassist` both map to `"gemini"` because one OAuth flow
+   * covers the whole family.
+   * Single source of truth: keep this in sync with AUTH_PROVIDERS in
+   * src/auth/auth-commands.ts.
+   */
+  oauthLoginSlug?: "gemini" | "codex" | "kimi";
   /** Whether this is a local provider (no API key needed) */
   isLocal?: boolean;
   /** Whether this provider supports direct API access (not just via OpenRouter) */
@@ -116,6 +131,9 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     nativeModelPatterns: [{ pattern: /^google\//i }, { pattern: /^gemini-/i }],
     isDirectApi: true,
     description: "Direct Gemini API (g@, google@)",
+    // No oauthLoginSlug: the bare Gemini direct API takes GEMINI_API_KEY.
+    // OAuth login (`claudish login gemini`) targets the gemini-codeassist
+    // subscription endpoint below, not this one.
   },
 
   // ── Gemini Code Assist (OAuth) ─────────────────────────────────────
@@ -128,6 +146,7 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     apiKeyEnvVar: "",
     apiKeyDescription: "Gemini Code Assist (OAuth)",
     apiKeyUrl: "https://cloud.google.com/code-assist",
+    oauthLoginSlug: "gemini",
     shortcuts: ["go"],
     shortestPrefix: "go",
     legacyPrefixes: [{ prefix: "go/", stripPrefix: true }],
@@ -161,6 +180,29 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     description: "Direct OpenAI API (oai@)",
   },
 
+  // ── OpenAI Codex (Responses API — ChatGPT Plus/Pro subscription) ────
+  {
+    name: "openai-codex",
+    displayName: "OpenAI Codex",
+    transport: "openai",
+    tokenStrategy: "delta-aware",
+    baseUrl: "https://api.openai.com",
+    baseUrlEnvVars: ["OPENAI_CODEX_BASE_URL"],
+    apiPath: "/v1/responses",
+    apiKeyEnvVar: "OPENAI_CODEX_API_KEY",
+    apiKeyAliases: ["OPENAI_API_KEY"],
+    apiKeyDescription: "OpenAI Codex API Key (ChatGPT Plus/Pro subscription)",
+    apiKeyUrl: "https://platform.openai.com/api-keys",
+    oauthFallback: "codex-oauth.json",
+    oauthLoginSlug: "codex",
+    shortcuts: ["cx", "codex"],
+    shortestPrefix: "cx",
+    legacyPrefixes: [{ prefix: "cx/", stripPrefix: true }],
+    nativeModelPatterns: [{ pattern: /codex$/i }],
+    isDirectApi: true,
+    description: "OpenAI Codex (cx@, codex@)",
+  },
+
   // ── OpenRouter ─────────────────────────────────────────────────────
   {
     name: "openrouter",
@@ -185,7 +227,7 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
 
   // ── xAI / Grok (OpenAI-compatible) ──────────────────────────────────
   {
-    name: "xai",
+    name: "x-ai",
     displayName: "xAI",
     transport: "openai",
     tokenStrategy: "delta-aware",
@@ -194,13 +236,13 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     apiKeyEnvVar: "XAI_API_KEY",
     apiKeyDescription: "xAI API Key",
     apiKeyUrl: "https://console.x.ai/",
-    shortcuts: ["xai", "grok"],
-    shortestPrefix: "xai",
+    // Canonical name is "x-ai" (matches the Firebase catalog slug). The bare
+    // "xai" and "grok" forms remain as input aliases so existing `xai@...`
+    // commands and scripts keep routing.
+    shortcuts: ["x-ai", "xai", "grok"],
+    shortestPrefix: "x-ai",
     legacyPrefixes: [{ prefix: "xai/", stripPrefix: true }],
-    nativeModelPatterns: [
-      { pattern: /^x-ai\//i },
-      { pattern: /^grok-/i },
-    ],
+    nativeModelPatterns: [{ pattern: /^x-ai\//i }, { pattern: /^grok-/i }],
     isDirectApi: true,
   },
 
@@ -259,13 +301,16 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     apiPath: "/messages",
     apiKeyEnvVar: "KIMI_CODING_API_KEY",
     apiKeyDescription: "Kimi Coding API Key",
-    apiKeyUrl:
-      "https://kimi.com/code (get key from membership page, or run: claudish --kimi-login)",
+    apiKeyUrl: "https://kimi.com/code (get key from membership page, or run: claudish login kimi)",
     oauthFallback: "kimi-oauth.json",
+    oauthLoginSlug: "kimi",
     shortcuts: ["kc"],
     shortestPrefix: "kc",
     legacyPrefixes: [{ prefix: "kc/", stripPrefix: true }],
     nativeModelPatterns: [{ pattern: /^kimi-for-coding$/i }],
+    // Single-model subscription: the coding endpoint only serves this one
+    // model, so the picker auto-selects it and skips the model prompt.
+    fixedModel: "kimi-for-coding",
     isDirectApi: true,
     description: "Kimi Coding Plan (kc@)",
   },
@@ -303,13 +348,15 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     displayName: "GLM",
     transport: "openai",
     tokenStrategy: "delta-aware",
-    baseUrl: "https://open.bigmodel.cn",
+    // api.z.ai is the international mirror — same models, same auth,
+    // dramatically better reachability from outside CN than open.bigmodel.cn.
+    baseUrl: "https://api.z.ai",
     baseUrlEnvVars: ["ZHIPU_BASE_URL", "GLM_BASE_URL"],
     apiPath: "/api/paas/v4/chat/completions",
     apiKeyEnvVar: "ZHIPU_API_KEY",
     apiKeyAliases: ["GLM_API_KEY"],
     apiKeyDescription: "GLM/Zhipu API Key",
-    apiKeyUrl: "https://open.bigmodel.cn/",
+    apiKeyUrl: "https://z.ai/",
     shortcuts: ["glm", "zhipu"],
     shortestPrefix: "glm",
     legacyPrefixes: [
@@ -346,7 +393,7 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
 
   // ── Z.AI (Anthropic-compatible GLM API) ────────────────────────────
   {
-    name: "zai",
+    name: "z-ai",
     displayName: "Z.AI",
     transport: "anthropic",
     baseUrl: "https://api.z.ai",
@@ -355,12 +402,14 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     apiKeyEnvVar: "ZAI_API_KEY",
     apiKeyDescription: "Z.AI API Key",
     apiKeyUrl: "https://z.ai/",
-    shortcuts: ["zai"],
-    shortestPrefix: "zai",
+    // Canonical name is "z-ai" (matches the Firebase catalog slug). Bare "zai"
+    // stays as an input alias for existing `zai@...` commands.
+    shortcuts: ["z-ai", "zai"],
+    shortestPrefix: "z-ai",
     legacyPrefixes: [{ prefix: "zai/", stripPrefix: true }],
     nativeModelPatterns: [{ pattern: /^z-ai\//i }, { pattern: /^zai\//i }],
     isDirectApi: true,
-    description: "Z.AI API (zai@)",
+    description: "Z.AI API (z-ai@)",
   },
 
   // ── OllamaCloud ────────────────────────────────────────────────────
@@ -415,10 +464,15 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     transport: "openai",
     tokenStrategy: "delta-aware",
     baseUrl: "https://opencode.ai/zen/go",
-    baseUrlEnvVars: ["OPENCODE_BASE_URL"],
+    baseUrlEnvVars: ["OPENCODE_GO_BASE_URL"],
     apiPath: "/v1/chat/completions",
-    apiKeyEnvVar: "OPENCODE_API_KEY",
-    apiKeyDescription: "OpenCode Zen Go (Lite Plan)",
+    // Zen Go is a separate paid tier from the free Zen plan — keys for one
+    // tier are not accepted by the other (401). Old single OPENCODE_API_KEY
+    // kept as an alias for backward compat, but new users should set
+    // OPENCODE_GO_API_KEY explicitly to avoid confusion.
+    apiKeyEnvVar: "OPENCODE_GO_API_KEY",
+    apiKeyAliases: ["OPENCODE_API_KEY"],
+    apiKeyDescription: "OpenCode Zen Go (Lite Plan) API Key",
     apiKeyUrl: "https://opencode.ai/",
     shortcuts: ["zengo", "zgo"],
     shortestPrefix: "zengo",
@@ -496,9 +550,13 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     displayName: "Ollama",
     transport: "local",
     baseUrl: "http://localhost:11434",
+    baseUrlEnvVars: ["OLLAMA_BASE_URL", "OLLAMA_HOST"],
     apiPath: "/api/chat",
-    apiKeyEnvVar: "",
-    apiKeyDescription: "Ollama (Local)",
+    // Optional: Ollama supports auth when exposed over the network (e.g.
+    // via reverse proxy). Empty by default; user sets OLLAMA_API_KEY if
+    // their deployment requires it.
+    apiKeyEnvVar: "OLLAMA_API_KEY",
+    apiKeyDescription: "Ollama API Key (optional — leave blank for localhost)",
     apiKeyUrl: "",
     shortcuts: ["ollama"],
     shortestPrefix: "ollama",
@@ -516,10 +574,14 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     displayName: "LM Studio",
     transport: "local",
     baseUrl: "http://localhost:1234",
+    baseUrlEnvVars: ["LMSTUDIO_BASE_URL"],
     apiPath: "/v1/chat/completions",
-    apiKeyEnvVar: "",
-    apiKeyDescription: "LM Studio (Local)",
-    apiKeyUrl: "",
+    // Optional: LM Studio supports API key auth when "Reachable on local
+    // network" is enabled in its server settings. Empty by default; user
+    // sets LMSTUDIO_API_KEY if their server requires it.
+    apiKeyEnvVar: "LMSTUDIO_API_KEY",
+    apiKeyDescription: "LM Studio API Key (optional — leave blank for localhost)",
+    apiKeyUrl: "https://lmstudio.ai/docs/local-server",
     shortcuts: ["lms", "lmstudio", "mlstudio"],
     shortestPrefix: "lms",
     legacyPrefixes: [
@@ -538,9 +600,11 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     displayName: "vLLM",
     transport: "local",
     baseUrl: "http://localhost:8000",
+    baseUrlEnvVars: ["VLLM_BASE_URL"],
     apiPath: "/v1/chat/completions",
-    apiKeyEnvVar: "",
-    apiKeyDescription: "vLLM (Local)",
+    // Optional: vLLM accepts an API key when started with --api-key.
+    apiKeyEnvVar: "VLLM_API_KEY",
+    apiKeyDescription: "vLLM API Key (optional — set if --api-key is configured)",
     apiKeyUrl: "",
     shortcuts: ["vllm"],
     shortestPrefix: "vllm",
@@ -558,9 +622,10 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     displayName: "MLX",
     transport: "local",
     baseUrl: "http://localhost:8080",
+    baseUrlEnvVars: ["MLX_BASE_URL"],
     apiPath: "/v1/chat/completions",
-    apiKeyEnvVar: "",
-    apiKeyDescription: "MLX (Local)",
+    apiKeyEnvVar: "MLX_API_KEY",
+    apiKeyDescription: "MLX API Key (optional)",
     apiKeyUrl: "",
     shortcuts: ["mlx"],
     shortestPrefix: "mlx",
@@ -570,6 +635,85 @@ export const BUILTIN_PROVIDERS: ProviderDefinition[] = [
     ],
     isLocal: true,
     description: "Local MLX (mlx@)",
+  },
+
+  // ── DeepSeek (OpenAI-compatible direct API) ─────────────────────────
+  {
+    name: "deepseek",
+    displayName: "DeepSeek",
+    transport: "openai",
+    tokenStrategy: "delta-aware",
+    baseUrl: "https://api.deepseek.com",
+    baseUrlEnvVars: ["DEEPSEEK_BASE_URL"],
+    apiPath: "/v1/chat/completions",
+    apiKeyEnvVar: "DEEPSEEK_API_KEY",
+    apiKeyDescription: "DeepSeek API Key",
+    apiKeyUrl: "https://platform.deepseek.com/api_keys",
+    shortcuts: ["ds"],
+    shortestPrefix: "ds",
+    legacyPrefixes: [{ prefix: "ds/", stripPrefix: true }],
+    nativeModelPatterns: [{ pattern: /^deepseek\//i }, { pattern: /^deepseek-/i }],
+    isDirectApi: true,
+    description: "DeepSeek API (ds@)",
+  },
+
+  // ── Sakana Fugu (OpenAI-compatible direct API / token plan) ────────
+  {
+    name: "sakana",
+    displayName: "Sakana Fugu",
+    transport: "openai",
+    tokenStrategy: "delta-aware",
+    baseUrl: "https://api.sakana.ai",
+    baseUrlEnvVars: ["SAKANA_BASE_URL"],
+    apiPath: "/v1/chat/completions",
+    apiKeyEnvVar: "SAKANA_API_KEY",
+    apiKeyDescription: "Sakana Fugu API Key",
+    apiKeyUrl: "https://console.sakana.ai/get-started",
+    shortcuts: ["sakana", "fugu"],
+    shortestPrefix: "fugu",
+    legacyPrefixes: [
+      { prefix: "sakana/", stripPrefix: true },
+      { prefix: "fugu/", stripPrefix: true },
+    ],
+    nativeModelPatterns: [{ pattern: /^fugu/i }, { pattern: /^sakana\//i }],
+    isDirectApi: true,
+    description: "Sakana Fugu API (sakana@, fugu@)",
+  },
+
+  // ── Sakana Fugu Subscription Plan ──────────────────────────────────
+  // A general-purpose subscription (NOT coding-specific) — usable for any task.
+  // Same endpoint as the API/token plan (api.sakana.ai — the only endpoint
+  // Sakana exposes), but the BILLING MODE is fixed at KEY CREATION: the Sakana
+  // console lets you mint a key as either a "subscription" key or an "API usage"
+  // (pay-as-you-go) key. They are GENUINELY DIFFERENT keys — a PAYG key draws
+  // from prepaid credits, a subscription key from the monthly plan allowance —
+  // so this provider has its OWN env var (SAKANA_SUBSCRIPTION_API_KEY) with NO
+  // alias back to SAKANA_API_KEY. Aliasing caused sc@ to fall back to the PAYG
+  // key and bill prepaid credits ("Prepaid credit balance is exhausted") despite
+  // an active subscription. (Sakana's public API reference shows only one
+  // SAKANA_API_KEY because the wire is identical; the subscription-vs-API
+  // distinction lives in the key, set at creation in the console.)
+  {
+    name: "sakana-subscription",
+    displayName: "Sakana Fugu Subscription",
+    transport: "openai",
+    tokenStrategy: "delta-aware",
+    baseUrl: "https://api.sakana.ai",
+    baseUrlEnvVars: ["SAKANA_BASE_URL"],
+    apiPath: "/v1/chat/completions",
+    // Primary env var matches Sakana's own term ("subscription"). The old
+    // SAKANA_CODING_API_KEY is kept only as a back-compat alias. NEITHER aliases
+    // the API-usage SAKANA_API_KEY — that's the PAYG key and would bill prepaid
+    // credits.
+    apiKeyEnvVar: "SAKANA_SUBSCRIPTION_API_KEY",
+    apiKeyAliases: ["SAKANA_CODING_API_KEY"],
+    apiKeyDescription: "Sakana Fugu Subscription API Key",
+    apiKeyUrl: "https://console.sakana.ai/get-started",
+    shortcuts: ["sc"],
+    shortestPrefix: "sc",
+    legacyPrefixes: [{ prefix: "sc/", stripPrefix: true }],
+    isDirectApi: true,
+    description: "Sakana Fugu Subscription (sc@)",
   },
 
   // ── Qwen (auto-routed, no direct API) ──────────────────────────────
@@ -635,6 +779,10 @@ function ensureProviderByNameCache(): Map<string, ProviderDefinition> {
 /**
  * Get the shortcuts → canonical provider name mapping.
  * Replaces PROVIDER_SHORTCUTS in model-parser.ts.
+ *
+ * Builtin shortcuts are cached on first access. Runtime providers merge their
+ * shortcuts fresh each call (the registry is small and startup-only, so the
+ * extra allocation is negligible and avoids cache-invalidation complexity).
  */
 export function getShortcuts(): Record<string, string> {
   if (!_shortcutsCache) {
@@ -645,7 +793,15 @@ export function getShortcuts(): Record<string, string> {
       }
     }
   }
-  return _shortcutsCache;
+  const runtime = getRuntimeProviders();
+  if (runtime.size === 0) return _shortcutsCache;
+  const merged: Record<string, string> = { ..._shortcutsCache };
+  for (const def of runtime.values()) {
+    for (const shortcut of def.shortcuts) {
+      merged[shortcut] = def.name;
+    }
+  }
+  return merged;
 }
 
 /**
@@ -699,9 +855,13 @@ export function getNativeModelPatterns(): Array<{ pattern: RegExp; provider: str
 
 /**
  * Get a provider definition by canonical name.
+ * Consults the builtin cache first, then the runtime registry for custom
+ * endpoints registered at startup via `custom-endpoints-loader.ts`.
  */
 export function getProviderByName(name: string): ProviderDefinition | undefined {
-  return ensureProviderByNameCache().get(name);
+  const builtin = ensureProviderByNameCache().get(name);
+  if (builtin) return builtin;
+  return getRuntimeProviders().get(name);
 }
 
 /**
@@ -736,10 +896,25 @@ export function getDisplayName(providerName: string): string {
 }
 
 /**
- * Get the effective base URL for a provider, respecting env var overrides.
+ * Get the effective base URL for a provider.
+ *
+ * Resolution precedence (highest to lowest):
+ *   1. config.endpoints[envVar] from ~/.claudish/config.json — primary,
+ *      TUI-editable, scoped to the user's profile.
+ *   2. process.env[envVar] — fallback for CI/scripted environments.
+ *   3. def.baseUrl — static default (e.g. http://localhost:1234).
+ *
+ * Each candidate env var name in `baseUrlEnvVars` is consulted in order
+ * for both config and env steps, so an explicit `LMSTUDIO_BASE_URL` setting
+ * wins over a generic `OLLAMA_HOST`.
  */
 export function getEffectiveBaseUrl(def: ProviderDefinition): string {
   if (def.baseUrlEnvVars) {
+    // Config wins over env (matches the apiKeys precedence rule).
+    for (const envVar of def.baseUrlEnvVars) {
+      const fromConfig = getConfigEndpoint(envVar);
+      if (fromConfig) return fromConfig;
+    }
     for (const envVar of def.baseUrlEnvVars) {
       const value = process.env[envVar];
       if (value) return value;
@@ -761,7 +936,11 @@ export function isLocalTransport(providerName: string): boolean {
       }
     }
   }
-  return _localProvidersCache.has(providerName.toLowerCase());
+  const lower = providerName.toLowerCase();
+  if (_localProvidersCache.has(lower)) return true;
+  // Runtime fallback — custom endpoints may declare isLocal
+  const runtimeDef = getRuntimeProviders().get(providerName);
+  return !!runtimeDef?.isLocal;
 }
 
 /**
@@ -777,7 +956,11 @@ export function isDirectApiProvider(providerName: string): boolean {
       }
     }
   }
-  return _directApiProvidersCache.has(providerName.toLowerCase());
+  const lower = providerName.toLowerCase();
+  if (_directApiProvidersCache.has(lower)) return true;
+  // Runtime fallback — custom endpoints are direct API by default
+  const runtimeDef = getRuntimeProviders().get(providerName);
+  return !!runtimeDef?.isDirectApi;
 }
 
 /**
@@ -807,10 +990,16 @@ export function toRemoteProvider(def: ProviderDefinition): RemoteProvider {
 }
 
 /**
- * Get all provider definitions.
+ * Get all provider definitions (builtin + runtime-registered).
+ *
+ * Fast path: when no runtime providers are registered, returns BUILTIN_PROVIDERS
+ * directly (no allocation). Once any custom endpoint is loaded, returns a fresh
+ * array that concatenates builtin and runtime definitions.
  */
 export function getAllProviders(): ProviderDefinition[] {
-  return BUILTIN_PROVIDERS;
+  const runtime = getRuntimeProviders();
+  if (runtime.size === 0) return BUILTIN_PROVIDERS;
+  return [...BUILTIN_PROVIDERS, ...runtime.values()];
 }
 
 /**
@@ -837,55 +1026,8 @@ export function getApiKeyEnvVars(
   };
 }
 
-/**
- * Check if a provider has what it needs to be usable (API key, local service, etc.).
- *
- * A provider is available when ANY of the following is true:
- * - It's a local provider (no API key needed)
- * - It has a publicKeyFallback (e.g. Zen free tier)
- * - Its primary apiKeyEnvVar is set in the environment
- * - Any of its apiKeyAliases are set in the environment
- * - Its oauthFallback credential file exists in ~/.claudish/
- *
- * Used by model-selector to hide providers the user hasn't configured.
- */
-export function isProviderAvailable(def: ProviderDefinition): boolean {
-  // Local providers are always available
-  if (def.isLocal) return true;
-
-  // Providers with public fallback keys are always available
-  if (def.publicKeyFallback) return true;
-
-  // No API key required (e.g. auto-routed providers)
-  if (!def.apiKeyEnvVar) return true;
-
-  // Check primary env var
-  if (process.env[def.apiKeyEnvVar]) return true;
-
-  // Check aliases
-  if (def.apiKeyAliases) {
-    for (const alias of def.apiKeyAliases) {
-      if (process.env[alias]) return true;
-    }
-  }
-
-  // Check OAuth fallback credential file
-  if (def.oauthFallback) {
-    try {
-      if (existsSync(join(homedir(), ".claudish", def.oauthFallback))) return true;
-    } catch {
-      // fs check failed, treat as unavailable
-    }
-  }
-
-  return false;
-}
-
-/**
- * Check provider availability by canonical name.
- */
-export function isProviderAvailableByName(providerName: string): boolean {
-  const def = getProviderByName(providerName);
-  if (!def) return false;
-  return isProviderAvailable(def);
-}
+// NOTE: the sync readiness oracles isProviderAvailable / isProviderAvailableByName
+// were DELETED in the async-credential-layer refactor. Provider readiness is now
+// resolved on demand through the credential authority (auth/credentials/authority.ts
+// → isAvailable), the single source of truth that also pulls from 1Password. The
+// model selector calls credentials.isAvailable() directly.

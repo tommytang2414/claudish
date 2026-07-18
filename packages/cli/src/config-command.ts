@@ -12,14 +12,14 @@
  * Usage: claudish config
  */
 
-import { select, input, password, confirm } from "@inquirer/prompts";
+import { confirm, input, password, select } from "@inquirer/prompts";
 import {
   loadConfig,
+  removeApiKey,
+  removeEndpoint,
   saveConfig,
   setApiKey,
-  removeApiKey,
   setEndpoint,
-  removeEndpoint,
 } from "./profile-config.js";
 
 // ANSI colors (matches profile-commands.ts)
@@ -99,10 +99,10 @@ const PROVIDERS: ProviderDef[] = [
     defaultEndpoint: "https://open.bigmodel.cn",
   },
   {
-    name: "zai",
+    name: "z-ai",
     displayName: "Z.AI",
     apiKeyEnvVar: "ZAI_API_KEY",
-    description: "Z.AI API (zai@)",
+    description: "Z.AI API (z-ai@)",
     keyUrl: "https://z.ai/",
     endpointEnvVar: "ZAI_BASE_URL",
     defaultEndpoint: "https://api.z.ai",
@@ -156,7 +156,7 @@ const PROVIDERS: ProviderDef[] = [
  */
 function maskKey(key: string): string {
   if (key.length <= 12) return "***";
-  return key.slice(0, 6) + "..." + key.slice(-4);
+  return `${key.slice(0, 6)}...${key.slice(-4)}`;
 }
 
 // ─── Connection Tests ─────────────────────────────────────
@@ -179,7 +179,7 @@ async function testProviderConnection(provider: ProviderDef, key: string): Promi
       headers = { Authorization: `Bearer ${key}` };
     } else if (provider.name === "litellm") {
       const config = loadConfig();
-      const baseUrl = config.endpoints?.["LITELLM_BASE_URL"] || process.env.LITELLM_BASE_URL;
+      const baseUrl = config.endpoints?.LITELLM_BASE_URL || process.env.LITELLM_BASE_URL;
       if (!baseUrl) {
         console.log(`${YELLOW}LiteLLM requires a base URL. Configure it in Providers.${RESET}`);
         return;
