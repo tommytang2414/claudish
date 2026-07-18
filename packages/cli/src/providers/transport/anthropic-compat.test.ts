@@ -74,6 +74,52 @@ describe("AnthropicCompatProvider.getHeaders()", () => {
   });
 });
 
+describe("AnthropicCompatProvider 429 circuit breaker", () => {
+  const provider: RemoteProvider = {
+    name: "minimax",
+    baseUrl: "https://api.minimax.io",
+    apiPath: "/anthropic/v1/messages",
+    apiKeyEnvVar: "MINIMAX_API_KEY",
+    prefixes: ["mm@"],
+    authScheme: "bearer",
+  };
+
+  it("opens the circuit after bounded retries and blocks the next upstream request", async () => {
+    const transport = new AnthropicCompatProvider(provider, TEST_API_KEY);
+    let upstreamCalls = 0;
+    const fetchFn = async () => {
+      upstreamCalls++;
+      return new Response('{"error":{"message":"rate limited"}}', {
+        status: 429,
+        headers: { "Retry-After": "0" },
+      });
+    };
+
+    const exhaustedResponse = await transport.enqueueRequest(fetchFn);
+    expect(exhaustedResponse.status).toBe(429);
+    expect(upstreamCalls).toBe(3);
+
+    const circuitResponse = await transport.enqueueRequest(fetchFn);
+    expect(circuitResponse.status).toBe(400);
+    expect(upstreamCalls).toBe(3);
+    expect(circuitResponse.headers.get("Retry-After")).toBe("5");
+    expect(await circuitResponse.text()).toContain("bounded retries");
+  });
+
+  it("does not open the transient circuit for terminal quota errors", async () => {
+    const transport = new AnthropicCompatProvider(provider, TEST_API_KEY);
+    let upstreamCalls = 0;
+    const fetchFn = async () => {
+      upstreamCalls++;
+      return new Response('{"error":{"message":"insufficient quota"}}', { status: 429 });
+    };
+
+    expect((await transport.enqueueRequest(fetchFn)).status).toBe(429);
+    expect((await transport.enqueueRequest(fetchFn)).status).toBe(429);
+    expect(upstreamCalls).toBe(2);
+  });
+});
+
 describe("AnthropicAPIFormat — tool_reference stripping", () => {
   const adapter = new AnthropicAPIFormat("kimi-k2.5", "kimi");
 

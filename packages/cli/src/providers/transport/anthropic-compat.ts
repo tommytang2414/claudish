@@ -19,6 +19,7 @@ export class AnthropicProviderTransport implements ProviderTransport {
 
   private provider: RemoteProvider;
   private apiKey: string;
+  private rateLimitCircuitOpenUntil = 0;
 
   constructor(provider: RemoteProvider, apiKey: string) {
     this.provider = provider;
@@ -86,6 +87,30 @@ export class AnthropicProviderTransport implements ProviderTransport {
    * in transport/openai.ts for the patterns matched.
    */
   async enqueueRequest(fetchFn: () => Promise<Response>): Promise<Response> {
+    const circuitRemainingMs = this.rateLimitCircuitOpenUntil - Date.now();
+    if (circuitRemainingMs > 0) {
+      const retryAfterSeconds = Math.max(1, Math.ceil(circuitRemainingMs / 1000));
+      log(
+        `[${this.displayName}] 429 circuit open; blocking upstream retry for ${retryAfterSeconds}s`
+      );
+      return new Response(
+        JSON.stringify({
+          error: {
+            type: "rate_limit_error",
+            message: `${this.displayName} is still rate limited after bounded retries. Retry in ${retryAfterSeconds}s.`,
+          },
+          upstream_status: 429,
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": String(retryAfterSeconds),
+          },
+        }
+      );
+    }
+
     const maxRetries = 2;
     let lastResponse: Response | null = null;
 
@@ -115,6 +140,20 @@ export class AnthropicProviderTransport implements ProviderTransport {
         );
         await new Promise((resolve) => setTimeout(resolve, delayMs));
         continue;
+      }
+
+      if (response.status === 429) {
+        const retryAfter = response.headers.get("Retry-After");
+        const retryAfterMs = retryAfter && !Number.isNaN(Number(retryAfter))
+          ? Number(retryAfter) * 1000
+          : 30_000;
+        const cooldownMs = Math.min(Math.max(retryAfterMs, 5_000), 60_000);
+        this.rateLimitCircuitOpenUntil = Date.now() + cooldownMs;
+        log(
+          `[${this.displayName}] 429 persisted after ${maxRetries + 1} attempts; circuit open for ${(cooldownMs / 1000).toFixed(0)}s`
+        );
+      } else {
+        this.rateLimitCircuitOpenUntil = 0;
       }
 
       return response;

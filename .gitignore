@@ -56,6 +56,7 @@ ai-sessions/
 
 # Build artifacts
 *.tsbuildinfo
+*.bun-build
 
 # Temp dev files
 claude

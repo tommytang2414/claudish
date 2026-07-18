@@ -80,6 +80,7 @@ export function createAnthropicPassthroughStream(
             const { done, value } = await reader.read();
             if (done) break;
             buffer += decoder.decode(value, { stream: true });
+            buffer = buffer.replace(/\r\n/g, "\n");
             lastActivity = Date.now();
             const lines = buffer.split("\n");
             buffer = lines.pop() || "";
@@ -244,7 +245,7 @@ export function createAnthropicPassthroughStream(
               // above in the filterThinking branch. Re-parse for tracking only.
               if (filterThinking && line.startsWith("data: ")) {
                 try {
-                  const data = JSON.parse(dataLine.slice(6));
+                  const data = JSON.parse(line.slice(6));
                   if (data.message?.usage) {
                     inputTokens = data.message.usage.input_tokens || inputTokens;
                     outputTokens = data.message.usage.output_tokens || outputTokens;

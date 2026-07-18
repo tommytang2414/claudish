@@ -735,8 +735,20 @@ async function findClaudeBinary(): Promise<string | null> {
 
   // 3. Check common global installation paths
   if (isWindows) {
-    // Windows: Check npm global paths for .cmd files
+    // Prefer Claude Code's native executable. Spawning the npm .cmd shim with
+    // shell:true makes cmd.exe reinterpret multi-word prompts on Windows.
     const windowsPaths = [
+      join(
+        home,
+        "AppData",
+        "Roaming",
+        "npm",
+        "node_modules",
+        "@anthropic-ai",
+        "claude-code",
+        "bin",
+        "claude.exe"
+      ),
       join(home, "AppData", "Roaming", "npm", "claude.cmd"), // npm global (default)
       join(home, ".npm-global", "claude.cmd"), // Custom npm prefix
       join(home, "node_modules", ".bin", "claude.cmd"), // Local node_modules
@@ -794,7 +806,12 @@ async function findClaudeBinary(): Promise<string | null> {
       const lines = output.trim().split(/\r?\n/);
 
       if (isWindows) {
-        // On Windows, prefer .cmd file over shell script
+        // Prefer a native executable so prompt arguments bypass cmd.exe.
+        const exePath = lines.find((line) => line.toLowerCase().endsWith(".exe"));
+        if (exePath) {
+          return exePath;
+        }
+
         const cmdPath = lines.find((line) => line.endsWith(".cmd"));
         if (cmdPath) {
           return cmdPath;
